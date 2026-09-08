@@ -731,11 +731,11 @@ tests/contract/
     pagination.rs
     errors.rs
 
-e2e-python/tests/
+source/tests/python/tests/
     sdk/            # SDK compatibility tests (official Python SDK)
     e2e/            # end-to-end tests (testcontainers)
 
-e2e-csharp/         # C# SDK compatibility tests (Phase 3)
+source/tests/csharp/    # C# SDK compatibility tests (Phase 3)
 ```
 
 Tests should ideally operate at three levels:

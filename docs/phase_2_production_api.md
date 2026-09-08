@@ -90,10 +90,10 @@ Everything below implements that matrix. Unsupported operations must fail explic
       pagination.rs
       errors.rs
   ```
-- SDK compatibility tests using the official Python SDK for every supported operation (`e2e-python/tests/sdk/`).
-- E2E suite extended to cover the full supported-operations matrix (`e2e-python/tests/e2e/`).
+- SDK compatibility tests using the official Python SDK for every supported operation (`source/tests/python/tests/sdk/`).
+- E2E suite extended to cover the full supported-operations matrix (`source/tests/python/tests/e2e/`).
 - Concurrency tests: parallel document writes and searches do not corrupt state.
-- HTTP fixtures from Phase 1 extended to cover all matrix operations; committed to `e2e-python/fixtures/` for Phase 3 C# replay.
+- HTTP fixtures from Phase 1 extended to cover all matrix operations; committed to `source/tests/python/fixtures/` for Phase 3 C# replay.
 
 ## Out of scope
 
@@ -109,7 +109,7 @@ Everything below implements that matrix. Unsupported operations must fail explic
 3. File-backed storage implementation.
 4. Full unit, contract, and SDK compatibility test suites.
 5. Extended e2e suite covering the matrix.
-6. Extended HTTP fixtures in `e2e-python/fixtures/` covering all matrix operations.
+6. Extended HTTP fixtures in `source/tests/python/fixtures/` covering all matrix operations.
 7. `docs/known_differences.md` — created as gaps are discovered during implementation (relevance ordering, filter edge cases, etc.).
 8. Updated README: supported operations, known limitations, configuration reference.
 

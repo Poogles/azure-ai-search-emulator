@@ -29,9 +29,9 @@ Admin endpoints should be:
 ### C# SDK compatibility
 
 - Treat the C# SDK as an independent consumer of the HTTP contract (per the initial design).
-- **Fixture replay:** replay the HTTP fixtures captured in Phase 1/2 (`e2e-python/fixtures/`) through the C# SDK to verify the emulator handles the same wire format. This catches serialisation/header differences without requiring a live Azure instance.
+- **Fixture replay:** replay the HTTP fixtures captured in Phase 1/2 (`source/tests/python/fixtures/`) through the C# SDK to verify the emulator handles the same wire format. This catches serialisation/header differences without requiring a live Azure instance.
 - Identify HTTP differences between Python and C# SDK behaviour (headers, serialisation, error handling, API version usage).
-- Add C# compatibility tests (a .NET xunit test project in `e2e-csharp/`) exercising the same supported-operations matrix.
+- Add C# compatibility tests (a .NET xunit test project in `source/tests/csharp/`) exercising the same supported-operations matrix.
 - Fix emulator behaviour where C# reveals gaps; keep the Python suite green.
 - Document which behaviours are identical across clients and which differ.
 
@@ -67,7 +67,7 @@ Admin endpoints should be:
 ## Deliverables
 
 1. Admin API with tests and configuration controls.
-2. C# compatibility test suite (`e2e-csharp/`) with fixture replay and emulator fixes it drives.
+2. C# compatibility test suite (`source/tests/csharp/`) with fixture replay and emulator fixes it drives.
 3. Azure comparison test suite and updated `docs/known_differences.md`.
 4. Packaged release (static binaries + `cargo install`) and published multi-arch Docker image (GHCR).
 5. Final documentation set.
@@ -85,7 +85,7 @@ Admin endpoints should be:
 
 ### C# compatibility
 
-- [ ] C# test project (`e2e-csharp/`) set up and runs against the emulator image.
+- [ ] C# test project (`source/tests/csharp/`) set up and runs against the emulator image.
 - [ ] HTTP fixtures from Phase 1/2 replayed through the C# SDK successfully.
 - [ ] C# suite covers the supported-operations matrix (indexes, documents, search, filters, pagination, errors).
 - [ ] HTTP differences between Python and C# SDKs documented.
