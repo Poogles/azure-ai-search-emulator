@@ -6,7 +6,7 @@ use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::Response;
-use axum::routing::{get, post, put};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 
@@ -22,9 +22,7 @@ pub struct AppState {
 
 impl AppState {
     #[must_use]
-    pub fn new(config: Config) -> Self {
-        let storage: Arc<dyn crate::storage::Storage> =
-            Arc::new(crate::storage::InMemoryStorage::new());
+    pub fn new(config: Config, storage: Arc<dyn crate::storage::Storage>) -> Self {
         Self {
             service: Arc::new(SearchService::new(storage)),
             config,
@@ -35,9 +33,16 @@ impl AppState {
 /// Builds the application router.
 pub fn build_router(state: AppState) -> Router {
     // The Azure path uses a single segment of the form `indexes('name')`, so the
-    // whole segment is captured and parsed in the handlers.
+    // whole segment is captured and parsed in the handlers. The literal
+    // `/indexes` route (create / list) takes precedence over `/{index}`.
     let azure = Router::new()
-        .route("/{index}", put(create_index).delete(delete_index))
+        .route("/indexes", post(create_index).get(list_indexes))
+        .route(
+            "/{index}",
+            get(get_index)
+                .put(create_or_update_index)
+                .delete(delete_index),
+        )
         .route("/{index}/docs/search.index", post(upload_documents))
         .route("/{index}/docs/search.post.search", post(search_documents))
         .layer(middleware::from_fn_with_state(state.clone(), azure_guard));
@@ -69,21 +74,48 @@ async fn admin_reset(State(state): State<AppState>) -> Json<Value> {
 // Azure-compatible endpoints
 // ---------------------------------------------------------------------------
 
+/// `POST /indexes` — Create Index. The name comes from the body.
 async fn create_index(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let definition = parse_body(&body)?;
+    let echoed = state.service.create_index(&definition)?;
+    Ok((StatusCode::CREATED, Json(echoed)))
+}
+
+/// `PUT /indexes('{name}')` — Create or Update Index. Replaces any existing
+/// index (and its documents).
+async fn create_or_update_index(
     State(state): State<AppState>,
     Path(raw_name): Path<String>,
     body: axum::body::Bytes,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let name = parse_index_name(&raw_name)?;
     let definition = parse_body(&body)?;
-    let echoed = state.service.create_index(&definition)?;
-    if name != echoed.get("name").and_then(Value::as_str).unwrap_or("") {
+    let body_name = definition.get("name").and_then(Value::as_str).unwrap_or("");
+    if name != body_name {
         return Err(ApiError::bad_request(
             "InvalidIndex",
             format!("Index name in path ({name:?}) does not match index name in body."),
         ));
     }
+    let echoed = state.service.create_or_update_index(&definition)?;
     Ok((StatusCode::CREATED, Json(echoed)))
+}
+
+/// `GET /indexes` — List Indexes.
+async fn list_indexes(State(state): State<AppState>) -> Json<Value> {
+    let value = state.service.list_indexes();
+    Json(json!({ "value": value }))
+}
+
+async fn get_index(
+    State(state): State<AppState>,
+    Path(raw_name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let name = parse_index_name(&raw_name)?;
+    Ok(Json(state.service.get_index(&name)?))
 }
 
 async fn delete_index(
@@ -102,15 +134,27 @@ async fn upload_documents(
 ) -> Result<Json<Value>, ApiError> {
     let name = parse_index_name(&raw_name)?;
     let batch = parse_body(&body)?;
-    let actions = batch
-        .as_array()
-        .ok_or_else(|| {
-            ApiError::bad_request(
+    // The SDK serializes an `IndexBatch` as `{"value": [...]}`; a bare array is
+    // also accepted for direct HTTP use.
+    let actions = match batch {
+        Value::Array(items) => items,
+        Value::Object(map) => map
+            .get("value")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    "InvalidDocuments",
+                    "Document batch must be a JSON array of actions or an object with a \"value\" array.",
+                )
+            })?,
+        _ => {
+            return Err(ApiError::bad_request(
                 "InvalidDocuments",
-                "Document batch must be a JSON array of actions.",
-            )
-        })?
-        .clone();
+                "Document batch must be a JSON array of actions or an object with a \"value\" array.",
+            ))
+        }
+    };
     let mut documents = Vec::with_capacity(actions.len());
     for action in &actions {
         let action_type = action
@@ -125,15 +169,27 @@ async fn upload_documents(
                 ),
             ));
         }
-        let doc = action
-            .get("document")
-            .ok_or_else(|| {
-                ApiError::bad_request(
-                    "InvalidDocuments",
-                    "Each batch action requires a \"document\" object.",
-                )
-            })?
-            .clone();
+        // Two wire shapes are accepted:
+        //   - Documented Azure format: {"@search.action": "upload", "document": {...}}
+        //   - Python SDK format:       {"@search.action": "upload", ...fields}
+        //     (the SDK spreads the document fields at the top level of the action)
+        let doc = match action.get("document") {
+            Some(document) => document.clone(),
+            None => Value::Object(
+                action
+                    .as_object()
+                    .ok_or_else(|| {
+                        ApiError::bad_request(
+                            "InvalidDocuments",
+                            "Each batch action must be a JSON object.",
+                        )
+                    })?
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != "@search.action")
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+        };
         documents.push(doc);
     }
     let results = state.service.upload_documents(&name, documents)?;
@@ -201,10 +257,11 @@ async fn azure_guard(
     request: Request,
     next: middleware::Next,
 ) -> Result<Response, ApiError> {
-    // The catch-all index route can shadow non-Azure paths (e.g. /admin/reset
-    // when admin is disabled). Only enforce Azure auth/version on the index
-    // operation surface; let everything else fall through to routing.
-    if !request.uri().path().starts_with("/indexes(") {
+    // Only enforce Azure auth/version on the index operation surface
+    // (`/indexes` and `/indexes('name')...`); let everything else fall through
+    // to routing.
+    let path = request.uri().path();
+    if path != "/indexes" && !path.starts_with("/indexes(") {
         return Ok(next.run(request).await);
     }
     let api_key = request

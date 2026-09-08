@@ -14,6 +14,9 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: source/rust
       - run: cargo fmt --manifest-path source/rust/Cargo.toml -- --check
       - run: cargo clippy --manifest-path source/rust/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path source/rust/Cargo.toml --all-targets
@@ -34,6 +37,12 @@ jobs:
             echo "::error::Image exceeds 20 MB limit"
             exit 1
           fi
+      - name: Save image
+        run: docker save aisearch-emulator | gzip > aisearch-emulator.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aisearch-emulator-image
+          path: aisearch-emulator.tar.gz
 
   e2e:
     name: E2E tests (Python SDK)
@@ -50,8 +59,11 @@ jobs:
       - name: Install dependencies
         working-directory: source/tests/python
         run: poetry install --no-interaction
-      - name: Build Docker image
-        run: docker build -t aisearch-emulator source/rust
+      - uses: actions/download-artifact@v4
+        with:
+          name: aisearch-emulator-image
+      - name: Load image
+        run: gunzip -c aisearch-emulator.tar.gz | docker load
       - name: Run E2E tests
         working-directory: source/tests/python
         run: poetry run pytest tests/e2e -v

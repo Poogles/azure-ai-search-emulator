@@ -1,7 +1,10 @@
 """E2E tests: official Azure AI Search SDK against the containerised emulator."""
 
+import urllib.request
+
 import pytest
-from azure.core.exceptions import ResourceNotFoundError
+from azure.core.credentials import AzureKeyCredential
+from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
 from azure.search.documents import SearchClient
 from azure.search.documents.indexes import SearchIndexClient
 from azure.search.documents.indexes.models import (
@@ -12,30 +15,41 @@ from azure.search.documents.indexes.models import (
 
 API_KEY = "test-key"
 INDEX_NAME = "e2e-index"
+# The emulator's default supported API version (see EMULATOR_API_VERSIONS). The
+# SDK defaults to a newer version, so pin it explicitly.
+API_VERSION = "2024-07-01"
+# AzureKeyCredential sends the `api-key` header (the emulator's auth scheme) and
+# avoids the SDK's bearer-token path, which enforces HTTPS.
+CREDENTIAL = AzureKeyCredential(API_KEY)
 
 
 def _index_client(endpoint: str) -> SearchIndexClient:
-    return SearchIndexClient(endpoint=endpoint, credential=API_KEY)
+    return SearchIndexClient(
+        endpoint=endpoint, credential=CREDENTIAL, api_version=API_VERSION
+    )
 
 
 def _search_client(endpoint: str) -> SearchClient:
-    return SearchClient(endpoint=endpoint, index_name=INDEX_NAME, credential=API_KEY)
+    return SearchClient(
+        endpoint=endpoint,
+        index_name=INDEX_NAME,
+        credential=CREDENTIAL,
+        api_version=API_VERSION,
+    )
 
 
 def _test_index() -> SearchIndex:
     return SearchIndex(
         name=INDEX_NAME,
         fields=[
-            SearchField(name="id", type=SearchFieldDataType.STRING, key=True),
-            SearchField(name="title", type=SearchFieldDataType.STRING, searchable=True),
+            SearchField(name="id", type=SearchFieldDataType.String, key=True),
+            SearchField(name="title", type=SearchFieldDataType.String, searchable=True),
         ],
     )
 
 
 class TestHealth:
     def test_health_endpoint(self, clean_emulator):
-        import urllib.request
-
         with urllib.request.urlopen(f"{clean_emulator}/health", timeout=5) as resp:
             assert resp.status == 200
             body = resp.read().decode()
@@ -53,8 +67,9 @@ class TestIndexLifecycle:
     def test_create_duplicate_index_fails(self, clean_emulator):
         client = _index_client(clean_emulator)
         client.create_index(_test_index())
-        with pytest.raises(Exception):
+        with pytest.raises(HttpResponseError) as exc_info:
             client.create_index(_test_index())
+        assert exc_info.value.status_code == 409
 
     def test_delete_index(self, clean_emulator):
         client = _index_client(clean_emulator)
@@ -77,7 +92,7 @@ class TestDocuments:
         ]
         results = search_client.upload_documents(documents=docs)
         assert len(results) == 3
-        assert all(r.status for r in results)
+        assert all(r.succeeded for r in results)
 
         search_results = search_client.search(search_text="hello", top=10)
         found = list(search_results)
@@ -106,5 +121,6 @@ class TestDocuments:
         index_client.delete_index(INDEX_NAME)
 
         search_client = _search_client(clean_emulator)
+        # search() returns a lazy paged iterator; iterate to trigger the request.
         with pytest.raises(ResourceNotFoundError):
-            search_client.search(search_text="test", top=1)
+            list(search_client.search(search_text="test", top=1))

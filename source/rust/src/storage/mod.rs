@@ -168,6 +168,9 @@ pub trait Storage: Send + Sync {
     /// Returns [`StorageError::IndexAlreadyExists`] if the index exists.
     fn create_index(&self, index: &IndexDefinition) -> Result<(), StorageError>;
 
+    /// Creates or replaces an index, discarding any existing documents.
+    fn upsert_index(&self, index: &IndexDefinition);
+
     /// Returns a clone of the index definition, if present.
     #[must_use]
     fn get_index(&self, name: &str) -> Option<IndexDefinition>;
@@ -221,7 +224,7 @@ impl Storage for InMemoryStorage {
         let mut indexes = self
             .inner
             .write()
-            .map_err(|_| StorageError::IndexNotFound("<poisoned lock>".to_owned()))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if indexes.contains_key(&index.name) {
             return Err(StorageError::IndexAlreadyExists(index.name.clone()));
         }
@@ -235,30 +238,49 @@ impl Storage for InMemoryStorage {
         Ok(())
     }
 
+    fn upsert_index(&self, index: &IndexDefinition) {
+        let mut indexes = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        indexes.insert(
+            index.name.clone(),
+            IndexEntry {
+                definition: index.clone(),
+                documents: BTreeMap::new(),
+            },
+        );
+    }
+
     fn get_index(&self, name: &str) -> Option<IndexDefinition> {
-        let indexes = self.inner.read().ok()?;
+        let indexes = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         indexes.get(name).map(|entry| entry.definition.clone())
     }
 
     fn delete_index(&self, name: &str) -> bool {
-        let Ok(mut indexes) = self.inner.write() else {
-            return false;
-        };
+        let mut indexes = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         indexes.remove(name).is_some()
     }
 
     fn list_index_names(&self) -> Vec<String> {
-        self.inner
+        let indexes = self
+            .inner
             .read()
-            .map(|indexes| indexes.keys().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        indexes.keys().cloned().collect()
     }
 
     fn put_documents(&self, index: &str, documents: Vec<Document>) -> Result<(), StorageError> {
         let mut indexes = self
             .inner
             .write()
-            .map_err(|_| StorageError::IndexNotFound(index.to_owned()))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = indexes
             .get_mut(index)
             .ok_or_else(|| StorageError::IndexNotFound(index.to_owned()))?;
@@ -272,7 +294,7 @@ impl Storage for InMemoryStorage {
         let indexes = self
             .inner
             .read()
-            .map_err(|_| StorageError::IndexNotFound(index.to_owned()))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = indexes
             .get(index)
             .ok_or_else(|| StorageError::IndexNotFound(index.to_owned()))?;
@@ -280,9 +302,11 @@ impl Storage for InMemoryStorage {
     }
 
     fn reset(&self) {
-        if let Ok(mut indexes) = self.inner.write() {
-            indexes.clear();
-        }
+        let mut indexes = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        indexes.clear();
     }
 }
 

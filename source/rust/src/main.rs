@@ -1,9 +1,11 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::Arc;
 use std::time::Duration;
 
 use aisearch_emulator::api::{build_router, AppState};
 use aisearch_emulator::config::{Config, StorageMode, DEFAULT_PORT};
+use aisearch_emulator::storage::{InMemoryStorage, Storage};
 use anyhow::{bail, Context};
 use serde_json::Value;
 
@@ -30,7 +32,8 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let state = AppState::new(config.clone());
+    let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+    let state = AppState::new(config.clone(), storage);
     let app = build_router(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));

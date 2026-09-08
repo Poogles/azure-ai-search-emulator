@@ -53,7 +53,7 @@ impl fmt::Display for ConfigError {
             ConfigError::InvalidApiVersions(v) => {
                 write!(f, "invalid EMULATOR_API_VERSIONS value: {v:?}")
             }
-            ConfigError::InvalidBool(v) => write!(f, "invalid boolean value: {v:?}"),
+            ConfigError::InvalidBool(v) => write!(f, "invalid boolean value: {v}"),
         }
     }
 }
@@ -68,27 +68,37 @@ impl Config {
     ///
     /// Returns a [`ConfigError`] if a set variable has an invalid value.
     pub fn from_env() -> Result<Self, ConfigError> {
-        let port = match env::var("EMULATOR_PORT").ok().filter(|v| !v.is_empty()) {
+        Self::from_values(|key| env::var(key).ok())
+    }
+
+    /// Builds configuration from a variable lookup, applying defaults for any
+    /// variable that is unset or empty. Split out from [`Config::from_env`] so
+    /// parsing is testable without mutating process environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigError`] if a set variable has an invalid value.
+    pub fn from_values<F>(lookup: F) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        // An empty value is treated as unset so that `VAR=` does not override
+        // the default.
+        let get = |key: &str| lookup(key).filter(|value| !value.is_empty());
+        let port = match get("EMULATOR_PORT") {
             None => DEFAULT_PORT,
             Some(raw) => raw
                 .parse::<u16>()
                 .map_err(|_| ConfigError::InvalidPort(raw))?,
         };
 
-        let storage_mode = match env::var("EMULATOR_STORAGE__MODE")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .as_deref()
-        {
+        let storage_mode = match get("EMULATOR_STORAGE__MODE").as_deref() {
             None | Some("memory") => StorageMode::Memory,
             Some("file") => StorageMode::File,
             Some(other) => return Err(ConfigError::InvalidStorageMode(other.to_owned())),
         };
 
-        let api_versions = match env::var("EMULATOR_API_VERSIONS")
-            .ok()
-            .filter(|v| !v.is_empty())
-        {
+        let api_versions = match get("EMULATOR_API_VERSIONS") {
             None => vec![DEFAULT_API_VERSION.to_owned()],
             Some(raw) => {
                 let versions: Vec<String> = raw
@@ -104,19 +114,16 @@ impl Config {
             }
         };
 
-        let log_level = env::var("EMULATOR_LOG_LEVEL")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_owned());
+        let log_level = get("EMULATOR_LOG_LEVEL").unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_owned());
 
-        let enable_admin = match env::var("EMULATOR_ENABLE_ADMIN")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .as_deref()
-        {
+        let enable_admin = match get("EMULATOR_ENABLE_ADMIN").as_deref() {
             None | Some("true" | "1") => true,
             Some("false" | "0") => false,
-            Some(other) => return Err(ConfigError::InvalidBool(other.to_owned())),
+            Some(other) => {
+                return Err(ConfigError::InvalidBool(format!(
+                    "EMULATOR_ENABLE_ADMIN={other:?}"
+                )))
+            }
         };
 
         Ok(Config {
@@ -138,19 +145,86 @@ impl Config {
 mod tests {
     use super::*;
 
+    fn from_pairs(pairs: &[(&str, &str)]) -> Result<Config, ConfigError> {
+        Config::from_values(|key| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        })
+    }
+
+    fn ok(result: Result<Config, ConfigError>) -> Config {
+        match result {
+            Ok(config) => config,
+            Err(err) => panic!("expected Ok, got Err: {err}"),
+        }
+    }
+
+    fn err(result: Result<Config, ConfigError>) -> ConfigError {
+        match result {
+            Ok(_) => panic!("expected Err, got Ok"),
+            Err(err) => err,
+        }
+    }
+
     #[test]
     fn defaults_when_no_env() {
-        // Run in a clean environment: from_env reads process env, so only assert
-        // parsing helpers here; env-based behaviour is covered by the contract tests.
-        let config = Config {
-            port: DEFAULT_PORT,
-            storage_mode: StorageMode::Memory,
-            api_versions: vec![DEFAULT_API_VERSION.to_owned()],
-            log_level: DEFAULT_LOG_LEVEL.to_owned(),
-            enable_admin: true,
-        };
-        assert_eq!(config.port, 8080);
+        let config = ok(from_pairs(&[]));
+        assert_eq!(config.port, DEFAULT_PORT);
+        assert_eq!(config.storage_mode, StorageMode::Memory);
+        assert_eq!(config.api_versions, vec![DEFAULT_API_VERSION.to_owned()]);
+        assert_eq!(config.log_level, DEFAULT_LOG_LEVEL);
+        assert!(config.enable_admin);
         assert!(config.supports_api_version("2024-07-01"));
         assert!(!config.supports_api_version("1900-01-01"));
+    }
+
+    #[test]
+    fn overrides_and_multi_api_versions() {
+        let config = ok(from_pairs(&[
+            ("EMULATOR_PORT", "9090"),
+            ("EMULATOR_STORAGE__MODE", "file"),
+            ("EMULATOR_API_VERSIONS", "2024-07-01, 2025-03-01"),
+            ("EMULATOR_LOG_LEVEL", "debug"),
+            ("EMULATOR_ENABLE_ADMIN", "false"),
+        ]));
+        assert_eq!(config.port, 9090);
+        assert_eq!(config.storage_mode, StorageMode::File);
+        assert_eq!(
+            config.api_versions,
+            vec!["2024-07-01".to_owned(), "2025-03-01".to_owned()]
+        );
+        assert_eq!(config.log_level, "debug");
+        assert!(!config.enable_admin);
+    }
+
+    #[test]
+    fn empty_values_fall_back_to_defaults() {
+        let config = ok(from_pairs(&[
+            ("EMULATOR_PORT", ""),
+            ("EMULATOR_ENABLE_ADMIN", ""),
+        ]));
+        assert_eq!(config.port, DEFAULT_PORT);
+        assert!(config.enable_admin);
+    }
+
+    #[test]
+    fn invalid_values_are_rejected() {
+        assert!(matches!(
+            err(from_pairs(&[("EMULATOR_PORT", "not-a-port")])),
+            ConfigError::InvalidPort(_)
+        ));
+        assert!(matches!(
+            err(from_pairs(&[("EMULATOR_STORAGE__MODE", "disk")])),
+            ConfigError::InvalidStorageMode(_)
+        ));
+        assert!(matches!(
+            err(from_pairs(&[("EMULATOR_API_VERSIONS", " , ")])),
+            ConfigError::InvalidApiVersions(_)
+        ));
+        let config_error = err(from_pairs(&[("EMULATOR_ENABLE_ADMIN", "yes")]));
+        assert!(matches!(config_error, ConfigError::InvalidBool(_)));
+        assert!(config_error.to_string().contains("EMULATOR_ENABLE_ADMIN"));
     }
 }

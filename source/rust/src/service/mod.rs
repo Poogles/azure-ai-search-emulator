@@ -112,6 +112,40 @@ impl SearchService {
         }
     }
 
+    /// Creates or replaces an index from a raw Azure `SearchIndex` definition,
+    /// returning the echoed definition. Replacing an index discards its
+    /// documents.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] if the definition is malformed or the schema
+    /// uses unsupported field types.
+    pub fn create_or_update_index(&self, raw: &Value) -> Result<Value, ApiError> {
+        let definition = parse_index_definition(raw)?;
+        validate_schema(&definition)?;
+        self.storage.upsert_index(&definition);
+        Ok(definition.raw.clone())
+    }
+
+    /// Returns the raw stored index definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] if the index does not exist.
+    pub fn get_index(&self, name: &str) -> Result<Value, ApiError> {
+        Ok(self.require_index(name)?.raw)
+    }
+
+    /// Returns the raw stored definitions of all indexes, sorted by name.
+    #[must_use]
+    pub fn list_indexes(&self) -> Vec<Value> {
+        self.storage
+            .list_index_names()
+            .into_iter()
+            .filter_map(|name| self.storage.get_index(&name).map(|def| def.raw))
+            .collect()
+    }
+
     /// Deletes an index by name.
     ///
     /// # Errors

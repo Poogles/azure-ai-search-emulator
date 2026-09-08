@@ -137,6 +137,36 @@ async fn search_match_all_returns_every_document() {
 }
 
 #[tokio::test]
+async fn upload_accepts_sdk_value_envelope() {
+    let app = app();
+    let (status, _) = create_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The Python SDK serializes an IndexBatch as {"value": [...]} and spreads
+    // the document fields at the top level of each action (no "document" key).
+    let (status, body) = call(
+        app,
+        upload_request(
+            "items",
+            json!({
+                "value": [
+                    {"@search.action": "upload", "id": "1", "title": "one"},
+                    {"@search.action": "upload", "id": "2", "title": "two"}
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value = &body["value"];
+    assert_eq!(value.as_array().map(Vec::len), Some(2));
+    assert_eq!(value[0]["key"], "1");
+    assert_eq!(value[0]["status"], true);
+    assert_eq!(value[1]["key"], "2");
+    assert_eq!(value[1]["status"], true);
+}
+
+#[tokio::test]
 async fn upload_to_missing_index_returns_404() {
     let app = app();
     let (status, body) = call(

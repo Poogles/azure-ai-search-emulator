@@ -73,6 +73,12 @@ The image is a static binary on `distroless/static` (< 20 MB) with a built-in `H
 ### E2E tests (Python SDK)
 
 ```sh
+make test
+```
+
+`make test` runs the Python SDK suite from the repository root (the Docker image is built automatically on first use). The manual equivalent:
+
+```sh
 docker build -t aisearch-emulator source/rust
 cd source/tests/python
 poetry install
@@ -91,7 +97,7 @@ source/tests/csharp/   C# SDK compatibility harness — Phase 3
 shell.nix              Nix dev shell definition
 ```
 
-Rust commands run from the repository root with the manifest path:
+Shortcuts: `make rust` (fmt, clippy, tests), `make docker` (build image), `make help` (all targets). Rust commands run from the repository root with the manifest path:
 
 ```sh
 cargo build --manifest-path source/rust/Cargo.toml

@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use aisearch_emulator::api::{build_router, AppState};
 use aisearch_emulator::config::{Config, StorageMode};
+use aisearch_emulator::storage::{InMemoryStorage, Storage};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
@@ -27,7 +30,8 @@ pub fn app_with_admin(enable_admin: bool) -> axum::Router {
         log_level: "off".to_owned(),
         enable_admin,
     };
-    build_router(AppState::new(config))
+    let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+    build_router(AppState::new(config, storage))
 }
 
 pub fn index_definition(name: &str) -> Value {
@@ -71,6 +75,18 @@ pub fn put_index_request(
     request("PUT", &uri, api_key, Some(index_definition(name)))
 }
 
+pub fn post_index_request(
+    name: &str,
+    api_key: Option<&str>,
+    api_version: Option<&str>,
+) -> Request<Body> {
+    let uri = match api_version {
+        Some(version) => format!("/indexes?api-version={version}"),
+        None => "/indexes".to_owned(),
+    };
+    request("POST", &uri, api_key, Some(index_definition(name)))
+}
+
 pub fn upload_request(name: &str, documents: Value) -> Request<Body> {
     let uri = format!("/indexes('{name}')/docs/search.index?api-version={API_VERSION}");
     request("POST", &uri, Some(API_KEY), Some(documents))
@@ -101,7 +117,7 @@ pub async fn create_index(app: &axum::Router, name: &str) -> (StatusCode, Value)
     let app = app.clone();
     call(
         app,
-        put_index_request(name, Some(API_KEY), Some(API_VERSION)),
+        post_index_request(name, Some(API_KEY), Some(API_VERSION)),
     )
     .await
 }

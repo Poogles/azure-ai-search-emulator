@@ -19,6 +19,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+[profile.release]
+strip = true
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 

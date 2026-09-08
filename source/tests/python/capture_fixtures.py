@@ -9,11 +9,16 @@ Outputs sanitized request/response pairs to fixtures/.
 import argparse
 import json
 import re
-import uuid
 from pathlib import Path
 
-from azure.core.pipeline import PipelineContext
-from azure.core.pipeline.transport import HttpRequest, HttpResponse
+from azure.core.credentials import AzureKeyCredential
+from azure.core.pipeline.transport import (
+    HttpRequest,
+    HttpResponse,
+    HttpTransport,
+    RequestsTransport,
+)
+import azure.search.documents.indexes._search_index_client as _search_index_client
 from azure.search.documents import SearchClient
 from azure.search.documents.indexes import SearchIndexClient
 from azure.search.documents.indexes.models import (
@@ -23,59 +28,83 @@ from azure.search.documents.indexes.models import (
 )
 
 API_KEY = "fixture-key"
+CREDENTIAL = AzureKeyCredential(API_KEY)
 INDEX_NAME = "fixture-index"
+# The emulator's default supported API version (see EMULATOR_API_VERSIONS).
+API_VERSION = "2024-07-01"
 
 
-class RecordingTransport:
-    """Wraps the default transport and records every request/response pair."""
+def _allow_http_endpoint(endpoint: str) -> str:
+    if not endpoint.lower().startswith("http"):
+        return "https://" + endpoint
+    return endpoint
 
-    def __init__(self):
-        self._inner = None
+
+# The pinned SDK's SearchIndexClient rejects non-TLS endpoints via
+# normalize_endpoint. The emulator is a local plain-HTTP service, so allow http.
+_search_index_client.normalize_endpoint = _allow_http_endpoint
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+class RecordingTransport(HttpTransport):
+    """Delegates to the default transport and records every exchange."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._inner: RequestsTransport | None = None
         self.records: list[dict] = []
 
-    def open(self):
-        from azure.core.pipeline.transport import RequestsTransport
-
+    def open(self) -> None:
         self._inner = RequestsTransport()
         self._inner.open()
 
-    def close(self):
-        if self._inner:
+    def close(self) -> None:
+        if self._inner is not None:
             self._inner.close()
+            self._inner = None
+
+    def __enter__(self) -> "RecordingTransport":
+        self.open()
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
 
     def send(self, request: HttpRequest, **kwargs) -> HttpResponse:
+        assert self._inner is not None
         response = self._inner.send(request, **kwargs)
-        body = response.read()
+        request_body = request.data
+        if isinstance(request_body, bytes):
+            request_body = request_body.decode("utf-8", errors="replace")
+        response_body = response.body().decode("utf-8", errors="replace")
         self.records.append(
             {
                 "method": request.method,
                 "url": request.url,
-                "headers": {k: v for k, v in request.headers},
-                "body": body.decode("utf-8", errors="replace") if body else None,
+                "headers": dict(request.headers),
+                "request_body": request_body,
                 "status_code": response.status_code,
                 "response_headers": dict(response.headers),
-                "response_body": body.decode("utf-8", errors="replace") if body else None,
+                "response_body": response_body,
             }
         )
-        # Re-wrap so the SDK can read the body again
-        response.set_content(body)
         return response
 
 
 def sanitize(record: dict) -> dict:
     """Strip dynamic values from a recorded exchange."""
     rec = dict(record)
-    # Remove x-ms-client-request-id
-    rec["headers"] = {k: v for k, v in rec["headers"].items() if k.lower() != "x-ms-client-request-id"}
+    rec["headers"] = {
+        k: v for k, v in rec["headers"].items() if k.lower() != "x-ms-client-request-id"
+    }
     rec["response_headers"] = {
         k: v for k, v in rec["response_headers"].items() if k.lower() != "x-ms-client-request-id"
     }
-    # Mask any UUIDs in URLs
-    rec["url"] = re.sub(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "<UUID>", rec["url"])
+    rec["url"] = UUID_RE.sub("<UUID>", rec["url"])
     return rec
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Capture SDK HTTP fixtures")
     parser.add_argument("--endpoint", default="http://localhost:8080")
     parser.add_argument("--output", default="fixtures")
@@ -86,13 +115,15 @@ def main():
 
     index_client = SearchIndexClient(
         endpoint=args.endpoint,
-        credential=API_KEY,
+        credential=CREDENTIAL,
+        api_version=API_VERSION,
         transport=transport,
     )
     search_client = SearchClient(
         endpoint=args.endpoint,
         index_name=INDEX_NAME,
-        credential=API_KEY,
+        credential=CREDENTIAL,
+        api_version=API_VERSION,
         transport=transport,
     )
 
@@ -101,8 +132,8 @@ def main():
         SearchIndex(
             name=INDEX_NAME,
             fields=[
-                SearchField(name="id", type=SearchFieldDataType.STRING, key=True),
-                SearchField(name="title", type=SearchFieldDataType.STRING, searchable=True),
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchField(name="title", type=SearchFieldDataType.String, searchable=True),
             ],
         )
     )
@@ -132,7 +163,7 @@ def main():
         path.write_text(json.dumps(sanitized, indent=2))
         print(f"  {path}")
 
-    print(f"\nCaptured {len(transport.records)} exchanges → {out_dir}/")
+    print(f"\nCaptured {len(transport.records)} exchanges -> {out_dir}/")
 
 
 if __name__ == "__main__":
