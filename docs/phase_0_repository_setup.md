@@ -18,10 +18,10 @@ The implementation language is **Rust**, chosen to leverage mature existing libr
 - Linting, type safety, and formatting tooling (clippy, rustfmt).
 - Test tooling (cargo test) configured but with no meaningful tests yet.
 - Directory layout matching the layered architecture from the initial design (HTTP/API, service, query engine, storage).
-- Python test harness scaffolding (`e2e-python/`) with Poetry, pytest, and testcontainers-python configured (no tests yet).
+- Python test harness scaffolding (`source/tests/python/`) with Poetry, pytest, and testcontainers configured (no tests yet).
 - Nix dev shell updated to provide both the Rust toolchain and Python 3.12+ (for the test harness).
 - CI skeleton (fmt, clippy, test) that runs on the empty project.
-- `docs/decisions.md` recording pinned versions and configuration conventions.
+- `docs/decisions/` recording pinned versions and configuration conventions.
 - README with development instructions.
 
 ## Out of scope
@@ -32,10 +32,10 @@ The implementation language is **Rust**, chosen to leverage mature existing libr
 
 ## Deliverables
 
-1. `Cargo.toml` (workspace) with project metadata and tool configuration.
-2. Crate `aisearch-emulator` with a `src/` layout containing empty layer modules:
+1. `source/rust/Cargo.toml` with project metadata and tool configuration.
+2. Crate `aisearch-emulator` in `source/rust/` with a `src/` layout containing empty layer modules:
    ```text
-   src/
+   source/rust/src/
        main.rs
        lib.rs
        api/          # HTTP / Azure compatibility layer
@@ -45,29 +45,31 @@ The implementation language is **Rust**, chosen to leverage mature existing libr
    ```
 3. Rust test layout:
    ```text
-   tests/
-       contract/     # HTTP contract tests (integrated tests, Phase 2)
+   source/rust/tests/
+       contract.rs       # integration test crate root
+       contract/         # HTTP contract tests (integrated tests, Phase 2)
    ```
    Unit tests live inline via `#[cfg(test)]` in each module.
 4. Python e2e test harness:
    ```text
-   e2e-python/
+   source/tests/python/
        pyproject.toml    # Poetry project
        tests/
            e2e/          # end-to-end tests (Phase 1)
        conftest.py       # testcontainers fixture
    ```
+   C# compatibility tests will be added under `source/tests/csharp/` in Phase 3.
 5. `rustfmt.toml` and clippy configuration (deny warnings in CI).
 6. `pre-commit` configuration (rustfmt, clippy).
 7. CI workflow (GitHub Actions or equivalent) running fmt, clippy, and tests.
 8. `README.md` with setup and run instructions.
 9. `.gitignore` (Cargo, IDE, OS, Python).
 10. Updated `shell.nix` providing the Rust toolchain (rustc, cargo, clippy, rustfmt) and Python 3.12+ via nixpkgs.
-11. `docs/decisions.md` with pinned versions and configuration conventions (see below).
+11. `docs/decisions/` with pinned versions and configuration conventions (see below).
 
 ## Decisions to record
 
-Record the following in `docs/decisions.md` as they are made:
+Record the following in `docs/decisions/` as they are made:
 
 - Rust edition and MSRV (e.g. edition 2021, MSRV matching the nixpkgs toolchain).
 - HTTP framework choice (e.g. Axum or Actix) — chosen in Phase 1, but the dependency should be added here if settled.
@@ -97,7 +99,7 @@ Record the following in `docs/decisions.md` as they are made:
 - [ ] Crate `aisearch-emulator` compiles with `lib.rs` and `main.rs`.
 - [ ] Layer modules (`api`, `service`, `query`, `storage`) exist and compile.
 - [ ] Placeholder test in `tests/` passes via `cargo test`.
-- [ ] `e2e-python/` Poetry project created; `poetry install` succeeds; `poetry run pytest --collect-only` runs (no tests yet).
+- [ ] `source/tests/python/` Poetry project created; `poetry install` succeeds; `poetry run pytest --collect-only` runs (no tests yet).
 
 ### Tooling
 
@@ -113,7 +115,7 @@ Record the following in `docs/decisions.md` as they are made:
 
 ### Decisions
 
-- [ ] `docs/decisions.md` created with pinned API version, SDK version, auth rule, and config env var names.
+- [ ] `docs/decisions/` created with pinned API version, SDK version, auth rule, and config env var names.
 
 ### CI
 
@@ -122,4 +124,4 @@ Record the following in `docs/decisions.md` as they are made:
 
 ## Exit criteria
 
-A developer can clone the repository, enter the nix shell, and run `cargo build`, `cargo fmt --check`, `cargo clippy`, and `cargo test` successfully, with CI green. The Python e2e harness (`e2e-python/`) installs cleanly and is ready for Phase 1 tests. `docs/decisions.md` records all pinned versions and configuration conventions.
+A developer can clone the repository, enter the nix shell, and run `cargo build`, `cargo fmt --check`, `cargo clippy`, and `cargo test` successfully, with CI green. The Python e2e harness (`source/tests/python/`) installs cleanly and is ready for Phase 1 tests. `docs/decisions/` records all pinned versions and configuration conventions.

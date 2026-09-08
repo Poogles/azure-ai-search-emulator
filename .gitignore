@@ -1,0 +1,21 @@
+# Rust
+/source/rust/target/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store
+
+# Environment files
+.env
+.env.*
+!.local.env

@@ -46,11 +46,28 @@ Entering the directory activates the shell automatically. It provides `rustc`, `
 ## Repository layout
 
 ```text
-docs/          Design and phased implementation documents
-source/        Emulator source (Rust) — to be populated in Phase 1
-e2e-python/    Python SDK compatibility / e2e harness (Poetry + pytest + testcontainers) — Phase 1
-e2e-csharp/    C# SDK compatibility harness — Phase 3
-shell.nix      Nix dev shell definition
+docs/                  Design and phased implementation documents
+source/rust/           Rust crate and Rust integration tests
+source/tests/python/   Python SDK compatibility / e2e harness
+source/tests/csharp/   C# SDK compatibility harness — Phase 3
+shell.nix              Nix dev shell definition
+```
+
+Rust commands run from the repository root with the manifest path:
+
+```sh
+cargo build --manifest-path source/rust/Cargo.toml
+cargo test --manifest-path source/rust/Cargo.toml
+cargo fmt --manifest-path source/rust/Cargo.toml -- --check
+cargo clippy --manifest-path source/rust/Cargo.toml --all-targets -- -D warnings
+```
+
+The Python harness is installed and checked from its directory:
+
+```sh
+cd source/tests/python
+poetry install
+poetry run pytest --collect-only
 ```
 
 ## Documentation
@@ -61,4 +78,4 @@ shell.nix      Nix dev shell definition
 - [docs/phase_2_production_api.md](docs/phase_2_production_api.md) — full API surface and test suite.
 - [docs/phase_3_admin_api_and_remaining.md](docs/phase_3_admin_api_and_remaining.md) — admin API, C# compatibility, release.
 
-Additional documents (`docs/decisions.md`, `docs/supported_operations.md`, `docs/known_differences.md`) are created as the corresponding phases are implemented.
+Additional documents (`docs/decisions/`, `docs/supported_operations.md`, `docs/known_differences.md`) are created as the corresponding phases are implemented.

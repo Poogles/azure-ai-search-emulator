@@ -53,7 +53,7 @@ Admin endpoints should be:
 
 - `README.md` final: quickstart (local, Docker, testcontainers), configuration reference, supported operations, known limitations.
 - `docs/known_differences.md` extended with findings from Azure comparison testing (created in Phase 2).
-- `docs/decisions.md` — record all decisions deferred from earlier phases (SDK versions, API versions, storage defaults).
+- `docs/decisions/` — record all decisions deferred from earlier phases (SDK versions, API versions, storage defaults).
 - Open questions from the initial design resolved or explicitly deferred with rationale.
 - Performance sanity check: document baseline throughput/latency for typical operations (no production-scale guarantees, per non-goals).
 

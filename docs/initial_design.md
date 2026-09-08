@@ -243,7 +243,7 @@ Authentication should be configurable independently.
 
 The emulator should accept the credential format expected by the SDK where practical, but should not require valid Azure credentials.
 
-The emulator accepts any non-empty `api-key` header and ignores its value. A missing or empty key returns `401` with the Azure error structure. See `docs/decisions.md` for the exact rule.
+The emulator accepts any non-empty `api-key` header and ignores its value. A missing or empty key returns `401` with the Azure error structure. See `docs/decisions/` for the exact rule.
 
 Authentication should therefore be treated as a compatibility mechanism rather than a security boundary.
 
@@ -973,7 +973,7 @@ The implementation is split into independently reviewable phases, each with its 
    * Tooling (clippy, rustfmt, cargo test).
    * Python test harness scaffolding (Poetry, pytest, testcontainers).
    * CI skeleton.
-   * `docs/decisions.md` with pinned versions and configuration conventions.
+   * `docs/decisions/` with pinned versions and configuration conventions.
 
 2. **Phase 1 — Application scaffold and end-to-end test** (`docs/phase_1_scaffold_and_e2e.md`)
 
@@ -1019,7 +1019,7 @@ The following are resolved during the Phase 2 API surface discovery (see `docs/p
 * Which behaviours must be identical between Python and C# clients?
 * Which tests must continue to run against real Azure AI Search?
 
-The following are resolved in Phase 0 (`docs/decisions.md`):
+The following are resolved in Phase 0 (`docs/decisions/`):
 
 * Which exact Azure AI Search SDK versions are supported (pinned).
 * Which Azure API version(s) must be supported (pinned).

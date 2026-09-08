@@ -1,0 +1,1 @@
+//! HTTP / Azure compatibility layer.

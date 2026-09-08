@@ -1,0 +1,20 @@
+[package]
+name = "aisearch-emulator"
+description = "Local HTTP-compatible emulator for Azure AI Search"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace]
+resolver = "2"
+
+[dependencies]
+
+[dev-dependencies]
+
+[lints.clippy]
+all = { level = "warn", priority = -100 }
+pedantic = { level = "warn", priority = -99 }
+unwrap_used = "deny"
+expect_used = "deny"

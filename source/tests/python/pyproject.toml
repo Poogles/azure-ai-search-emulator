@@ -1,0 +1,16 @@
+[project]
+name = "aisearch-emulator-e2e"
+version = "0.1.0"
+description = "Python SDK end-to-end compatibility tests for the Azure AI Search emulator"
+requires-python = ">=3.12"
+dependencies = [
+    "azure-search-documents==11.6.0",
+    "pytest>=8.0",
+    "testcontainers>=4.0",
+]
+
+[tool.poetry]
+package-mode = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
