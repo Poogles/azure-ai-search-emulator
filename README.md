@@ -8,7 +8,7 @@ The emulator is a **compatible test double with a persistent search implementati
 
 ## Status
 
-The project is in **Phase 0 — Repository Setup**. The design and phased implementation plan are in place; the emulator itself is not yet implemented. See [docs/](docs/) for details.
+The project is in **Phase 1 — Application Scaffold and E2E Test**. A runnable HTTP service with Azure-compatible endpoints is implemented, containerised, and exercised by the official Python SDK through testcontainers. See [docs/](docs/) for details.
 
 | Phase | Description | Doc |
 |-------|-------------|-----|
@@ -42,6 +42,44 @@ direnv allow
 ```
 
 Entering the directory activates the shell automatically. It provides `rustc`, `cargo`, `clippy`, `rustfmt`, Python 3.14, `poetry`, `pre-commit`, and `docker`.
+
+## Running the emulator
+
+### Local (cargo)
+
+```sh
+cargo run --manifest-path source/rust/Cargo.toml
+```
+
+Serves on `http://localhost:8080` by default. Configure via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EMULATOR_PORT` | `8080` | Listen port |
+| `EMULATOR_STORAGE__MODE` | `memory` | `memory` or `file` (file not yet implemented) |
+| `EMULATOR_API_VERSIONS` | `2024-07-01` | Comma-separated supported API versions |
+| `EMULATOR_LOG_LEVEL` | `info` | Log level |
+| `EMULATOR_ENABLE_ADMIN` | `true` | Enable `/admin/reset` |
+
+### Docker
+
+```sh
+docker build -t aisearch-emulator source/rust
+docker run --rm -p 8080:8080 aisearch-emulator
+```
+
+The image is a static binary on `distroless/static` (< 20 MB) with a built-in `HEALTHCHECK`.
+
+### E2E tests (Python SDK)
+
+```sh
+docker build -t aisearch-emulator source/rust
+cd source/tests/python
+poetry install
+poetry run pytest tests/e2e -v
+```
+
+The E2E suite starts the container via testcontainers and exercises the official `azure-search-documents` SDK: create index, upload documents, search, delete index.
 
 ## Repository layout
 
