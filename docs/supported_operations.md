@@ -50,6 +50,22 @@ Everything else (e.g. `Edm.Vector(...)`, `Edm.Collection(Edm.ComplexType)`, `Edm
 
 Field attributes (`searchable`, `filterable`, `sortable`, `facetable`, `retrievable`) are parsed, stored, and echoed. `searchable` controls full-text indexing; `filterable`, `sortable`, and `facetable` gate the corresponding query options (a field used in `filter`/`orderby`/`facets` must carry the matching attribute, else `400 InvalidQuery`). Collection types may be written with or without the `Edm.` prefix (`Collection(Edm.String)` as sent by the SDK, or `Edm.Collection(Edm.String)`); both are accepted and normalized.
 
+## Synonym maps
+
+Service-level resource (not scoped to an index). Synonym maps are stored and echoed but **inert**: they do not affect search results (see `docs/known_differences.md`).
+
+| Operation | SDK method | HTTP request | Success | Errors | Status |
+|-----------|-----------|--------------|---------|--------|--------|
+| Create synonym map | `SearchIndexClient.create_synonym_map` | `POST /synonymmaps?api-version=...` | `201` + the map | `409 SynonymMapAlreadyExists`, `400 InvalidSynonymMap` | Supported |
+| Create or update synonym map | `SearchIndexClient.create_or_update_synonym_map` | `PUT /synonymmaps('{name}')?api-version=...` | `201` + the map | `400 InvalidSynonymMap` | Supported |
+| Get synonym map | `SearchIndexClient.get_synonym_map` | `GET /synonymmaps('{name}')?api-version=...` | `200` + the map | `404 ResourceNotFound` | Supported |
+| List synonym maps | `SearchIndexClient.get_synonym_maps` | `GET /synonymmaps?api-version=...` | `200 {"value": [...]}` (sorted by name) | — | Supported |
+| Delete synonym map | `SearchIndexClient.delete_synonym_map` | `DELETE /synonymmaps('{name}')?api-version=...` | `204` | `404 ResourceNotFound` | Supported |
+
+Wire format (as sent by the pinned Python SDK): `{"name": "...", "format": "solr", "synonyms": "rule1\nrule2"}` — `synonyms` is a single newline-joined string. Responses are `{"name", "format", "synonyms", "@odata.etag"}`; the etag is an opaque counter string bumped on every create or update.
+
+Validation (rejected with `400 InvalidSynonymMap`): missing/empty `name`, `format` other than `solr` (the only format Azure supports), empty/whitespace-only `synonyms`, and a path/body name mismatch on `PUT`.
+
 ## Document management
 
 All batch operations use one route: `POST /indexes('{name}')/docs/search.index?api-version=...`.
@@ -199,10 +215,12 @@ When more results exist beyond the returned page, the response includes `@odata.
 | `400` | `InvalidRequest` | Missing or invalid JSON request body |
 | `400` | `InvalidDocuments` | Document batch is not an array or `{"value": [...]}` object |
 | `400` | `InvalidQuery` | Search body is not a JSON object; `top`/`skip` not non-negative integers; invalid search text, filter, orderby, select, facets, or searchFields; stale or invalid continuation token |
+| `400` | `InvalidSynonymMap` | Missing/empty synonym-map name, format other than `solr`, empty synonyms, malformed `synonymmaps('name')` path segment, path/body name mismatch on `PUT` |
 | `400` | `UnsupportedQuery` | Unsupported search option or `queryType` |
 | `400` | `UnsupportedAction` | Unknown document action (only `upload`, `merge`, `mergeOrUpload`, `delete` are supported) |
-| `404` | `ResourceNotFound` | Get/delete/upload/search/get-document on a missing index; get-document on a missing document key |
+| `404` | `ResourceNotFound` | Get/delete/upload/search/get-document on a missing index; get-document on a missing document key; get/delete on a missing synonym map |
 | `409` | `IndexAlreadyExists` | `POST /indexes` with an existing name |
+| `409` | `SynonymMapAlreadyExists` | `POST /synonymmaps` with an existing name |
 | `500` | `InternalError` | Search engine failure |
 
 ## Storage and consistency
@@ -217,6 +235,7 @@ When more results exist beyond the returned page, the response includes `@odata.
 | Capability | Contract tests | Unit tests | Python SDK/e2e |
 |------------|----------------|------------|------------|
 | Index create/get/list/update/delete | `tests/contract/index_management.rs` | `service`, `storage` | `test_emulator.py`, `tests/sdk/` |
+| Synonym map create/update/get/list/delete, auth, validation, reset | `tests/contract/synonym_maps.rs` | `service` | `tests/ms_samples/` (`sample_index_synonym_map_crud.py`) |
 | Document upload/merge/mergeOrUpload/delete, per-document errors, batch shapes, get-document, document count, GeographyPoint values | `tests/contract/document_management.rs` | `service` | `tests/sdk/` |
 | Search shape, count, match-all, boolean operators, searchFields, facet options, analyze text, service stats | `tests/contract/search.rs` | `query`, `service` | `tests/sdk/` |
 | Filters, including nested complex-type paths | `tests/contract/filtering.rs` | `filter`, `service` | `tests/sdk/` |

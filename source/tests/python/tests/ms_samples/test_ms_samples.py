@@ -43,7 +43,6 @@ KNOWN_ISSUES = {
     # --- Emulator gaps: the feature is not implemented. Pinned to the Azure
     #     error signature so the gap is documented and the test alerts us when
     #     the feature lands (the sample starts passing -> promote it).
-    "sample_index_synonym_map_crud.py": ("gap", "Method Not Allowed"),  # synonym maps 405
     "sample_query_autocomplete.py": ("gap", "Not Found"),  # autocomplete 404
     "sample_query_suggestions.py": ("gap", "Not Found"),  # suggest 404
     # --- Cannot run here: needs azure-search-documents >= 12.0.0 (harness pins 11.6.0).

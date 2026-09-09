@@ -78,9 +78,15 @@ Differences fall into two categories:
 - Only the versions listed in `EMULATOR_API_VERSIONS` (default `2024-07-01`) are accepted; Azure accepts a wide range of versions with version-specific behaviour. There is no version adapter: behaviour is identical across all accepted versions.
 - **Rationale:** one supported version is sufficient for the pinned SDKs; unsupported versions fail explicitly rather than guessing.
 
+### Synonym maps
+
+- Synonym maps are stored, echoed, and managed (create/update/get/list/delete) but **inert**: they do not affect search results. Azure rewrites queries using the map's rules; the emulator never applies them.
+- Etags are opaque counter strings, not Azure's hex entity tags.
+- **Rationale:** the CRUD surface is implemented so samples and clients that manage maps work unchanged; applying Solr synonym rules to the query pipeline is out of scope for a test double. Test assertions must not expect synonym expansion in search results.
+
 ### Service surface
 
-- No indexers, data sources, skillsets, synonym maps, or other admin resources — those routes are not registered (`404`).
+- No indexers, data sources, skillsets, or other admin resources — those routes are not registered (`404`).
 - No asynchronous index operations: everything completes synchronously.
 - `GET /health` and `POST /admin/reset` exist only in the emulator (the latter gated by `EMULATOR_ENABLE_ADMIN`).
 - **Rationale:** the emulator implements the surface our applications use (see `docs/supported_operations.md`), not the full Azure service.

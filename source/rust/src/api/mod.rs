@@ -44,6 +44,10 @@ pub fn build_router(state: AppState) -> Router {
     let azure = Router::new()
         .route("/indexes", post(create_index).get(list_indexes))
         .route(
+            "/synonymmaps",
+            post(create_synonym_map).get(list_synonym_maps),
+        )
+        .route(
             "/{index}",
             get(get_index)
                 .put(create_or_update_index)
@@ -100,12 +104,36 @@ async fn create_index(
 }
 
 /// `PUT /indexes('{name}')` — Create or Update Index. Replaces any existing
-/// index (and its documents).
+/// index (and its documents). Also dispatches `PUT /synonymmaps('{name}')`
+/// (create or update synonym map), which shares the single-segment route.
 async fn create_or_update_index(
     State(state): State<AppState>,
     Path(raw_name): Path<String>,
     body: axum::body::Bytes,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    if let Some(raw) = raw_name.strip_prefix("synonymmaps(") {
+        let name = parse_synonym_map_name(raw)?;
+        let definition = parse_body(&body)?;
+        let body_name = definition.get("name").and_then(Value::as_str).unwrap_or("");
+        if name != body_name {
+            return Err(ApiError::bad_request(
+                "InvalidSynonymMap",
+                format!("Synonym map name in path ({name:?}) does not match name in body."),
+            ));
+        }
+        let format = definition
+            .get("format")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let synonyms = definition
+            .get("synonyms")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let map = state
+            .service
+            .create_or_update_synonym_map(&name, format, synonyms)?;
+        return Ok((StatusCode::CREATED, Json(map.to_value())));
+    }
     let name = parse_index_name(&raw_name)?;
     let definition = parse_body(&body)?;
     let body_name = definition.get("name").and_then(Value::as_str).unwrap_or("");
@@ -125,21 +153,66 @@ async fn list_indexes(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "value": value }))
 }
 
+/// `GET /indexes('{name}')` — Get Index. Also dispatches
+/// `GET /synonymmaps('{name}')` (get synonym map), which shares the
+/// single-segment route.
 async fn get_index(
     State(state): State<AppState>,
     Path(raw_name): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    if let Some(raw) = raw_name.strip_prefix("synonymmaps(") {
+        let name = parse_synonym_map_name(raw)?;
+        return Ok(Json(state.service.get_synonym_map(&name)?.to_value()));
+    }
     let name = parse_index_name(&raw_name)?;
     Ok(Json(state.service.get_index(&name)?))
 }
 
+/// `DELETE /indexes('{name}')` — Delete Index. Also dispatches
+/// `DELETE /synonymmaps('{name}')` (delete synonym map), which shares the
+/// single-segment route.
 async fn delete_index(
     State(state): State<AppState>,
     Path(raw_name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    if let Some(raw) = raw_name.strip_prefix("synonymmaps(") {
+        let name = parse_synonym_map_name(raw)?;
+        state.service.delete_synonym_map(&name)?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
     let name = parse_index_name(&raw_name)?;
     state.service.delete_index(&name)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /synonymmaps` — Create Synonym Map. The name comes from the body.
+async fn create_synonym_map(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let definition = parse_body(&body)?;
+    let name = definition.get("name").and_then(Value::as_str).unwrap_or("");
+    let format = definition
+        .get("format")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let synonyms = definition
+        .get("synonyms")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let map = state.service.create_synonym_map(name, format, synonyms)?;
+    Ok((StatusCode::CREATED, Json(map.to_value())))
+}
+
+/// `GET /synonymmaps` — List Synonym Maps.
+async fn list_synonym_maps(State(state): State<AppState>) -> Json<Value> {
+    let maps = state
+        .service
+        .list_synonym_maps()
+        .into_iter()
+        .map(|map| map.to_value())
+        .collect::<Vec<_>>();
+    Json(json!({ "value": maps }))
 }
 
 async fn upload_documents(
@@ -417,10 +490,16 @@ async fn azure_guard(
     next: middleware::Next,
 ) -> Result<Response, ApiError> {
     // Only enforce Azure auth/version on the index operation surface
-    // (`/indexes`, `/indexes('name')...`, and `/servicestats`); let
-    // everything else fall through to routing.
+    // (`/indexes`, `/indexes('name')...`, `/synonymmaps`,
+    // `/synonymmaps('name')...`, and `/servicestats`); let everything else
+    // fall through to routing.
     let path = request.uri().path();
-    if path != "/indexes" && !path.starts_with("/indexes(") && path != "/servicestats" {
+    if path != "/indexes"
+        && !path.starts_with("/indexes(")
+        && path != "/synonymmaps"
+        && !path.starts_with("/synonymmaps(")
+        && path != "/servicestats"
+    {
         return Ok(next.run(request).await);
     }
     let api_key = request
@@ -502,6 +581,26 @@ fn parse_index_name(raw: &str) -> Result<String, ApiError> {
     Ok(name.to_owned())
 }
 
+/// Parses the OData-style synonym-map path segment `synonymmaps('name')`.
+/// Takes the segment with the `synonymmaps(` prefix already stripped.
+fn parse_synonym_map_name(raw: &str) -> Result<String, ApiError> {
+    let invalid = || {
+        ApiError::bad_request(
+            "InvalidSynonymMap",
+            format!("Invalid synonym map path segment {raw:?}; expected synonymmaps('name')."),
+        )
+    };
+    let inner = raw.strip_suffix(')').ok_or_else(invalid)?;
+    let name = inner
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .ok_or_else(invalid)?;
+    if name.is_empty() {
+        return Err(invalid());
+    }
+    Ok(name.to_owned())
+}
+
 /// Parses the OData-style document path segment `docs('key')`.
 fn parse_document_key(raw: &str) -> Result<String, ApiError> {
     let invalid = || {
@@ -569,6 +668,21 @@ fn operation_for(method: &axum::http::Method, path: &str) -> &'static str {
             "getDocument"
         } else {
             "unknown"
+        };
+    }
+    if path == "/synonymmaps" {
+        return if method.as_str() == "POST" {
+            "createSynonymMap"
+        } else {
+            "listSynonymMaps"
+        };
+    }
+    if path.starts_with("/synonymmaps(") {
+        return match method.as_str() {
+            "GET" => "getSynonymMap",
+            "PUT" => "createOrUpdateSynonymMap",
+            "DELETE" => "deleteSynonymMap",
+            _ => "unknown",
         };
     }
     match method.as_str() {

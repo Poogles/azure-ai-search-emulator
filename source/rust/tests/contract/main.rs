@@ -11,3 +11,4 @@ mod filtering;
 mod index_management;
 mod pagination;
 mod search;
+mod synonym_maps;

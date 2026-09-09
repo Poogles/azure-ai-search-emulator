@@ -129,6 +129,35 @@ pub struct SearchOutcome {
     pub next_skip: u64,
 }
 
+/// A synonym map: a named collection of synonym rules in Solr format.
+/// Synonym maps are stored and echoed but inert: they do not affect search
+/// results (see `docs/known_differences.md`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SynonymMap {
+    pub name: String,
+    /// Always `"solr"`; the only format Azure supports.
+    pub format: String,
+    /// The synonym rules joined by newlines (the wire format the SDKs use).
+    pub synonyms: String,
+    /// Opaque entity tag, bumped on every create or update.
+    pub etag: String,
+}
+
+impl SynonymMap {
+    /// The JSON representation returned by the synonym-map routes.
+    #[must_use]
+    pub fn to_value(&self) -> Value {
+        Value::Object({
+            let mut map = Map::new();
+            map.insert("name".to_owned(), Value::String(self.name.clone()));
+            map.insert("format".to_owned(), Value::String(self.format.clone()));
+            map.insert("synonyms".to_owned(), Value::String(self.synonyms.clone()));
+            map.insert("@odata.etag".to_owned(), Value::String(self.etag.clone()));
+            map
+        })
+    }
+}
+
 /// A continuation token: the opaque `base64(json{filter, orderby, skip,
 /// state_version})` value carried in `@odata.nextLink` and returned by the
 /// client in the `continuation` request parameter.
@@ -172,6 +201,10 @@ pub struct SearchService {
     /// mutation; embedded in continuation tokens so stale tokens can be
     /// detected.
     state_version: AtomicU64,
+    /// Service-level synonym maps, keyed by name (sorted).
+    synonym_maps: std::sync::RwLock<std::collections::BTreeMap<String, SynonymMap>>,
+    /// Counter for generated synonym-map etags.
+    synonym_map_etags: AtomicU64,
 }
 
 impl SearchService {
@@ -180,6 +213,8 @@ impl SearchService {
             storage,
             engine,
             state_version: AtomicU64::new(0),
+            synonym_maps: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+            synonym_map_etags: AtomicU64::new(0),
         }
     }
 
@@ -295,6 +330,118 @@ impl SearchService {
                 "Index {name:?} was not found."
             )))
         }
+    }
+
+    /// Creates a new synonym map.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] if the definition is invalid (`400
+    /// InvalidSynonymMap`) or a map with the same name exists (`409
+    /// SynonymMapAlreadyExists`).
+    pub fn create_synonym_map(
+        &self,
+        name: &str,
+        format: &str,
+        synonyms: &str,
+    ) -> Result<SynonymMap, ApiError> {
+        validate_synonym_map(name, format, synonyms)?;
+        let mut maps = self
+            .synonym_maps
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if maps.contains_key(name) {
+            return Err(ApiError::conflict(
+                "SynonymMapAlreadyExists",
+                format!("A synonym map with name {name:?} already exists."),
+            ));
+        }
+        Ok(self.insert_synonym_map(&mut maps, name, format, synonyms))
+    }
+
+    /// Creates or replaces a synonym map. Replacing a map issues a new etag.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] if the definition is invalid (`400
+    /// InvalidSynonymMap`).
+    pub fn create_or_update_synonym_map(
+        &self,
+        name: &str,
+        format: &str,
+        synonyms: &str,
+    ) -> Result<SynonymMap, ApiError> {
+        validate_synonym_map(name, format, synonyms)?;
+        let mut maps = self
+            .synonym_maps
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(self.insert_synonym_map(&mut maps, name, format, synonyms))
+    }
+
+    /// Returns a clone of the synonym map with the given name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] if the map does not exist.
+    pub fn get_synonym_map(&self, name: &str) -> Result<SynonymMap, ApiError> {
+        let maps = self
+            .synonym_maps
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        maps.get(name)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found(format!("Synonym map {name:?} was not found.")))
+    }
+
+    /// Returns clones of all synonym maps, sorted by name.
+    #[must_use]
+    pub fn list_synonym_maps(&self) -> Vec<SynonymMap> {
+        let maps = self
+            .synonym_maps
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        maps.values().cloned().collect()
+    }
+
+    /// Deletes a synonym map by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] if the map does not exist.
+    pub fn delete_synonym_map(&self, name: &str) -> Result<(), ApiError> {
+        let mut maps = self
+            .synonym_maps
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if maps.remove(name).is_some() {
+            Ok(())
+        } else {
+            Err(ApiError::not_found(format!(
+                "Synonym map {name:?} was not found."
+            )))
+        }
+    }
+
+    fn insert_synonym_map(
+        &self,
+        maps: &mut std::collections::BTreeMap<String, SynonymMap>,
+        name: &str,
+        format: &str,
+        synonyms: &str,
+    ) -> SynonymMap {
+        let etag = self
+            .synonym_map_etags
+            .fetch_add(1, Ordering::SeqCst)
+            .to_string();
+        let map = SynonymMap {
+            name: name.to_owned(),
+            format: format.to_owned(),
+            synonyms: synonyms.to_owned(),
+            etag,
+        };
+        maps.insert(name.to_owned(), map.clone());
+        map
     }
 
     /// Returns a single document by key.
@@ -720,6 +867,11 @@ impl SearchService {
     pub fn reset(&self) {
         self.storage.reset();
         self.engine.reset();
+        let mut maps = self
+            .synonym_maps
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        maps.clear();
         self.bump_state_version();
     }
 
@@ -1292,6 +1444,30 @@ fn validate_subfields(field: &FieldDefinition) -> Result<(), ApiError> {
                 ),
             ));
         }
+    }
+    Ok(())
+}
+
+/// Validates a synonym-map definition: a non-empty name, the `solr` format
+/// (the only format Azure supports), and at least one non-blank synonym rule.
+fn validate_synonym_map(name: &str, format: &str, synonyms: &str) -> Result<(), ApiError> {
+    if name.is_empty() {
+        return Err(ApiError::bad_request(
+            "InvalidSynonymMap",
+            "The synonym map name is required.",
+        ));
+    }
+    if format != "solr" {
+        return Err(ApiError::bad_request(
+            "InvalidSynonymMap",
+            format!("Synonym map format {format:?} is not supported; only \"solr\" is supported."),
+        ));
+    }
+    if synonyms.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "InvalidSynonymMap",
+            "The synonym map must contain at least one synonym rule.",
+        ));
     }
     Ok(())
 }

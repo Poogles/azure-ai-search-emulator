@@ -60,8 +60,10 @@ Each sample is classified in `KNOWN_ISSUES` (`test_ms_samples.py`):
 ## Current state
 
 32 sync samples discovered. `make test-ms`: **10 passed, 22 skipped, 0 failed.**
+(The passed count includes the gap-pinned samples, whose tests pass while the
+sample fails with the documented signature: 8 genuine passes + 2 gap pins.)
 
-### Passes (7)
+### Passes (8)
 
 | Sample | Notes |
 |--------|-------|
@@ -72,12 +74,12 @@ Each sample is classified in `KNOWN_ISSUES` (`test_ms_samples.py`):
 | `sample_query_filter.py` | Genuine pass since the complex-type fix (`Address/StateProvince` filter against the `Address` complex field in the seeded hotels index). |
 | `sample_index_analyze_text.py` | Genuine pass since the `POST /search.analyze` fix: tokenizes text and returns tokens with offsets. |
 | `sample_query_session.py` | Genuine pass since the `sessionId` fix: the option is accepted and silently ignored (deterministic ordering makes session affinity irrelevant). |
+| `sample_index_synonym_map_crud.py` | Genuine pass since the synonym-map CRUD fix: create (incl. from file), list, get, and delete of Solr-format maps all round-trip. Maps are stored but inert (see `known_differences.md`). |
 
-### Documented emulator gaps (3)
+### Documented emulator gaps (2)
 
 | Sample | Fails with | Missing feature |
 |--------|-----------|-----------------|
-| `sample_index_synonym_map_crud.py` | 405 `Method Not Allowed` | Synonym-map routes not implemented. |
 | `sample_query_autocomplete.py` | 404 `Not Found` | Autocomplete route not implemented. |
 | `sample_query_suggestions.py` | 404 `Not Found` | Suggest route not implemented. |
 
@@ -96,7 +98,7 @@ order (each builds on prior auth-guard / route changes).
 | 1 | Document count (`$count`) | ☑ done | |
 | 7 | Service stats (`/servicestats`) | ☑ done | |
 | 2 | Analyze text (`/search.analyze`) | ☑ done | |
-| 3 | Synonym maps CRUD | ☐ not started | |
+| 3 | Synonym maps CRUD | ☑ done | |
 | 4 | Autocomplete | ☐ not started | |
 | 5 | Suggest | ☐ not started | |
 
@@ -215,7 +217,7 @@ simplification (documented in `known_differences.md`).
 
 ---
 
-#### Gap 3 — Synonym maps CRUD (medium, ~2-3 hrs)
+#### Gap 3 — Synonym maps CRUD (medium, ~2-3 hrs) ✅
 
 **Sample:** `sample_index_synonym_map_crud.py`
 **Routes:**
@@ -225,33 +227,37 @@ simplification (documented in `known_differences.md`).
 - `PUT /synonymmaps('{name}')` (create or update)
 - `DELETE /synonymmaps('{name}')` (delete)
 
-**Current failure:** 405 `Method Not Allowed`
+**Was:** 405 `Method Not Allowed`
 
-**What is required:**
+**What was done:**
 
-- [ ] Define a `SynonymMap` struct: `name: String`, `format: String`
-      (always `"solr"`), `synonyms: Vec<String>`, `etag: String`
-      (generated UUID or incrementing counter).
-- [ ] Add storage: a `BTreeMap<String, SynonymMap>` in `SearchService` (or a
-      dedicated `SynonymMapStore`).
-- [ ] Add routes. The OData-style `synonymmaps('name')` is a single path
-      segment, so it conflicts with the existing `/{index}` route. Options:
-      - Register `POST /synonymmaps` and `GET /synonymmaps` as literal routes
-        (no conflict).
-      - For `GET/PUT/DELETE /{segment}`: dispatch in the existing `/{index}`
-        handler — if the raw segment starts with `synonymmaps(`, route to
-        synonym-map logic; otherwise treat as an index name.
-- [ ] Extend `azure_guard` to cover `/synonymmaps` and `/synonymmaps(` paths.
-- [ ] Response format:
+- [x] Defined a `SynonymMap` struct (`name`, `format`, `synonyms`, `etag`)
+      in `source/rust/src/service/mod.rs`. Note: the pinned SDK sends
+      `synonyms` as a single newline-joined **string** (not an array), so it
+      is stored and echoed in that wire form.
+- [x] Added storage: a `BTreeMap<String, SynonymMap>` in `SearchService`
+      (service-level, not per-index), with an incrementing counter for etags.
+      `reset()` clears the maps.
+- [x] Added routes. `POST /synonymmaps` and `GET /synonymmaps` are literal
+      routes; `GET/PUT/DELETE /synonymmaps('{name}')` dispatch in the existing
+      `/{index}` handlers (the raw segment starts with `synonymmaps(`).
+- [x] Extended `azure_guard` to cover `/synonymmaps` and `/synonymmaps(` paths.
+- [x] Response format:
       ```json
-      {"name": "...", "format": "solr", "synonyms": ["a, b, c"], "@odata.etag": "\"...\""}
+      {"name": "...", "format": "solr", "synonyms": "a, b\nc, d", "@odata.etag": "1"}
       ```
-      List response: `{"value": [...]}`.
-- [ ] Add contract tests (create, list, get, update, delete).
-- [ ] Document in `known_differences.md`: synonym maps are stored but inert
+      List response: `{"value": [...]}` (sorted by name). Create/update return
+      `201`; delete returns `204`; missing map returns `404 ResourceNotFound`;
+      duplicate create returns `409 SynonymMapAlreadyExists`; invalid
+      definition (missing name, non-`solr` format, empty synonyms, path/body
+      name mismatch) returns `400 InvalidSynonymMap`.
+- [x] Added contract tests in `source/rust/tests/contract/synonym_maps.rs`
+      (create, duplicate, list, get, update, delete, auth, validation, reset).
+- [x] Documented in `known_differences.md`: synonym maps are stored but inert
       (do not affect search results).
-- [ ] Remove the `KNOWN_ISSUES` entry.
-- [ ] Run `make test-ms` to confirm.
+- [x] Removed the `KNOWN_ISSUES` entry in
+      `source/tests/python/tests/ms_samples/test_ms_samples.py`.
+- [x] `make test-ms` confirms the sample passes.
 
 ---
 
@@ -322,16 +328,17 @@ simplification (documented in `known_differences.md`).
 #### Cross-cutting changes (apply as each gap lands)
 
 - [x] `azure_guard` middleware (`source/rust/src/api/mod.rs`): extended to
-      cover `/servicestats` (done with Gap 7). Still needs `/synonymmaps`
-      and `/synonymmaps(` (Gap 3).
+      cover `/servicestats` (done with Gap 7) and `/synonymmaps` /
+      `/synonymmaps(` (done with Gap 3).
 - [x] `docs/supported_operations.md`: updated for `$count`, `/search.analyze`,
-      `/servicestats`, and `sessionId` (done with Gaps 1, 2, 6, 7).
-- [x] `docs/known_differences.md`: documented `sessionId` as inert and
-      `/search.analyze` default-analyzer simplification (done with Gaps 2, 6).
-      Still needs: inert synonym maps, prefix-match autocomplete/suggest
-      (Gaps 3, 4, 5).
+      `/servicestats`, `sessionId`, and synonym maps (done with Gaps 1, 2, 3,
+      6, 7).
+- [x] `docs/known_differences.md`: documented `sessionId` as inert,
+      `/search.analyze` default-analyzer simplification (done with Gaps 2, 6),
+      and inert synonym maps (done with Gap 3). Still needs: prefix-match
+      autocomplete/suggest (Gaps 4, 5).
 - [x] `source/tests/python/tests/ms_samples/test_ms_samples.py`: removed
-      `KNOWN_ISSUES` entries for Gaps 1, 2, 6, 7.
+      `KNOWN_ISSUES` entries for Gaps 1, 2, 3, 6, 7.
 - [ ] `source/tests/python/ms_samples/setup_hotels.py`: add suggester
       definition (needed for Gaps 4 and 5).
 
