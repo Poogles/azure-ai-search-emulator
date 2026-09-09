@@ -21,7 +21,7 @@ Differences fall into two categories:
 | Scoring profiles, parameters, statistics | Rejected | Scoring is a constant placeholder (see below). |
 | Semantic and vector queries | Rejected | Out of scope for the emulator (initial design non-goal). |
 | `queryType` other than `simple` (e.g. `full`/Lucene) | Rejected | Only simple-query semantics are implemented. |
-| `count_documents()` (`/docs/$count`), suggest, autocomplete | Route not registered; `404` | Not part of the supported matrix. |
+| Suggest, autocomplete | Route not registered; `404` | Not part of the supported matrix. |
 
 ## Silently different (operation succeeds, result may differ from Azure)
 
@@ -29,12 +29,14 @@ Differences fall into two categories:
 
 - `@search.score` is `1.0` for every result. Azure computes a relevance score.
 - Results are ordered by the index key field, not by relevance. Azure orders by score (then by its own tie-breaks).
+- `sessionId` is accepted but inert: Azure uses it to maintain consistent scoring across a user session; the emulator's deterministic ordering and constant scoring make it irrelevant.
 - **Rationale:** deterministic ordering makes tests stable and independent of index contents; real relevance ranking is not needed for a test double. Test assertions must not assume relevance ordering or score values.
 
 ### Query matching
 
 - **Simple** query semantics with `+`/`-` modifiers and `"quoted phrases"`: a multi-term search matches when every required analyzer token matches at least one searchable string field (AND). Azure simple queries additionally support proximity behaviour and more modifiers.
 - Tokenization uses Tantivy's default English analyzer: lowercasing and punctuation splitting, **no stemming and no stopword removal**. Azure uses its own analyzers (e.g. the basic English analyzer stems and can drop stopwords), so `running` does not match `run` in the emulator, and `the` is a matchable term.
+- `POST /search.analyze` always uses Tantivy's default analyzer regardless of the `analyzerName` or `field` parameters (accepted but inert). Token offsets and positions are accurate for the default analyzer.
 - **Rationale:** whole-token, case-insensitive matching covers the assertions our tests make; e2e assertions deliberately use whole-token search terms so they would also pass against Azure.
 
 ### Filter matching

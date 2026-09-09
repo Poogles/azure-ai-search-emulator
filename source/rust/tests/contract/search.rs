@@ -236,3 +236,71 @@ async fn search_fields_restrict_scope() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "InvalidQuery");
 }
+
+fn analyze_request(name: &str, body: serde_json::Value) -> axum::http::Request<axum::body::Body> {
+    let uri = format!("/indexes('{name}')/search.analyze?api-version={API_VERSION}");
+    request("POST", &uri, Some(API_KEY), Some(body))
+}
+
+#[tokio::test]
+async fn analyze_text_returns_tokens_with_offsets() {
+    let app = app();
+    let (status, _) = create_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = call(
+        app,
+        analyze_request("items", json!({"text": "Hello, World!"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let tokens = &body["tokens"];
+    assert!(tokens.as_array().map_or(0, Vec::len) >= 2);
+    assert_eq!(tokens[0]["token"], "hello");
+    assert_eq!(tokens[0]["startOffset"], 0);
+    assert_eq!(tokens[0]["endOffset"], 5);
+    assert_eq!(tokens[0]["position"], 0);
+    assert_eq!(tokens[1]["token"], "world");
+    assert_eq!(tokens[1]["position"], 1);
+}
+
+#[tokio::test]
+async fn analyze_text_missing_text_field_returns_400() {
+    let app = app();
+    let (status, _) = create_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = call(app, analyze_request("items", json!({}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "InvalidRequest");
+}
+
+#[tokio::test]
+async fn analyze_text_missing_index_returns_404() {
+    let app = app();
+    let (status, body) = call(app, analyze_request("missing", json!({"text": "hello"}))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "ResourceNotFound");
+}
+
+#[tokio::test]
+async fn service_stats_returns_static_response() {
+    let app = app();
+    let uri = format!("/servicestats?api-version={API_VERSION}");
+    let (status, body) = call(app, request("GET", &uri, Some(API_KEY), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["counters"]["knowledgeBaseCounter"]["usage"], 0);
+    assert_eq!(body["counters"]["knowledgeSourceCounter"]["usage"], 0);
+    assert_eq!(
+        body["limits"]["maxVectorIndexSizePerIndexInBytes"],
+        1_073_741_824
+    );
+}
+
+#[tokio::test]
+async fn service_stats_requires_api_key() {
+    let app = app();
+    let uri = format!("/servicestats?api-version={API_VERSION}");
+    let (status, _) = call(app, request("GET", &uri, None, None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}

@@ -51,6 +51,9 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/{index}/docs/search.index", post(upload_documents))
         .route("/{index}/docs/search.post.search", post(search_documents))
+        .route("/{index}/docs/$count", get(document_count))
+        .route("/{index}/search.analyze", post(analyze_text))
+        .route("/servicestats", get(service_stats))
         // `docs('key')` is a single OData path segment, so this is a
         // two-segment route (unlike the three-segment search routes above).
         // It accepts any method and rejects non-GET requests with a 404 so
@@ -271,6 +274,68 @@ async fn search_documents(
     )))
 }
 
+/// `GET /indexes('{name}')/docs/$count` — Document Count. Returns a bare
+/// integer (the number of documents in the index).
+async fn document_count(
+    State(state): State<AppState>,
+    Path(raw_name): Path<String>,
+) -> Result<(StatusCode, axum::http::HeaderMap, axum::body::Bytes), ApiError> {
+    let name = parse_index_name(&raw_name)?;
+    let count = state.service.count_documents(&name)?;
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    Ok((
+        StatusCode::OK,
+        headers,
+        axum::body::Bytes::from(count.to_string()),
+    ))
+}
+
+/// `POST /indexes('{name}')/search.analyze` — Analyze Text. Tokenizes the
+/// provided text and returns the tokens with offsets and positions.
+async fn analyze_text(
+    State(state): State<AppState>,
+    Path(raw_name): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let name = parse_index_name(&raw_name)?;
+    state.service.require_index_public(&name)?;
+    let raw = parse_body(&body)?;
+    let text = raw.get("text").and_then(Value::as_str).ok_or_else(|| {
+        ApiError::bad_request("InvalidRequest", "The \"text\" field is required.")
+    })?;
+    let tokens = crate::query::analyze_with_offsets(text);
+    let token_values: Vec<Value> = tokens
+        .iter()
+        .map(|t| {
+            json!({
+                "token": t.token,
+                "startOffset": t.start_offset,
+                "endOffset": t.end_offset,
+                "position": t.position,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "tokens": token_values })))
+}
+
+/// `GET /servicestats` — Service Statistics. Returns a static response with
+/// zero counters and default limits.
+async fn service_stats() -> Json<Value> {
+    Json(json!({
+        "counters": {
+            "knowledgeBaseCounter": {"usage": 0},
+            "knowledgeSourceCounter": {"usage": 0}
+        },
+        "limits": {
+            "maxVectorIndexSizePerIndexInBytes": 1_073_741_824
+        }
+    }))
+}
+
 fn search_response(
     name: &str,
     api_version: Option<&String>,
@@ -352,10 +417,10 @@ async fn azure_guard(
     next: middleware::Next,
 ) -> Result<Response, ApiError> {
     // Only enforce Azure auth/version on the index operation surface
-    // (`/indexes` and `/indexes('name')...`); let everything else fall through
-    // to routing.
+    // (`/indexes`, `/indexes('name')...`, and `/servicestats`); let
+    // everything else fall through to routing.
     let path = request.uri().path();
-    if path != "/indexes" && !path.starts_with("/indexes(") {
+    if path != "/indexes" && !path.starts_with("/indexes(") && path != "/servicestats" {
         return Ok(next.run(request).await);
     }
     let api_key = request

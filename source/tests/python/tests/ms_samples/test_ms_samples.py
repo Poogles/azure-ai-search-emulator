@@ -43,15 +43,12 @@ KNOWN_ISSUES = {
     # --- Emulator gaps: the feature is not implemented. Pinned to the Azure
     #     error signature so the gap is documented and the test alerts us when
     #     the feature lands (the sample starts passing -> promote it).
-    "sample_authentication.py": ("gap", "Not Found"),  # get_document_count -> /docs/$count
-    "sample_index_analyze_text.py": ("gap", "Not Found"),  # /analyze not implemented
     "sample_index_synonym_map_crud.py": ("gap", "Method Not Allowed"),  # synonym maps 405
     "sample_query_autocomplete.py": ("gap", "Not Found"),  # autocomplete 404
     "sample_query_suggestions.py": ("gap", "Not Found"),  # suggest 404
-    "sample_query_session.py": ("gap", "UnsupportedQuery"),  # session_id
-    "sample_knowledge_service_stats_preview.py": ("gap", "InvalidIndexName"),  # /servicestats
     # --- Cannot run here: needs azure-search-documents >= 12.0.0 (harness pins 11.6.0).
     "sample_agentic_retrieval.py": ("skip", "needs azure-search-documents>=12 (knowledgebases)"),
+    "sample_knowledge_service_stats_preview.py": ("skip", "needs azure-search-documents>=12 (typed service stats model)"),
     "sample_index_alias_crud.py": ("skip", "needs azure-search-documents>=12 (SearchAlias)"),
     "sample_index_client_custom_request.py": ("skip", "needs azure-search-documents>=12 (DEFAULT_VERSION)"),
     "sample_index_crud.py": ("skip", "needs azure-search-documents>=12 (SearchFieldDataType.STRING)"),
@@ -68,6 +65,8 @@ KNOWN_ISSUES = {
     "sample_knowledge_source_freshness_preview.py": ("skip", "needs azure-search-documents>=12 (knowledge sources)"),
     "sample_knowledge_source_mcp_server_preview.py": ("skip", "needs azure-search-documents>=12 (knowledge sources)"),
     "sample_knowledge_source_workiq_preview.py": ("skip", "needs azure-search-documents>=12 (knowledge sources)"),
+    # --- Cannot run here: needs azure-identity and a real Azure AD environment.
+    "sample_authentication.py": ("skip", "needs azure-identity + real AAD for the AAD half (API-key half passes)"),
     # --- Cannot run here: needs an external Azure Storage account.
     "sample_indexer_crud.py": ("skip", "needs AZURE_STORAGE_CONNECTION_STRING"),
     "sample_indexer_datasource_crud.py": ("skip", "needs AZURE_STORAGE_CONNECTION_STRING"),

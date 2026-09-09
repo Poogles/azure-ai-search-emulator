@@ -110,7 +110,7 @@ Route: `POST /indexes('{name}')/docs/search.post.search?api-version=...`.
 | Result count | `search(count=True)` → `@odata.count` | Supported |
 | Paging | `top=`, `skip=` | Supported |
 | Continuation tokens | `by_page()` → `@odata.nextLink` + `@search.nextPageParameters` | Supported |
-| Count documents | `SearchClient.count_documents()` (`/docs/$count`) | Not implemented (route not registered; returns `404`) |
+| Count documents | `SearchClient.count_documents()` (`/docs/$count`) | Supported (returns bare integer) |
 | Filters | `filter=` | Supported, including nested complex-type paths (`Address/StateProvince`; see Filter below) |
 | Ordering | `orderby=` | Supported (sortable top-level fields only) |
 | Projection | `select=` | Supported (top-level fields only) |
@@ -121,9 +121,13 @@ Route: `POST /indexes('{name}')/docs/search.post.search?api-version=...`.
 | Scoring profiles / parameters / statistics | `scoring_profile=`, ... | Unsupported (explicit) |
 | Semantic / vector queries | `semantic=`, `vector_queries=`, ... | Unsupported (explicit) |
 | Suggest / autocomplete | `SearchClient.suggest(...)`, `autocomplete(...)` | Not implemented (routes not registered; return `404`) |
+| Analyze text | `SearchIndexClient.analyze_text(...)` (`/search.analyze`) | Supported (Tantivy default analyzer; `analyzerName`/`field` accepted but inert) |
+| Service statistics | `SearchIndexClient.get_service_statistics()` (`/servicestats`) | Supported (static response: zero counters, default limits) |
 | `queryType` other than `simple` | — | Unsupported (explicit) |
 
-The full list of search options rejected with `400 UnsupportedQuery`: `searchMode`, `highlight`, `highlightPreTag`, `highlightPostTag`, `scoringProfile`, `scoringParameters`, `scoringStatistics`, `sessionId`, `minimumCoverage`, `answers`, `captions`, `semanticConfiguration`, `semanticQuery`, `semanticErrorHandling`, `semanticMaxWaitInMilliseconds`, `vectorQueries`, `vectorFilterMode`, `debug`.
+The full list of search options rejected with `400 UnsupportedQuery`: `searchMode`, `highlight`, `highlightPreTag`, `highlightPostTag`, `scoringProfile`, `scoringParameters`, `scoringStatistics`, `minimumCoverage`, `answers`, `captions`, `semanticConfiguration`, `semanticQuery`, `semanticErrorHandling`, `semanticMaxWaitInMilliseconds`, `vectorQueries`, `vectorFilterMode`, `debug`.
+
+Accepted but inert (silently ignored): `sessionId` (the emulator uses deterministic ordering and constant scoring, so session affinity is irrelevant).
 
 ### Filter
 
@@ -213,8 +217,8 @@ When more results exist beyond the returned page, the response includes `@odata.
 | Capability | Contract tests | Unit tests | Python SDK/e2e |
 |------------|----------------|------------|------------|
 | Index create/get/list/update/delete | `tests/contract/index_management.rs` | `service`, `storage` | `test_emulator.py`, `tests/sdk/` |
-| Document upload/merge/mergeOrUpload/delete, per-document errors, batch shapes, get-document, GeographyPoint values | `tests/contract/document_management.rs` | `service` | `tests/sdk/` |
-| Search shape, count, match-all, boolean operators, searchFields, facet options | `tests/contract/search.rs` | `query`, `service` | `tests/sdk/` |
+| Document upload/merge/mergeOrUpload/delete, per-document errors, batch shapes, get-document, document count, GeographyPoint values | `tests/contract/document_management.rs` | `service` | `tests/sdk/` |
+| Search shape, count, match-all, boolean operators, searchFields, facet options, analyze text, service stats | `tests/contract/search.rs` | `query`, `service` | `tests/sdk/` |
 | Filters, including nested complex-type paths | `tests/contract/filtering.rs` | `filter`, `service` | `tests/sdk/` |
 | Complex-type schema, documents, filters | `tests/contract/complex_fields.rs` | `service` | `tests/sdk/` |
 | Ordering, projection, facets | `tests/contract/search.rs` | `service` | `tests/sdk/` |

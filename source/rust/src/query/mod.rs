@@ -80,6 +80,39 @@ pub fn analyze(text: &str) -> Vec<String> {
     tokens
 }
 
+/// A single token from the analyze-text operation, with position and offset
+/// information matching the Azure `POST /indexes('{name}')/search.analyze`
+/// response shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalyzeToken {
+    pub token: String,
+    pub start_offset: usize,
+    pub end_offset: usize,
+    pub position: usize,
+}
+
+/// Tokenizes text with Tantivy's default analyzer, returning structured tokens
+/// with offsets and positions (for the analyze-text endpoint).
+#[must_use]
+pub fn analyze_with_offsets(text: &str) -> Vec<AnalyzeToken> {
+    let manager = TokenizerManager::default();
+    let Some(mut analyzer) = manager.get("default") else {
+        return Vec::new();
+    };
+    let mut stream = analyzer.token_stream(text);
+    let mut tokens = Vec::new();
+    while stream.advance() {
+        let t = stream.token();
+        tokens.push(AnalyzeToken {
+            token: t.text.clone(),
+            start_offset: t.offset_from,
+            end_offset: t.offset_to,
+            position: t.position,
+        });
+    }
+    tokens
+}
+
 /// One clause of a parsed simple query: a single term or a quoted phrase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Clause {

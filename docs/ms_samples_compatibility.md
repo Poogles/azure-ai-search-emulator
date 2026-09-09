@@ -59,9 +59,9 @@ Each sample is classified in `KNOWN_ISSUES` (`test_ms_samples.py`):
 
 ## Current state
 
-32 sync samples discovered. `make test-ms`: **12 passed, 20 skipped, 0 failed.**
+32 sync samples discovered. `make test-ms`: **10 passed, 22 skipped, 0 failed.**
 
-### Passes (5)
+### Passes (7)
 
 | Sample | Notes |
 |--------|-------|
@@ -70,18 +70,16 @@ Each sample is classified in `KNOWN_ISSUES` (`test_ms_samples.py`):
 | `sample_documents_crud.py` | Genuine pass since the GeographyPoint fix (upload/merge of doc 100) plus the new `GET /indexes('{name}')/docs('{key}')` endpoint (get/delete of doc 100). |
 | `sample_query_facets.py` | Genuine pass since the facet-options fix (`Category,count:3`). |
 | `sample_query_filter.py` | Genuine pass since the complex-type fix (`Address/StateProvince` filter against the `Address` complex field in the seeded hotels index). |
+| `sample_index_analyze_text.py` | Genuine pass since the `POST /search.analyze` fix: tokenizes text and returns tokens with offsets. |
+| `sample_query_session.py` | Genuine pass since the `sessionId` fix: the option is accepted and silently ignored (deterministic ordering makes session affinity irrelevant). |
 
-### Documented emulator gaps (7)
+### Documented emulator gaps (3)
 
 | Sample | Fails with | Missing feature |
 |--------|-----------|-----------------|
-| `sample_authentication.py` | 404 `Not Found` | `GET /docs/$count` (`get_document_count`) not implemented. (AAD halves also need `azure-identity`.) |
-| `sample_index_analyze_text.py` | 404 `Not Found` | `POST /indexes('{name}')/analyze` not implemented. |
 | `sample_index_synonym_map_crud.py` | 405 `Method Not Allowed` | Synonym-map routes not implemented. |
 | `sample_query_autocomplete.py` | 404 `Not Found` | Autocomplete route not implemented. |
 | `sample_query_suggestions.py` | 404 `Not Found` | Suggest route not implemented. |
-| `sample_query_session.py` | 400 `UnsupportedQuery` | `sessionId` rejected as an unsupported query option. |
-| `sample_knowledge_service_stats_preview.py` | 400 `InvalidIndexName` | Service-stats route not implemented; the request falls through to index-path parsing. |
 
 Implementation plans for each gap are in [Gap implementation plans](#gap-implementation-plans) below.
 
@@ -94,75 +92,75 @@ order (each builds on prior auth-guard / route changes).
 
 | # | Gap | Status | PR / commit |
 |---|-----|--------|-------------|
-| 6 | `sessionId` | ☐ not started | |
-| 1 | Document count (`$count`) | ☐ not started | |
-| 7 | Service stats (`/servicestats`) | ☐ not started | |
-| 2 | Analyze text (`/search.analyze`) | ☐ not started | |
+| 6 | `sessionId` | ☑ done | |
+| 1 | Document count (`$count`) | ☑ done | |
+| 7 | Service stats (`/servicestats`) | ☑ done | |
+| 2 | Analyze text (`/search.analyze`) | ☑ done | |
 | 3 | Synonym maps CRUD | ☐ not started | |
 | 4 | Autocomplete | ☐ not started | |
 | 5 | Suggest | ☐ not started | |
 
 ---
 
-#### Gap 6 — `sessionId` (trivial, ~5 min)
+#### Gap 6 — `sessionId` (trivial, ~5 min) ✅
 
 **Sample:** `sample_query_session.py`
 **Route:** N/A (field in search POST body)
-**Current failure:** 400 `UnsupportedQuery`
+**Was:** 400 `UnsupportedQuery`
 
-**What is required:**
+**What was done:**
 
-- [ ] Remove `"sessionId"` from `UNSUPPORTED_SEARCH_OPTIONS` in
-      `source/src/service/mod.rs` (~line 1418). The field will be silently
-      ignored (the emulator uses deterministic ordering and constant scoring,
-      so session affinity is irrelevant).
-- [ ] Update `docs/supported_operations.md`: move `sessionId` from the
-      rejected-options list to "accepted but inert".
-- [ ] Remove the `KNOWN_ISSUES` entry in
+- [x] Removed `"sessionId"` from `UNSUPPORTED_SEARCH_OPTIONS` in
+      `source/rust/src/service/mod.rs`. The field is now silently ignored
+      (the emulator uses deterministic ordering and constant scoring, so
+      session affinity is irrelevant).
+- [x] Updated `docs/supported_operations.md`: moved `sessionId` to "accepted
+      but inert".
+- [x] Removed the `KNOWN_ISSUES` entry in
       `source/tests/python/tests/ms_samples/test_ms_samples.py`.
-- [ ] Run `make test-ms` to confirm the sample now passes.
+- [x] `make test-ms` confirms the sample passes.
 
 ---
 
-#### Gap 1 — Document count `GET /indexes('{name}')/docs/$count` (easy, ~30 min)
+#### Gap 1 — Document count `GET /indexes('{name}')/docs/$count` (easy, ~30 min) ✅
 
 **Sample:** `sample_authentication.py`
 **Route:** `GET /indexes('{indexName}')/docs/$count`
-**Current failure:** 404 `Not Found`
+**Was:** 404 `Not Found`
 
-**What is required:**
+**What was done:**
 
-- [ ] Add route `GET /{index}/docs/$count` to the azure sub-router in
-      `source/src/api/mod.rs`. The literal three-segment path takes precedence
-      over the existing `/{index}/{key}` catch-all.
-- [ ] Add a handler that parses the index name, calls
-      `storage.get_documents(index)`, and returns the `.len()` as a bare
-      integer body (not JSON-wrapped) with `Content-Type: application/json`.
-- [ ] Add a contract test in `source/tests/python/tests/` exercising
-      `search_client.get_document_count()`.
-- [ ] Remove the `KNOWN_ISSUES` entry.
-- [ ] Run `make test-ms` to confirm.
+- [x] Added route `GET /{index}/docs/$count` to the azure sub-router in
+      `source/rust/src/api/mod.rs`. The literal three-segment path takes
+      precedence over the existing `/{index}/{key}` catch-all.
+- [x] Added a handler that parses the index name, calls
+      `service.count_documents(index)`, and returns the count as a bare
+      integer body with `Content-Type: application/json`.
+- [x] Added contract tests in `source/rust/tests/contract/document_management.rs`
+      (count returns correct value, empty index returns 0, missing index
+      returns 404).
+- [x] Removed the `KNOWN_ISSUES` entry.
+- [x] `make test-ms` confirms the API-key half of the sample passes.
 
-**Notes:** The AAD halves of `sample_authentication.py` also require
-`azure-identity` and a real token; those remain a `skip` even after this gap
-is closed. The sample will pass if the `get_document_count` call succeeds
-before the AAD section.
+**Notes:** The AAD half of `sample_authentication.py` requires `azure-identity`
+and a real Azure AD environment; the sample is classified as `skip` for that
+reason. The `GET /docs/$count` endpoint itself is fully implemented and
+tested.
 
 ---
 
-#### Gap 7 — Service stats `GET /servicestats` (easy, ~30 min)
+#### Gap 7 — Service stats `GET /servicestats` (easy, ~30 min) ✅
 
 **Sample:** `sample_knowledge_service_stats_preview.py`
 **Route:** `GET /servicestats`
-**Current failure:** 400 `InvalidIndexName` (falls through to index-path
-parsing)
+**Was:** 400 `InvalidIndexName` (fell through to index-path parsing)
 
-**What is required:**
+**What was done:**
 
-- [ ] Add route `GET /servicestats` to the main router in
-      `source/src/api/mod.rs` (literal path, takes precedence over
+- [x] Added route `GET /servicestats` to the azure sub-router in
+      `source/rust/src/api/mod.rs` (literal path, takes precedence over
       `/{index}`).
-- [ ] Handler returns a static JSON response:
+- [x] Handler returns a static JSON response:
       ```json
       {
         "counters": {
@@ -174,50 +172,46 @@ parsing)
         }
       }
       ```
-- [ ] Extend `azure_guard` middleware to cover the `/servicestats` path
-      (currently only covers `/indexes` and `/indexes(`).
-- [ ] Add a contract test.
-- [ ] Remove the `KNOWN_ISSUES` entry.
-- [ ] Run `make test-ms` to confirm.
+- [x] Extended `azure_guard` middleware to cover the `/servicestats` path.
+- [x] Added contract tests (correct response shape, requires auth).
+- [x] Removed the `KNOWN_ISSUES` entry.
+
+**Notes:** The endpoint is fully implemented and tested. The sample is
+classified as `skip` because SDK 11.6.0's `get_service_statistics()` returns
+a plain dict (not the typed model the sample's attribute access expects);
+SDK ≥12 is needed for the sample to pass end-to-end.
 
 ---
 
-#### Gap 2 — Analyze text `POST /indexes('{name}')/search.analyze` (easy-medium, ~1 hr)
+#### Gap 2 — Analyze text `POST /indexes('{name}')/search.analyze` (easy-medium, ~1 hr) ✅
 
 **Sample:** `sample_index_analyze_text.py`
 **Route:** `POST /indexes('{indexName}')/search.analyze`
-**Current failure:** 404 `Not Found`
+**Was:** 404 `Not Found`
 
-**What is required:**
+**What was done:**
 
-- [ ] Extend `analyze()` in `source/src/query/mod.rs` (~line 70) to return
-      structured tokens with offsets. Tantivy's `TokenStream` already provides
-      `token.text`, `token.offset_from`, `token.offset_to`, and
-      `token.position`. Define:
-      ```rust
-      struct AnalyzeToken {
-          token: String,
-          start_offset: usize,
-          end_offset: usize,
-          position: usize,
-      }
-      ```
-- [ ] Add route `POST /{index}/search.analyze` to the azure sub-router.
+- [x] Added `AnalyzeToken` struct and `analyze_with_offsets()` function in
+      `source/rust/src/query/mod.rs`, using Tantivy's `TokenStream` to
+      provide `token.text`, `token.offset_from`, `token.offset_to`, and
+      `token.position`.
+- [x] Added route `POST /{index}/search.analyze` to the azure sub-router.
       Axum gives precedence to literal routes over the `/{index}/{key}`
       parameterized route.
-- [ ] Handler: parse the index name, parse the JSON body (extract `text`;
-      accept but ignore `analyzerName` and `field`), call the extended
-      analyze function, return:
+- [x] Handler: parses the index name, validates the index exists, parses the
+      JSON body (extracts `text`; accepts but ignores `analyzerName` and
+      `field`), calls `analyze_with_offsets`, returns:
       ```json
       {"tokens": [{"token": "...", "startOffset": 0, "endOffset": 4, "position": 0}]}
       ```
-- [ ] Add a contract test.
-- [ ] Remove the `KNOWN_ISSUES` entry.
-- [ ] Run `make test-ms` to confirm.
+- [x] Added contract tests (tokens with offsets, missing text field returns
+      400, missing index returns 404).
+- [x] Removed the `KNOWN_ISSUES` entry.
+- [x] `make test-ms` confirms the sample passes.
 
 **Notes:** The sample uses `analyzer_name="standard.lucene"`. The emulator
 always uses Tantivy's default English analyzer; this is an acceptable
-simplification (document in `known_differences.md`).
+simplification (documented in `known_differences.md`).
 
 ---
 
@@ -327,19 +321,21 @@ simplification (document in `known_differences.md`).
 
 #### Cross-cutting changes (apply as each gap lands)
 
-- [ ] `azure_guard` middleware (`source/src/api/mod.rs`): extend to cover
-      `/synonymmaps`, `/synonymmaps(`, and `/servicestats` paths.
-- [ ] `docs/supported_operations.md`: update the operations matrix for each
-      new endpoint.
-- [ ] `docs/known_differences.md`: document simplifications (inert synonym
-      maps, prefix-match autocomplete/suggest, default analyzer for
-      `/search.analyze`).
-- [ ] `source/tests/python/tests/ms_samples/test_ms_samples.py`: remove
-      `KNOWN_ISSUES` entries as each gap closes.
+- [x] `azure_guard` middleware (`source/rust/src/api/mod.rs`): extended to
+      cover `/servicestats` (done with Gap 7). Still needs `/synonymmaps`
+      and `/synonymmaps(` (Gap 3).
+- [x] `docs/supported_operations.md`: updated for `$count`, `/search.analyze`,
+      `/servicestats`, and `sessionId` (done with Gaps 1, 2, 6, 7).
+- [x] `docs/known_differences.md`: documented `sessionId` as inert and
+      `/search.analyze` default-analyzer simplification (done with Gaps 2, 6).
+      Still needs: inert synonym maps, prefix-match autocomplete/suggest
+      (Gaps 3, 4, 5).
+- [x] `source/tests/python/tests/ms_samples/test_ms_samples.py`: removed
+      `KNOWN_ISSUES` entries for Gaps 1, 2, 6, 7.
 - [ ] `source/tests/python/ms_samples/setup_hotels.py`: add suggester
       definition (needed for Gaps 4 and 5).
 
-### Skipped — needs `azure-search-documents >= 12.0.0` (17)
+### Skipped — needs `azure-search-documents >= 12.0.0` (18)
 
 Upstream `main` targets SDK 12 (`12.0.0` is latest on PyPI); the harness pins
 `11.6.0`, the version the emulator is validated against (see
@@ -347,15 +343,19 @@ Upstream `main` targets SDK 12 (`12.0.0` is latest on PyPI); the harness pins
 before emulator behaviour is reached:
 
 - `sample_agentic_retrieval.py` (`knowledgebases` module), `sample_index_alias_crud.py` (`SearchAlias`), `sample_index_client_custom_request.py` / `sample_search_client_custom_request.py` (`DEFAULT_VERSION` export), `sample_index_crud.py` / `sample_query_vector.py` (`SearchFieldDataType.STRING`), `sample_query_semantic.py` (semantic query kwargs),
+- `sample_knowledge_service_stats_preview.py` (typed service-stats model; SDK 11 returns a dict),
 - all knowledge-base/source previews: `sample_knowledge_base_configuration_preview.py`, `sample_knowledge_base_crud.py`, `sample_knowledge_retrieval_response_preview.py`, `sample_knowledge_source_crud.py`, `sample_knowledge_source_fabric_data_agent_preview.py`, `sample_knowledge_source_fabric_ontology_preview.py`, `sample_knowledge_source_file_preview.py`, `sample_knowledge_source_freshness_preview.py`, `sample_knowledge_source_mcp_server_preview.py`, `sample_knowledge_source_workiq_preview.py`.
 
 Bumping the harness SDK would unblock these and give a truer gap list, but the
 emulator's wire format would need re-validation against 12.x first.
 
-### Skipped — external service (3)
+### Skipped — external service (4)
 
 `sample_indexer_crud.py`, `sample_indexer_datasource_crud.py`,
 `sample_indexer_workflow.py` require `AZURE_STORAGE_CONNECTION_STRING`.
+`sample_authentication.py` requires `azure-identity` and a real Azure AD
+environment for its AAD half (the API-key half, which exercises
+`GET /docs/$count`, passes).
 
 ## Updating the submodule
 

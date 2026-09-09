@@ -316,6 +316,20 @@ impl SearchService {
         }
     }
 
+    /// Returns the number of documents in the index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] if the index does not exist.
+    pub fn count_documents(&self, index: &str) -> Result<u64, ApiError> {
+        let definition = self.require_index(index)?;
+        let docs = self
+            .storage
+            .get_documents(&definition.name)
+            .map_err(|e| ApiError::not_found(e.to_string()))?;
+        Ok(docs.len() as u64)
+    }
+
     /// Validates and applies a batch of document actions (upload, merge,
     /// merge-or-upload, delete), returning one result per action in request
     /// order. Valid actions in the same batch are applied even when others
@@ -713,6 +727,15 @@ impl SearchService {
         self.storage
             .get_index(name)
             .ok_or_else(|| ApiError::not_found(format!("Index {name:?} was not found.")))
+    }
+
+    /// Validates that the index exists, returning an error if not.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] if the index does not exist.
+    pub fn require_index_public(&self, name: &str) -> Result<(), ApiError> {
+        self.require_index(name).map(|_| ())
     }
 }
 
@@ -1415,7 +1438,6 @@ const UNSUPPORTED_SEARCH_OPTIONS: &[&str] = &[
     "scoringProfile",
     "scoringParameters",
     "scoringStatistics",
-    "sessionId",
     "minimumCoverage",
     "answers",
     "captions",

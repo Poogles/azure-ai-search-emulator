@@ -273,6 +273,54 @@ async fn get_document_on_missing_index_returns_404() {
     assert_eq!(body["error"]["code"], "ResourceNotFound");
 }
 
+fn document_count_request(name: &str) -> axum::http::Request<axum::body::Body> {
+    let uri = format!("/indexes('{name}')/docs/$count?api-version={API_VERSION}");
+    request("GET", &uri, Some(API_KEY), None)
+}
+
+#[tokio::test]
+async fn document_count_returns_count() {
+    let app = app();
+    let (status, _) = create_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        upload_request(
+            "items",
+            json!([
+                {"@search.action": "upload", "document": {"id": "1", "title": "one"}},
+                {"@search.action": "upload", "document": {"id": "2", "title": "two"}},
+                {"@search.action": "upload", "document": {"id": "3", "title": "three"}}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = call(app, document_count_request("items")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, 3);
+}
+
+#[tokio::test]
+async fn document_count_empty_index_returns_zero() {
+    let app = app();
+    let (status, _) = create_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = call(app, document_count_request("items")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, 0);
+}
+
+#[tokio::test]
+async fn document_count_missing_index_returns_404() {
+    let app = app();
+    let (status, body) = call(app, document_count_request("missing")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "ResourceNotFound");
+}
+
 #[tokio::test]
 async fn delete_removes_document() {
     let app = app();
