@@ -1,0 +1,5 @@
+[submodule "source/tests/python/ms_samples/upstream"]
+	path = source/tests/python/ms_samples/upstream
+	url = https://github.com/Azure/azure-sdk-for-python.git
+	shallow = true
+	branch = main

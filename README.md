@@ -130,5 +130,6 @@ poetry run pytest --collect-only
 - [docs/phase_2_production_api.md](docs/phase_2_production_api.md) — full API surface and test suite.
 - [docs/phase_3_admin_api_and_remaining.md](docs/phase_3_admin_api_and_remaining.md) — admin API, C# compatibility, release.
 - [docs/supported_operations.md](docs/supported_operations.md) — supported-operations matrix: every operation, its SDK method, HTTP request, status codes, and supported/unsupported state.
+- [docs/ms_samples_compatibility.md](docs/ms_samples_compatibility.md) — compatibility probe against Microsoft's reference samples: how it runs, per-sample results, and what is skipped and why.
 - [docs/known_differences.md](docs/known_differences.md) — accepted behavioural differences from real Azure AI Search, with rationale.
 - [docs/decisions/](docs/decisions/) — architecture decision records (HTTP framework, search engine, baseline).
