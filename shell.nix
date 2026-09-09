@@ -54,7 +54,7 @@ in
 
     shellHook = ''
       PATH="${pinned.poetry}/bin:${pinned.python314}/bin:${pinned.cargo}/bin:${pinned.rustc}/bin:$PATH";
-    '' + systemBuildExports.${system} + pkgs.optional pkgs.stdenv.isDarwin ''
+    '' + systemBuildExports.${system} + pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
       # The nix darwin sdkroot does not ship usr/lib/libiconv.tbd, so the
       # linker cannot resolve -liconv when building Rust binaries/tests.
       # Add the system SDK lib directory to the linker search path.
