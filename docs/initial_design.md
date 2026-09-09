@@ -115,8 +115,9 @@ Internally, the emulator will consist of:
 4. **Search engine**
 
    * Provides text search and structured querying.
+   * Backed by **Tantivy** (https://github.com/quickwit-oss/tantivy), a Rust full-text search library modelled on Apache Lucene. Tantivy is an embedded, in-process dependency rather than a separate service, so the emulator remains a single static binary.
    * Initially implements only the query features required by consumers.
-   * Can be replaced or extended independently of the API layer.
+   * Can be replaced or extended independently of the API layer. See `docs/decisions/0003-search-engine.md`.
 
 5. **Compatibility layer**
 
@@ -654,6 +655,8 @@ Two toolchains are used in this project:
 
 The Python Azure AI Search SDK remains the initial reference client for compatibility.
 
+The full-text search and indexing backend is **Tantivy** (https://github.com/quickwit-oss/tantivy), a Rust library modelled on Apache Lucene. It is used as an embedded dependency behind the query-engine abstraction rather than rolling our own full-text search, and rather than depending on a separate Lucene/Elasticsearch/OpenSearch service. See `docs/decisions/0003-search-engine.md`.
+
 The architecture should separate:
 
 ```text
@@ -892,18 +895,22 @@ The emulator could expose a thin API over an existing search engine such as Elas
 
 #### Cons
 
-* Adds a substantial external dependency.
+* Server-based engines (Elasticsearch, OpenSearch, Lucene over the JVM) add a substantial external dependency and a separate process/service.
 * Azure query semantics still need to be translated.
 * Azure index semantics do not map perfectly onto other search engines.
 * Deployment becomes more complicated.
 * Search results may still differ substantially from Azure.
 * The implementation can become dominated by translation between two APIs.
 
-#### Overall reason for rejection
+#### Overall reason for rejection (server-based engines)
 
-An existing search engine may eventually be useful as the query/indexing backend, particularly if application requirements become sophisticated.
+A separate, server-based search engine is rejected because it conflicts with the goal of a single, fast-starting, static Rust binary that is trivial to run in local development and CI.
 
-However, it should remain an implementation detail behind the emulator's query-engine abstraction rather than defining the emulator's architecture.
+#### Adopted variant — embedded Rust search library (Tantivy)
+
+The underlying concern in this alternative — not rolling our own full-text search — is addressed by adopting **Tantivy** (https://github.com/quickwit-oss/tantivy), a Rust full-text search library modelled on Apache Lucene, as the query/indexing backend.
+
+Unlike a server-based engine, Tantivy is an embedded, in-process Cargo dependency: it provides Lucene-equivalent indexing and full-text querying without a JVM, a separate service, or added deployment complexity. It is used strictly as an implementation detail behind the emulator's query-engine abstraction and does not define the emulator's architecture or its Azure-compatible API surface. See `docs/decisions/0003-search-engine.md`.
 
 ### Alternative 5 — Reimplement Azure AI Search completely
 

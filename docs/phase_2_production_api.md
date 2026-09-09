@@ -39,6 +39,7 @@ Everything below implements that matrix. Unsupported operations must fail explic
 
 ### Query engine
 
+- Full-text search and indexing backend is **Tantivy** (https://github.com/quickwit-oss/tantivy), a Rust library modelled on Apache Lucene, used as an embedded dependency (see `docs/decisions/0003-search-engine.md`). The emulator does not roll its own full-text search.
 - Internal query representation decoupled from the HTTP representation.
 - Full-text search: simple terms, field-specific search, boolean operators as required by the matrix.
 - Filter parser producing an internal expression tree:

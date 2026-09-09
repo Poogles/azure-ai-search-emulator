@@ -74,6 +74,7 @@ Record the following in `docs/decisions/` as they are made:
 - Rust edition and MSRV (e.g. edition 2021, MSRV matching the nixpkgs toolchain).
 - HTTP framework choice (e.g. Axum or Actix) — chosen in Phase 1, but the dependency should be added here if settled.
 - JSON handling library (e.g. serde/serde_json).
+- Full-text search / indexing backend: **Tantivy** (https://github.com/quickwit-oss/tantivy), a Rust library modelled on Apache Lucene, used as an embedded dependency (see `docs/decisions/0003-search-engine.md`).
 - **Pinned Azure AI Search API version:** `2024-07-01` (single version, explicitly supported).
 - **Pinned Python SDK version:** `azure-search-documents==11.6.0` (exact pin for the e2e harness).
 - **Authentication rule:** accept any non-empty `api-key` header; missing or empty key returns `401` with Azure error structure (`{"error":{"code":"AuthenticationFailed","message":"..."}}`).

@@ -12,6 +12,7 @@ use serde_json::{json, Map, Value};
 
 use crate::config::Config;
 use crate::error::ApiError;
+use crate::query::SearchEngine;
 use crate::service::{parse_search_request, SearchService};
 
 #[derive(Clone)]
@@ -23,8 +24,9 @@ pub struct AppState {
 impl AppState {
     #[must_use]
     pub fn new(config: Config, storage: Arc<dyn crate::storage::Storage>) -> Self {
+        let engine = Arc::new(SearchEngine::new());
         Self {
-            service: Arc::new(SearchService::new(storage)),
+            service: Arc::new(SearchService::new(storage, engine)),
             config,
         }
     }

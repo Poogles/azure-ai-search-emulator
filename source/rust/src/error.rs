@@ -55,6 +55,14 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "InternalError".to_owned(),
+            message: message.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {

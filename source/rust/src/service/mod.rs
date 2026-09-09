@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 use crate::error::ApiError;
-use crate::query;
+use crate::query::{QueryError, SearchEngine};
 use crate::storage::{Document, IndexDefinition, Storage, StorageError};
 
 /// Field types accepted by the Phase 1 schema validator.
@@ -78,11 +78,12 @@ pub struct SearchOutcome {
 
 pub struct SearchService {
     storage: Arc<dyn Storage>,
+    engine: Arc<SearchEngine>,
 }
 
 impl SearchService {
-    pub fn new(storage: Arc<dyn Storage>) -> Self {
-        Self { storage }
+    pub fn new(storage: Arc<dyn Storage>, engine: Arc<SearchEngine>) -> Self {
+        Self { storage, engine }
     }
 
     #[must_use]
@@ -101,7 +102,19 @@ impl SearchService {
         let definition = parse_index_definition(raw)?;
         validate_schema(&definition)?;
         match self.storage.create_index(&definition) {
-            Ok(()) => Ok(definition.raw.clone()),
+            Ok(()) => {
+                if let Err(e) = self
+                    .engine
+                    .create_index(&definition.name, &definition.fields)
+                {
+                    // Roll back storage: this index did not exist before, so
+                    // removing it restores the prior state and avoids
+                    // storage/engine divergence.
+                    self.storage.delete_index(&definition.name);
+                    return Err(engine_error(&definition.name, e));
+                }
+                Ok(definition.raw.clone())
+            }
             Err(StorageError::IndexAlreadyExists(name)) => Err(ApiError::conflict(
                 "IndexAlreadyExists",
                 format!("An index with name {name:?} already exists."),
@@ -124,6 +137,17 @@ impl SearchService {
         let definition = parse_index_definition(raw)?;
         validate_schema(&definition)?;
         self.storage.upsert_index(&definition);
+        // Replacing an index discards its documents, so rebuild the search index.
+        self.engine.delete_index(&definition.name);
+        if let Err(e) = self
+            .engine
+            .create_index(&definition.name, &definition.fields)
+        {
+            // Engine rebuild failed; remove the upserted index so storage and
+            // engine stay consistent (both absent). The caller can retry.
+            self.storage.delete_index(&definition.name);
+            return Err(engine_error(&definition.name, e));
+        }
         Ok(definition.raw.clone())
     }
 
@@ -153,6 +177,7 @@ impl SearchService {
     /// Returns an [`ApiError`] if the index does not exist.
     pub fn delete_index(&self, name: &str) -> Result<(), ApiError> {
         if self.storage.delete_index(name) {
+            self.engine.delete_index(name);
             Ok(())
         } else {
             Err(ApiError::not_found(format!(
@@ -203,6 +228,14 @@ impl SearchService {
             }
         }
         if !accepted.is_empty() {
+            // Index the engine first (borrow), then move the documents into
+            // storage. Either order self-heals on the next upload (engine
+            // upserts by key; search resolves keys against storage), but this
+            // avoids cloning the batch and leaves storage untouched if the
+            // engine rejects the documents.
+            self.engine
+                .index_documents(index, &accepted)
+                .map_err(|e| engine_error(index, e))?;
             self.storage
                 .put_documents(index, accepted)
                 .map_err(|e| ApiError::not_found(e.to_string()))?;
@@ -217,15 +250,19 @@ impl SearchService {
     ///
     /// Returns an [`ApiError`] if the index does not exist.
     pub fn search(&self, index: &str, query: &SearchQuery) -> Result<SearchOutcome, ApiError> {
-        let definition = self.require_index(index)?;
+        self.require_index(index)?;
+        let term = query.search.as_deref().unwrap_or("");
+        let matched_keys = self
+            .engine
+            .search(index, term)
+            .map_err(|e| engine_error(index, e))?;
         let documents = self
             .storage
             .get_documents(index)
             .map_err(|e| ApiError::not_found(e.to_string()))?;
-        let term = query.search.as_deref().unwrap_or("");
         let matched: Vec<Document> = documents
             .into_iter()
-            .filter(|doc| query::document_matches(doc, &definition.fields, term))
+            .filter(|doc| matched_keys.contains(&doc.key))
             .collect();
         let total = u64::try_from(matched.len()).unwrap_or(u64::MAX);
         let skip = usize::try_from(query.skip).unwrap_or(usize::MAX);
@@ -242,6 +279,7 @@ impl SearchService {
 
     pub fn reset(&self) {
         self.storage.reset();
+        self.engine.reset();
     }
 
     fn require_index(&self, name: &str) -> Result<IndexDefinition, ApiError> {
@@ -263,6 +301,18 @@ fn key_display(value: &Value) -> Option<String> {
         Value::String(s) => Some(s.clone()),
         Value::Number(n) => Some(n.to_string()),
         _ => None,
+    }
+}
+
+/// Maps a query-engine failure onto an Azure-compatible [`ApiError`].
+fn engine_error(index: &str, error: QueryError) -> ApiError {
+    match error {
+        QueryError::IndexNotFound(name) => {
+            ApiError::not_found(format!("Index {name:?} was not found."))
+        }
+        QueryError::Engine(message) => {
+            ApiError::internal(format!("Search failed for index {index:?}: {message}"))
+        }
     }
 }
 
@@ -478,7 +528,10 @@ mod tests {
     }
 
     fn service() -> SearchService {
-        SearchService::new(Arc::new(InMemoryStorage::new()))
+        SearchService::new(
+            Arc::new(InMemoryStorage::new()),
+            Arc::new(SearchEngine::new()),
+        )
     }
 
     fn index_body() -> Value {
@@ -545,6 +598,51 @@ mod tests {
         assert!(!results[1].succeeded);
         assert_eq!(results[1].status_code, 400);
         assert!(!results[2].succeeded);
+    }
+
+    #[test]
+    fn upsert_index_rebuilds_search_state() {
+        let service = service();
+        ok(service.create_index(&index_body()));
+        ok(service.upload_documents(
+            "items",
+            vec![json!({"id": "1", "title": "hello", "price": 1.0})],
+        ));
+        let outcome = ok(service.search(
+            "items",
+            &SearchQuery {
+                search: Some("hello".to_owned()),
+                ..Default::default()
+            },
+        ));
+        assert_eq!(outcome.total, 1);
+
+        // Replacing the index discards its documents from both storage and
+        // the search engine.
+        let replacement = json!({
+            "name": "items",
+            "fields": [
+                {"name": "id", "type": "Edm.String", "key": true},
+                {"name": "other", "type": "Edm.String", "searchable": true}
+            ]
+        });
+        ok(service.create_or_update_index(&replacement));
+        let outcome = ok(service.search(
+            "items",
+            &SearchQuery {
+                search: Some("hello".to_owned()),
+                ..Default::default()
+            },
+        ));
+        assert_eq!(outcome.total, 0);
+        let outcome = ok(service.search(
+            "items",
+            &SearchQuery {
+                search: Some("*".to_owned()),
+                ..Default::default()
+            },
+        ));
+        assert_eq!(outcome.total, 0);
     }
 
     #[test]

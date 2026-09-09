@@ -1,4 +1,4 @@
-FROM rust:1.85-slim-bookworm AS builder
+FROM rust:1.95-slim-bookworm AS builder
 
 # Build a static musl binary for the platform Docker is running on, so the
 # image works on both amd64 (CI) and arm64 (Apple Silicon) hosts.

@@ -5,7 +5,7 @@ This decision record establishes the repository-wide versions and compatibility 
 ## Rust
 
 - Edition: Rust 2021.
-- MSRV: Rust 1.85, matching the toolchain expected by the pinned Nix development shell.
+- MSRV: Rust 1.95, matching the toolchain provided by the pinned Nix development shell (raised from 1.85 when Tantivy was adopted; the Tantivy 0.26 dependency tree requires a current toolchain).
 - Workspace location: `source/rust`.
 - Linting: Clippy warnings are denied in CI with `-D warnings`; `unwrap_used` and `expect_used` are denied in the crate configuration.
 - Formatting: rustfmt configuration is stored in the repository root and applies to the Rust workspace.
