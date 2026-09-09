@@ -177,3 +177,77 @@ def test_search_paging(priced_docs):
 def test_search_count(priced_docs):
     results = priced_docs.search(search_text="*", include_total_count=True)
     assert results.get_count() == 3
+
+
+def test_get_document(index_client, search_client, full_index):
+    index_client.create_index(full_index)
+    search_client.upload_documents(documents=[{"id": "1", "title": "one", "price": 1.0}])
+    doc = search_client.get_document(key="1")
+    assert doc["id"] == "1"
+    assert doc["title"] == "one"
+    assert doc["price"] == 1.0
+    with pytest.raises(HttpResponseError):
+        search_client.get_document(key="missing")
+
+
+def test_search_facet_options(priced_docs):
+    results = priced_docs.search(search_text="*", facets=["tags,count:1"])
+    facets = results.get_facets()
+    assert facets is not None
+    assert len(facets["tags"]) == 1
+    assert facets["tags"][0]["value"] == "red"
+    assert facets["tags"][0]["count"] == 2
+
+
+def test_geography_point_upload(index_client, search_client):
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchField(name="location", type=SearchFieldDataType.GeographyPoint),
+            ],
+        )
+    )
+    results = search_client.upload_documents(
+        documents=[
+            {"id": "1", "location": {"type": "Point", "coordinates": [-122.13, 47.67]}},
+        ]
+    )
+    assert all(r.succeeded for r in results)
+    doc = search_client.get_document(key="1")
+    assert doc["location"] == {"type": "Point", "coordinates": [-122.13, 47.67]}
+
+
+def test_complex_type_filter(index_client, search_client):
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchableField(name="name", type=SearchFieldDataType.String),
+                SearchField(
+                    name="address",
+                    type=SearchFieldDataType.ComplexType,
+                    fields=[
+                        SearchField(name="city", type=SearchFieldDataType.String, filterable=True),
+                        SearchField(
+                            name="state",
+                            type=SearchFieldDataType.String,
+                            filterable=True,
+                        ),
+                    ],
+                ),
+            ],
+        )
+    )
+    results = search_client.upload_documents(
+        documents=[
+            {"id": "1", "name": "one", "address": {"city": "Miami", "state": "FL"}},
+            {"id": "2", "name": "two", "address": {"city": "Seattle", "state": "WA"}},
+        ]
+    )
+    assert all(r.succeeded for r in results)
+    found = list(search_client.search(search_text="*", filter="address/state eq 'FL'"))
+    assert [doc["id"] for doc in found] == ["1"]
+    assert found[0]["address"] == {"city": "Miami", "state": "FL"}

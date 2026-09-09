@@ -16,6 +16,8 @@ pub struct FieldDefinition {
     pub sortable: bool,
     pub facetable: bool,
     pub retrievable: bool,
+    /// Subfields of an `Edm.ComplexType` field; empty for all other types.
+    pub subfields: Vec<FieldDefinition>,
     /// The raw JSON field definition, preserved for echo in responses.
     pub raw: Value,
 }
@@ -41,6 +43,12 @@ impl FieldDefinition {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| format!("field {name:?} is missing a non-empty \"type\""))?;
+        let mut subfields = Vec::new();
+        if let Some(subfields_raw) = obj.get("fields").and_then(Value::as_array) {
+            for subfield in subfields_raw {
+                subfields.push(FieldDefinition::from_json(subfield.clone())?);
+            }
+        }
         Ok(FieldDefinition {
             name: name.to_owned(),
             field_type: normalize_field_type(field_type),
@@ -65,6 +73,7 @@ impl FieldDefinition {
                 .get("retrievable")
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
+            subfields,
             raw,
         })
     }
@@ -137,6 +146,19 @@ impl IndexDefinition {
     #[must_use]
     pub fn field(&self, name: &str) -> Option<&FieldDefinition> {
         self.fields.iter().find(|f| f.name == name)
+    }
+
+    /// Resolves a field path (`Address/StateProvince`) through complex-type
+    /// subfields. A plain name resolves exactly like [`field`](Self::field).
+    #[must_use]
+    pub fn field_path(&self, path: &str) -> Option<&FieldDefinition> {
+        let mut segments = path.split('/');
+        let first = segments.next()?;
+        let mut current = self.fields.iter().find(|f| f.name == first)?;
+        for segment in segments {
+            current = current.subfields.iter().find(|f| f.name == segment)?;
+        }
+        Some(current)
     }
 }
 

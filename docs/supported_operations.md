@@ -44,8 +44,9 @@ Supported field types:
 
 - `Edm.String`, `Edm.Int32`, `Edm.Int64`, `Edm.Single`, `Edm.Double`, `Edm.Boolean`, `Edm.DateTimeOffset`, `Edm.Guid`, `Edm.GeographyPoint`
 - `Edm.Collection(...)` of any of the above
+- `Edm.ComplexType` with a non-empty `fields` array of subfields. Subfields must be scalar or collection-of-scalar types (no nested complex types), must have unique names, and cannot be keys. A complex field itself cannot be a key and cannot be marked `searchable`, `sortable`, or `facetable` (set those attributes on its subfields instead).
 
-Everything else (e.g. `Edm.Vector(...)`, complex types, `Edm.Int8`/`Edm.Int16`, `Edm.Time`, `Edm.Duration`, `Edm.Binary`) is rejected explicitly with the list of supported types in the message.
+Everything else (e.g. `Edm.Vector(...)`, `Edm.Collection(Edm.ComplexType)`, `Edm.Int8`/`Edm.Int16`, `Edm.Time`, `Edm.Duration`, `Edm.Binary`) is rejected explicitly with the list of supported types in the message.
 
 Field attributes (`searchable`, `filterable`, `sortable`, `facetable`, `retrievable`) are parsed, stored, and echoed. `searchable` controls full-text indexing; `filterable`, `sortable`, and `facetable` gate the corresponding query options (a field used in `filter`/`orderby`/`facets` must carry the matching attribute, else `400 InvalidQuery`). Collection types may be written with or without the `Edm.` prefix (`Collection(Edm.String)` as sent by the SDK, or `Edm.Collection(Edm.String)`); both are accepted and normalized.
 
@@ -87,7 +88,15 @@ Response body: `{"value": [{"key", "status", "statusCode", "errorMessage"}, ...]
 - Must be a JSON object.
 - Must contain the index key field, with a string or number value.
 - Must not contain fields absent from the index schema.
-- Each value must be compatible with the field type (strings for `Edm.String`/`DateTimeOffset`/`Guid`/`GeographyPoint`; integers for `Edm.Int32`/`Int64`; numbers for `Edm.Single`/`Double`; booleans for `Edm.Boolean`; arrays of the inner type for collections).
+- Each value must be compatible with the field type (strings for `Edm.String`/`DateTimeOffset`/`Guid`; integers for `Edm.Int32`/`Int64`; numbers for `Edm.Single`/`Double`; booleans for `Edm.Boolean`; arrays of the inner type for collections).
+- `Edm.GeographyPoint` accepts the `GeoJSON` point object the SDKs send (`{"type": "Point", "coordinates": [lon, lat]}`; a third altitude element is also accepted) or a plain string.
+- `Edm.ComplexType` values must be JSON objects whose members are known subfields with type-compatible values (checked recursively). Unknown subfields are rejected; missing subfields are allowed.
+
+### Single-document lookup
+
+| Operation | SDK method | HTTP request | Success | Errors | Status |
+|-----------|-----------|--------------|---------|--------|--------|
+| Get document | `SearchClient.get_document` | `GET /indexes('{name}')/docs('{key}')?api-version=...` | `200` + the stored document | `404 ResourceNotFound` (index or document) | Supported |
 
 ## Search
 
@@ -102,11 +111,11 @@ Route: `POST /indexes('{name}')/docs/search.post.search?api-version=...`.
 | Paging | `top=`, `skip=` | Supported |
 | Continuation tokens | `by_page()` → `@odata.nextLink` + `@search.nextPageParameters` | Supported |
 | Count documents | `SearchClient.count_documents()` (`/docs/$count`) | Not implemented (route not registered; returns `404`) |
-| Filters | `filter=` | Supported (see Filter below) |
-| Ordering | `orderby=` | Supported (sortable fields only) |
-| Projection | `select=` | Supported |
-| Facets | `facets=` | Supported (facetable fields only) |
-| Field-specific search | `search_fields=` | Supported (searchable fields only; weights accepted but inert) |
+| Filters | `filter=` | Supported, including nested complex-type paths (`Address/StateProvince`; see Filter below) |
+| Ordering | `orderby=` | Supported (sortable top-level fields only) |
+| Projection | `select=` | Supported (top-level fields only) |
+| Facets | `facets=` | Supported (facetable fields only), with `count:N` / `top:N` limits and the special `$count` facet |
+| Field-specific search | `search_fields=` | Supported (searchable fields only, including nested paths such as `Address/City`; weights accepted but inert) |
 | Search modes | `search_mode=` | Unsupported (explicit `400 UnsupportedQuery`; AND semantics are fixed) |
 | Highlighting | `highlight_fields=`, pre/post tags | Unsupported (explicit) |
 | Scoring profiles / parameters / statistics | `scoring_profile=`, ... | Unsupported (explicit) |
@@ -118,13 +127,13 @@ The full list of search options rejected with `400 UnsupportedQuery`: `searchMod
 
 ### Filter
 
-OData `$filter` with `and` / `or` / `not`, parentheses, `eq` / `ne` / `gt` / `ge` / `lt` / `le` on string, numeric, and boolean values, and collection filtering with `any` / `all`. Referenced fields must exist and be marked `filterable`. Invalid syntax, unknown fields, non-filterable fields, and incompatible operators (ordering on booleans or collections, `any`/`all` on non-collections) are rejected with `400 InvalidQuery`.
+OData `$filter` with `and` / `or` / `not`, parentheses, `eq` / `ne` / `gt` / `ge` / `lt` / `le` on string, numeric, and boolean values, and collection filtering with `any` / `all`. Field references may be nested complex-type paths (`Address/StateProvince eq 'FL'`); each path must resolve through complex-type subfields and the final subfield must exist and be marked `filterable`. Invalid syntax, unknown fields, non-filterable fields, and incompatible operators (ordering on booleans or collections, `any`/`all` on non-collections) are rejected with `400 InvalidQuery`.
 
 ### Ordering, projection, facets
 
 - `orderby`: comma-separated `field [asc|desc]` (or a JSON array). Every field must exist and be marked `sortable`. Missing values sort last; the key field is the final tie-breaker for determinism.
 - `select`: comma-separated field names (or a JSON array). Every field must exist. Only the selected fields are returned per document.
-- `facets`: comma-separated field names or `*` (or a JSON array). Named fields must exist and be marked `facetable`; `*` expands to all facetable fields. Counts are computed over the full filtered result set, ordered by count descending then value ascending.
+- `facets`: comma-separated entries or `*` (or a JSON array). Each entry is a field name, optionally followed by `,count:N` (or `,top:N`) to limit the number of returned facet values (e.g. `Category,count:3`). Named fields must exist and be marked `facetable`; `*` expands to all facetable fields. The special `$count` entry reports the total number of documents in the filtered result set as a plain number. Unknown facet options are rejected with `400 InvalidQuery`. Counts are computed over the full filtered result set, ordered by count descending then value ascending.
 
 ### Continuation tokens
 
@@ -188,7 +197,7 @@ When more results exist beyond the returned page, the response includes `@odata.
 | `400` | `InvalidQuery` | Search body is not a JSON object; `top`/`skip` not non-negative integers; invalid search text, filter, orderby, select, facets, or searchFields; stale or invalid continuation token |
 | `400` | `UnsupportedQuery` | Unsupported search option or `queryType` |
 | `400` | `UnsupportedAction` | Unknown document action (only `upload`, `merge`, `mergeOrUpload`, `delete` are supported) |
-| `404` | `ResourceNotFound` | Get/delete/upload/search on a missing index |
+| `404` | `ResourceNotFound` | Get/delete/upload/search/get-document on a missing index; get-document on a missing document key |
 | `409` | `IndexAlreadyExists` | `POST /indexes` with an existing name |
 | `500` | `InternalError` | Search engine failure |
 
@@ -204,9 +213,10 @@ When more results exist beyond the returned page, the response includes `@odata.
 | Capability | Contract tests | Unit tests | Python SDK/e2e |
 |------------|----------------|------------|------------|
 | Index create/get/list/update/delete | `tests/contract/index_management.rs` | `service`, `storage` | `test_emulator.py`, `tests/sdk/` |
-| Document upload/merge/mergeOrUpload/delete, per-document errors, batch shapes | `tests/contract/document_management.rs` | `service` | `tests/sdk/` |
-| Search shape, count, match-all, boolean operators, searchFields | `tests/contract/search.rs` | `query`, `service` | `tests/sdk/` |
-| Filters | `tests/contract/filtering.rs` | `filter`, `service` | `tests/sdk/` |
+| Document upload/merge/mergeOrUpload/delete, per-document errors, batch shapes, get-document, GeographyPoint values | `tests/contract/document_management.rs` | `service` | `tests/sdk/` |
+| Search shape, count, match-all, boolean operators, searchFields, facet options | `tests/contract/search.rs` | `query`, `service` | `tests/sdk/` |
+| Filters, including nested complex-type paths | `tests/contract/filtering.rs` | `filter`, `service` | `tests/sdk/` |
+| Complex-type schema, documents, filters | `tests/contract/complex_fields.rs` | `service` | `tests/sdk/` |
 | Ordering, projection, facets | `tests/contract/search.rs` | `service` | `tests/sdk/` |
 | Continuation tokens (nextLink, staleness) | `tests/contract/pagination.rs` | `service` | `tests/sdk/` (`by_page()`) |
 | Auth, API version, 404s, error structure | `tests/contract/errors.rs` | `version` | `test_emulator.py` |

@@ -44,19 +44,12 @@ KNOWN_ISSUES = {
     #     error signature so the gap is documented and the test alerts us when
     #     the feature lands (the sample starts passing -> promote it).
     "sample_authentication.py": ("gap", "Not Found"),  # get_document_count -> /docs/$count
-    "sample_documents_crud.py": ("gap", "Not Found"),  # GeographyPoint dropped -> get 404
     "sample_index_analyze_text.py": ("gap", "Not Found"),  # /analyze not implemented
     "sample_index_synonym_map_crud.py": ("gap", "Method Not Allowed"),  # synonym maps 405
     "sample_query_autocomplete.py": ("gap", "Not Found"),  # autocomplete 404
     "sample_query_suggestions.py": ("gap", "Not Found"),  # suggest 404
-    "sample_query_facets.py": ("gap", "InvalidQuery"),  # "field,count:N" facet syntax
-    "sample_query_filter.py": ("gap", "InvalidQuery"),  # complex/nested field filter
     "sample_query_session.py": ("gap", "UnsupportedQuery"),  # session_id
     "sample_knowledge_service_stats_preview.py": ("gap", "InvalidIndexName"),  # /servicestats
-    # --- False pass: exits 0, but the GeographyPoint document was not stored
-    #     (the emulator rejects the SDK's {"type": "Point", ...} shape) and the
-    #     buffered sender does not raise on per-document errors.
-    "sample_documents_buffered_sender.py": ("falsepass", None),
     # --- Cannot run here: needs azure-search-documents >= 12.0.0 (harness pins 11.6.0).
     "sample_agentic_retrieval.py": ("skip", "needs azure-search-documents>=12 (knowledgebases)"),
     "sample_index_alias_crud.py": ("skip", "needs azure-search-documents>=12 (SearchAlias)"),

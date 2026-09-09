@@ -86,8 +86,8 @@ impl FilterExpr {
             FilterExpr::Or(clauses) => clauses.iter().any(|c| c.matches(fields)),
             FilterExpr::Not(inner) => !inner.matches(fields),
             FilterExpr::Compare { field, op, value } => {
-                let Some(actual) = fields.get(field) else {
-                    // A missing field compares like `null`.
+                let Some(actual) = resolve_path(fields, field) else {
+                    // A missing field (or missing path segment) compares like `null`.
                     return null_matches(*op, value);
                 };
                 if actual.is_null() {
@@ -119,6 +119,18 @@ impl FilterExpr {
                 .is_some_and(|items| items.iter().all(|item| element_matches(inner, item))),
         }
     }
+}
+
+/// Resolves a field path (`Address/StateProvince`, or a plain field name)
+/// against a document's field map, walking into complex-type objects.
+fn resolve_path<'a>(fields: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
+    let mut segments = path.split('/');
+    let first = segments.next()?;
+    let mut current = fields.get(first)?;
+    for segment in segments {
+        current = current.as_object()?.get(segment)?;
+    }
+    Some(current)
 }
 
 fn value_is_null(value: &FilterValue) -> bool {
@@ -253,7 +265,7 @@ fn require_filterable<'a>(
     definition: &'a IndexDefinition,
 ) -> Result<&'a FieldDefinition, String> {
     let field_def = definition
-        .field(field)
+        .field_path(field)
         .ok_or_else(|| format!("Filter references unknown field {field:?}."))?;
     if !field_def.filterable {
         return Err(format!(
@@ -360,7 +372,9 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 let mut text = String::new();
                 text.push(c);
                 while let Some(&(_, next_ch)) = chars.peek() {
-                    if next_ch.is_ascii_alphanumeric() || next_ch == '_' {
+                    // `/` continues an identifier so complex-type field paths
+                    // (`Address/StateProvince`) parse as a single field name.
+                    if next_ch.is_ascii_alphanumeric() || next_ch == '_' || next_ch == '/' {
                         chars.next();
                         text.push(next_ch);
                     } else {
@@ -771,5 +785,61 @@ mod tests {
         assert!(validate(&parse_ok("title any x eq 'a'"), &definition).is_err());
         // Valid.
         assert!(validate(&parse_ok("price gt 1 and tags any x eq 'a'"), &definition).is_ok());
+    }
+
+    fn hotels_definition() -> IndexDefinition {
+        IndexDefinition::from_json(json!({
+            "name": "hotels",
+            "fields": [
+                {"name": "id", "type": "Edm.String", "key": true},
+                {
+                    "name": "Address",
+                    "type": "Edm.ComplexType",
+                    "fields": [
+                        {"name": "City", "type": "Edm.String", "filterable": true},
+                        {"name": "StateProvince", "type": "Edm.String", "filterable": true},
+                        {"name": "Country", "type": "Edm.String"}
+                    ]
+                }
+            ]
+        }))
+        .unwrap_or_else(|e| panic!("valid definition: {e}"))
+    }
+
+    #[test]
+    fn parses_and_evaluates_complex_field_paths() {
+        let expr = parse_ok("Address/StateProvince eq 'FL' and Address/City eq 'Miami'");
+        assert!(matches(
+            &expr,
+            &[("Address", json!({"City": "Miami", "StateProvince": "FL"}))]
+        ));
+        assert!(!matches(
+            &expr,
+            &[("Address", json!({"City": "Miami", "StateProvince": "WA"}))]
+        ));
+        // A missing path segment compares like `null`.
+        assert!(!matches(&expr, &[("Address", json!({"City": "Miami"}))]));
+        assert!(!matches(&expr, &[]));
+        assert!(matches(
+            &parse_ok("Address/Country eq null"),
+            &[("Address", json!({"City": "Miami"}))]
+        ));
+    }
+
+    #[test]
+    fn validation_checks_complex_field_paths() {
+        let definition = hotels_definition();
+        // Valid nested path on filterable subfields.
+        assert!(validate(
+            &parse_ok("Address/StateProvince eq 'FL' and Address/City eq 'Miami'"),
+            &definition
+        )
+        .is_ok());
+        // Unknown nested path.
+        assert!(validate(&parse_ok("Address/Missing eq 'x'"), &definition).is_err());
+        // Non-filterable subfield.
+        assert!(validate(&parse_ok("Address/Country eq 'USA'"), &definition).is_err());
+        // Path through a non-complex field.
+        assert!(validate(&parse_ok("id/City eq 'x'"), &definition).is_err());
     }
 }

@@ -1,0 +1,16 @@
+{
+  "method": "GET",
+  "url": "http://<endpoint>/indexes('fixture-index')/docs('1')?api-version=2024-07-01",
+  "headers": {
+    "api-key": "fixture-key",
+    "Accept": "application/json;odata.metadata=none",
+    "User-Agent": "<user-agent>"
+  },
+  "request_body": null,
+  "status_code": 200,
+  "response_headers": {
+    "content-type": "application/json",
+    "content-length": "32"
+  },
+  "response_body": "{\"id\":\"1\",\"title\":\"hello world\"}"
+}

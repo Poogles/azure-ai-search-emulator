@@ -182,6 +182,98 @@ async fn merge_or_upload_merges_existing_and_uploads_new() {
 }
 
 #[tokio::test]
+async fn upload_accepts_geography_point_geojson_value() {
+    let app = app();
+    let definition = json!({
+        "name": "hotels",
+        "fields": [
+            {"name": "HotelId", "type": "Edm.Int32", "key": true},
+            {"name": "Location", "type": "Edm.GeographyPoint", "searchable": true}
+        ]
+    });
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            "/indexes?api-version=2024-07-01",
+            Some(API_KEY),
+            Some(definition),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The SDK serializes GeographyPoint as a GeoJSON object, not a string.
+    let (status, body) = call(
+        app,
+        upload_request(
+            "hotels",
+            json!([
+                {
+                    "@search.action": "upload",
+                    "document": {
+                        "HotelId": 100,
+                        "Location": {"type": "Point", "coordinates": [-122.131_577, 47.678_581]}
+                    }
+                }
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["value"][0]["key"], "100");
+    assert_eq!(body["value"][0]["status"], true);
+    assert_eq!(body["value"][0]["statusCode"], 201);
+    assert!(body["value"][0]["errorMessage"].is_null());
+}
+
+fn get_document_request(name: &str, key: &str) -> axum::http::Request<axum::body::Body> {
+    let uri = format!("/indexes('{name}')/docs('{key}')?api-version={API_VERSION}");
+    request("GET", &uri, Some(API_KEY), None)
+}
+
+#[tokio::test]
+async fn get_document_returns_stored_document() {
+    let app = app();
+    let (status, _) = create_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        upload_request(
+            "items",
+            json!([{"@search.action": "upload", "document": {"id": "1", "title": "one", "price": 1.5}}]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = call(app, get_document_request("items", "1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["id"], "1");
+    assert_eq!(body["title"], "one");
+    assert_eq!(body["price"], 1.5);
+}
+
+#[tokio::test]
+async fn get_missing_document_returns_404() {
+    let app = app();
+    let (status, _) = create_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = call(app, get_document_request("items", "missing")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "ResourceNotFound");
+}
+
+#[tokio::test]
+async fn get_document_on_missing_index_returns_404() {
+    let app = app();
+    let (status, body) = call(app, get_document_request("missing", "1")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "ResourceNotFound");
+}
+
+#[tokio::test]
 async fn delete_removes_document() {
     let app = app();
     let (status, _) = create_index(&app, "items").await;

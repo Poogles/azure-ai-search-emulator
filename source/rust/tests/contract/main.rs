@@ -4,6 +4,7 @@
 
 mod admin;
 mod common;
+mod complex_fields;
 mod document_management;
 mod errors;
 mod filtering;

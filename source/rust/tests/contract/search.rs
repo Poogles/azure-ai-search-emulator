@@ -146,6 +146,61 @@ async fn search_quoted_phrase_requires_adjacency() {
 }
 
 #[tokio::test]
+async fn search_facets_accept_count_option() {
+    let app = app();
+    let definition = json!({
+        "name": "hotels",
+        "fields": [
+            {"name": "HotelId", "type": "Edm.Int32", "key": true},
+            {"name": "Category", "type": "Edm.String", "facetable": true},
+            {"name": "ParkingIncluded", "type": "Edm.Boolean", "facetable": true}
+        ]
+    });
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            "/indexes?api-version=2024-07-01",
+            Some(API_KEY),
+            Some(definition),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        upload_request(
+            "hotels",
+            json!([
+                {"@search.action": "upload", "document": {"HotelId": 1, "Category": "boutique", "ParkingIncluded": true}},
+                {"@search.action": "upload", "document": {"HotelId": 2, "Category": "boutique", "ParkingIncluded": false}},
+                {"@search.action": "upload", "document": {"HotelId": 3, "Category": "luxury", "ParkingIncluded": true}},
+                {"@search.action": "upload", "document": {"HotelId": 4, "Category": "motel", "ParkingIncluded": false}}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The SDK sends facet options as `field,count:N` items in the array.
+    let (status, body) = call(
+        app,
+        search_request(
+            "hotels",
+            json!({"search": "*", "facets": ["Category,count:3", "ParkingIncluded"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let category = &body["@search.facets"]["Category"];
+    assert_eq!(category.as_array().map(Vec::len), Some(3));
+    assert_eq!(category[0]["value"], "boutique");
+    assert_eq!(category[0]["count"], 2);
+    let parking = &body["@search.facets"]["ParkingIncluded"];
+    assert_eq!(parking.as_array().map(Vec::len), Some(2));
+}
+
+#[tokio::test]
 async fn search_fields_restrict_scope() {
     let app = app();
     let (status, _) = create_index(&app, "items").await;

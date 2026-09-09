@@ -22,6 +22,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde_json::{Map, Value};
 use tantivy::collector::TopDocs;
 use tantivy::query::{AllQuery, BooleanQuery, EmptyQuery, Occur, PhraseQuery, Query, TermQuery};
 use tantivy::schema::Value as _;
@@ -273,9 +274,7 @@ impl SearchEngine {
             let mut tantivy_doc = TantivyDocument::new();
             tantivy_doc.add_text(engine.key_field, &document.key);
             for (field_name, field) in &engine.searchable {
-                if let Some(value) = document
-                    .fields
-                    .get(field_name)
+                if let Some(value) = resolve_doc_path(&document.fields, field_name)
                     .and_then(serde_json::Value::as_str)
                 {
                     tantivy_doc.add_text(*field, value);
@@ -403,18 +402,47 @@ impl SearchEngine {
 }
 
 /// Builds the Tantivy schema for an emulator index: a stored key field plus one
-/// tokenized text field per `searchable: true` field.
+/// tokenized text field per `searchable: true` field. Searchable complex-type
+/// subfields are indexed under their field path (`Address/City`).
 fn build_schema(fields: &[FieldDefinition]) -> (Schema, Field, Vec<(String, Field)>) {
     let mut builder = Schema::builder();
     let key_field = builder.add_text_field(KEY_FIELD_NAME, STRING | STORED);
     let mut searchable = Vec::new();
+    collect_searchable(&mut builder, &mut searchable, "", fields);
+    (builder.build(), key_field, searchable)
+}
+
+fn collect_searchable(
+    builder: &mut tantivy::schema::SchemaBuilder,
+    searchable: &mut Vec<(String, Field)>,
+    prefix: &str,
+    fields: &[FieldDefinition],
+) {
     for field in fields {
-        if field.searchable {
-            let tantivy_field = builder.add_text_field(&field.name, TEXT);
-            searchable.push((field.name.clone(), tantivy_field));
+        let path = if prefix.is_empty() {
+            field.name.clone()
+        } else {
+            format!("{prefix}/{}", field.name)
+        };
+        if field.field_type == "Edm.ComplexType" {
+            collect_searchable(builder, searchable, &path, &field.subfields);
+        } else if field.searchable {
+            let tantivy_field = builder.add_text_field(&path, TEXT);
+            searchable.push((path, tantivy_field));
         }
     }
-    (builder.build(), key_field, searchable)
+}
+
+/// Resolves a field path (`Address/City`, or a plain field name) against a
+/// document's field map, walking into complex-type objects.
+fn resolve_doc_path<'a>(fields: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
+    let mut segments = path.split('/');
+    let first = segments.next()?;
+    let mut current = fields.get(first)?;
+    for segment in segments {
+        current = current.as_object()?.get(segment)?;
+    }
+    Some(current)
 }
 
 /// Builds the Tantivy query for a [`FullTextQuery`]: match-all when the query
@@ -497,6 +525,7 @@ mod tests {
                 sortable: false,
                 facetable: false,
                 retrievable: true,
+                subfields: Vec::new(),
                 raw: Value::Null,
             },
             FieldDefinition {
@@ -508,6 +537,7 @@ mod tests {
                 sortable: false,
                 facetable: false,
                 retrievable: true,
+                subfields: Vec::new(),
                 raw: Value::Null,
             },
             FieldDefinition {
@@ -519,6 +549,7 @@ mod tests {
                 sortable: false,
                 facetable: false,
                 retrievable: true,
+                subfields: Vec::new(),
                 raw: Value::Null,
             },
             FieldDefinition {
@@ -530,6 +561,7 @@ mod tests {
                 sortable: true,
                 facetable: false,
                 retrievable: true,
+                subfields: Vec::new(),
                 raw: Value::Null,
             },
         ]

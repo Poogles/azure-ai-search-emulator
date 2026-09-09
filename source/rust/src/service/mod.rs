@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 use crate::error::ApiError;
 use crate::filter::{self, FilterExpr};
 use crate::query::{parse_search_text, FullTextQuery, QueryError, SearchEngine};
-use crate::storage::{Document, IndexDefinition, Storage, StorageError};
+use crate::storage::{Document, FieldDefinition, IndexDefinition, Storage, StorageError};
 
 /// Field types accepted by the schema validator.
 const SUPPORTED_FIELD_TYPES: &[&str] = &[
@@ -96,9 +96,17 @@ pub struct SearchQuery {
     /// The raw `orderby` string, preserved for continuation tokens.
     pub orderby_raw: Option<String>,
     pub select: Vec<String>,
-    pub facets: Vec<String>,
+    pub facets: Vec<Facet>,
     pub search_fields: Vec<String>,
     pub continuation: Option<String>,
+}
+
+/// One `facets` entry: a field (or the special `$count`) with an optional
+/// limit on the number of returned facet values (`count:N` / `top:N`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Facet {
+    pub field: String,
+    pub limit: Option<usize>,
 }
 
 /// One `orderby` clause: a field and its direction.
@@ -286,6 +294,25 @@ impl SearchService {
             Err(ApiError::not_found(format!(
                 "Index {name:?} was not found."
             )))
+        }
+    }
+
+    /// Returns a single document by key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] if the index or the document does not exist.
+    pub fn get_document(&self, index: &str, key: &str) -> Result<Value, ApiError> {
+        let definition = self.require_index(index)?;
+        match self
+            .storage
+            .get_document(&definition.name, key)
+            .map_err(|e| ApiError::not_found(e.to_string()))?
+        {
+            Some(document) => Ok(document.to_value()),
+            None => Err(ApiError::not_found(format!(
+                "Document with key {key:?} was not found in index {index:?}."
+            ))),
         }
     }
 
@@ -781,13 +808,22 @@ fn type_tag(value: &Value) -> u8 {
 }
 
 /// Computes facet counts over the full (filtered, ordered) result set: one
-/// entry per distinct value, ordered by count descending then value ascending.
-fn compute_facets(documents: &[Document], fields: &[String]) -> Value {
+/// entry per distinct value, ordered by count descending then value ascending,
+/// truncated to the facet's limit when one is given. The special `$count`
+/// facet reports the total number of documents in the result set.
+fn compute_facets(documents: &[Document], facets: &[Facet]) -> Value {
     let mut map = Map::new();
-    for field in fields {
+    for facet in facets {
+        if facet.field == "$count" {
+            map.insert(
+                facet.field.clone(),
+                Value::from(u64::try_from(documents.len()).unwrap_or(u64::MAX)),
+            );
+            continue;
+        }
         let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
         for document in documents {
-            let Some(value) = document.fields.get(field) else {
+            let Some(value) = document.fields.get(&facet.field) else {
                 continue;
             };
             let values = if value.is_array() {
@@ -805,6 +841,9 @@ fn compute_facets(documents: &[Document], fields: &[String]) -> Value {
         }
         let mut entries: Vec<(String, u64)> = counts.into_iter().collect();
         entries.sort_by(|(a, ac), (b, bc)| bc.cmp(ac).then_with(|| a.cmp(b)));
+        if let Some(limit) = facet.limit {
+            entries.truncate(limit);
+        }
         let items = entries
             .into_iter()
             .map(|(key, count)| {
@@ -816,7 +855,7 @@ fn compute_facets(documents: &[Document], fields: &[String]) -> Value {
                 })
             })
             .collect();
-        map.insert(field.clone(), Value::Array(items));
+        map.insert(facet.field.clone(), Value::Array(items));
     }
     Value::Object(map)
 }
@@ -977,39 +1016,92 @@ fn parse_select(value: &Value, definition: &IndexDefinition) -> Result<Vec<Strin
     Ok(fields)
 }
 
-/// Parses a `facets` value: comma-separated field names or `*` (all facetable
-/// fields), or a JSON array. Named fields must exist and be marked `facetable`.
-fn parse_facets(value: &Value, definition: &IndexDefinition) -> Result<Vec<String>, ApiError> {
-    let mut fields = Vec::new();
+/// Parses a `facets` value: comma-separated entries (or a JSON array). Each
+/// entry is a field name, the special `$count`, or `*` (all facetable fields),
+/// optionally followed by `,count:N` (or `,top:N`) to limit the number of
+/// returned facet values. Named fields must exist and be marked `facetable`.
+fn parse_facets(value: &Value, definition: &IndexDefinition) -> Result<Vec<Facet>, ApiError> {
+    let mut facets = Vec::new();
     for part in string_items(value, "facets")? {
-        if part == "*" {
-            for field in &definition.fields {
-                if field.facetable {
-                    fields.push(field.name.clone());
-                }
-            }
-        } else {
-            let field_def = definition.field(&part).ok_or_else(|| {
+        let mut pieces = part.split(',');
+        let name = pieces.next().unwrap_or("").trim();
+        let mut limit = None;
+        for option in pieces {
+            let option = option.trim();
+            let Some((key, arg)) = option.split_once(':') else {
+                return Err(ApiError::bad_request(
+                    "InvalidQuery",
+                    format!(
+                        "Invalid facet option {option:?} in {part:?}; expected 'count:N' or 'top:N'."
+                    ),
+                ));
+            };
+            let count: u64 = arg.trim().parse().map_err(|_| {
                 ApiError::bad_request(
                     "InvalidQuery",
-                    format!("facets references unknown field {part:?}."),
+                    format!(
+                        "Invalid facet option {option:?} in {part:?}; the count must be a non-negative integer."
+                    ),
+                )
+            })?;
+            let n = usize::try_from(count).unwrap_or(usize::MAX);
+            match key {
+                "count" | "top" => limit = Some(n),
+                other => {
+                    return Err(ApiError::bad_request(
+                        "InvalidQuery",
+                        format!(
+                            "Unsupported facet option {other:?} in {part:?}; supported options: count:N, top:N."
+                        ),
+                    ))
+                }
+            }
+        }
+        if name == "*" {
+            for field in &definition.fields {
+                if field.facetable {
+                    facets.push(Facet {
+                        field: field.name.clone(),
+                        limit,
+                    });
+                }
+            }
+        } else if name == "$count" {
+            if limit.is_some() {
+                return Err(ApiError::bad_request(
+                    "InvalidQuery",
+                    format!("The $count facet does not take options (got {part:?})."),
+                ));
+            }
+            facets.push(Facet {
+                field: "$count".to_owned(),
+                limit: None,
+            });
+        } else {
+            let field_def = definition.field(name).ok_or_else(|| {
+                ApiError::bad_request(
+                    "InvalidQuery",
+                    format!("facets references unknown field {name:?}."),
                 )
             })?;
             if !field_def.facetable {
                 return Err(ApiError::bad_request(
                     "InvalidQuery",
                     format!(
-                        "Field {part:?} is not facetable; mark it \"facetable\": true in the index schema."
+                        "Field {name:?} is not facetable; mark it \"facetable\": true in the index schema."
                     ),
                 ));
             }
-            fields.push(part);
+            facets.push(Facet {
+                field: name.to_owned(),
+                limit,
+            });
         }
     }
-    if fields.is_empty() {
+    if facets.is_empty() {
         return Err(ApiError::bad_request("InvalidQuery", "facets is empty."));
     }
-    Ok(fields)
+    Ok(facets)
 }
 
 /// Parses a `searchFields` value: comma-separated field names (or a JSON
@@ -1023,7 +1115,7 @@ fn parse_search_fields(
     let mut fields = Vec::new();
     for part in string_items(value, "searchFields")? {
         let name = part.split('^').next().unwrap_or("").trim();
-        let field_def = definition.field(name).ok_or_else(|| {
+        let field_def = definition.field_path(name).ok_or_else(|| {
             ApiError::bad_request(
                 "InvalidQuery",
                 format!("searchFields references unknown field {name:?}."),
@@ -1091,13 +1183,34 @@ fn validate_schema(definition: &IndexDefinition) -> Result<(), ApiError> {
             ));
         }
         if field.is_key {
+            if field.field_type == "Edm.ComplexType" {
+                return Err(ApiError::bad_request(
+                    "InvalidIndex",
+                    format!(
+                        "Field {:?} cannot be the key: complex type fields cannot be keys.",
+                        field.name
+                    ),
+                ));
+            }
             key_count += 1;
         }
-        if !SUPPORTED_FIELD_TYPES.contains(&field.field_type.as_str()) {
+        if field.field_type == "Edm.ComplexType" {
+            if field.searchable || field.sortable || field.facetable {
+                return Err(ApiError::bad_request(
+                    "InvalidIndex",
+                    format!(
+                        "Field {:?} is a complex type and cannot be searchable, sortable, or facetable; \
+                         set those attributes on its subfields instead.",
+                        field.name
+                    ),
+                ));
+            }
+            validate_subfields(field)?;
+        } else if !SUPPORTED_FIELD_TYPES.contains(&field.field_type.as_str()) {
             return Err(ApiError::bad_request(
                 "InvalidIndex",
                 format!(
-                    "Unsupported field type {:?} for field {:?}. Supported types: {}.",
+                    "Unsupported field type {:?} for field {:?}. Supported types: {}, Edm.ComplexType.",
                     field.field_type,
                     field.name,
                     SUPPORTED_FIELD_TYPES.join(", ")
@@ -1110,6 +1223,52 @@ fn validate_schema(definition: &IndexDefinition) -> Result<(), ApiError> {
             "InvalidIndex",
             format!("Index schema must define exactly one key field; found {key_count}."),
         ));
+    }
+    Ok(())
+}
+
+/// Validates the subfields of an `Edm.ComplexType` field: non-empty, unique
+/// names, supported scalar (or collection-of-scalar) types, and no keys.
+fn validate_subfields(field: &FieldDefinition) -> Result<(), ApiError> {
+    if field.subfields.is_empty() {
+        return Err(ApiError::bad_request(
+            "InvalidIndex",
+            format!(
+                "Complex type field {:?} must define a non-empty \"fields\" array of subfields.",
+                field.name
+            ),
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for subfield in &field.subfields {
+        if !seen.insert(subfield.name.as_str()) {
+            return Err(ApiError::bad_request(
+                "InvalidIndex",
+                format!(
+                    "Duplicate subfield name {:?} in complex type field {:?}.",
+                    subfield.name, field.name
+                ),
+            ));
+        }
+        if subfield.is_key {
+            return Err(ApiError::bad_request(
+                "InvalidIndex",
+                format!(
+                    "Subfield {:?} of complex type field {:?} cannot be a key.",
+                    subfield.name, field.name
+                ),
+            ));
+        }
+        if !SUPPORTED_FIELD_TYPES.contains(&subfield.field_type.as_str()) {
+            return Err(ApiError::bad_request(
+                "InvalidIndex",
+                format!(
+                    "Unsupported subfield type {:?} for subfield {:?} of complex type field {:?}. \
+                     Subfields must be scalar or collection-of-scalar types.",
+                    subfield.field_type, subfield.name, field.name
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -1138,7 +1297,7 @@ fn validate_document(definition: &IndexDefinition, document: &Value) -> Result<D
         let field = definition
             .field(name)
             .ok_or_else(|| format!("Document contains unknown field {name:?}."))?;
-        check_field_type(name, &field.field_type, value)?;
+        check_field_type(field, value)?;
     }
     Ok(Document {
         key,
@@ -1146,7 +1305,12 @@ fn validate_document(definition: &IndexDefinition, document: &Value) -> Result<D
     })
 }
 
-fn check_field_type(name: &str, field_type: &str, value: &Value) -> Result<(), String> {
+fn check_field_type(field: &FieldDefinition, value: &Value) -> Result<(), String> {
+    if field.field_type == "Edm.ComplexType" {
+        return check_complex_value(field, value);
+    }
+    let name = &field.name;
+    let field_type = &field.field_type;
     let ok = if let Some(inner) = field_type
         .strip_prefix("Edm.Collection(")
         .and_then(|s| s.strip_suffix(')'))
@@ -1155,10 +1319,9 @@ fn check_field_type(name: &str, field_type: &str, value: &Value) -> Result<(), S
             .as_array()
             .is_some_and(|items| items.iter().all(|item| type_ok(inner, item)))
     } else {
-        match field_type {
-            "Edm.String" | "Edm.DateTimeOffset" | "Edm.Guid" | "Edm.GeographyPoint" => {
-                value.is_string()
-            }
+        match field_type.as_str() {
+            "Edm.String" | "Edm.DateTimeOffset" | "Edm.Guid" => value.is_string(),
+            "Edm.GeographyPoint" => is_geography_point(value),
             "Edm.Int32" | "Edm.Int64" => value.is_i64() || value.is_u64(),
             "Edm.Single" | "Edm.Double" => value.is_number(),
             "Edm.Boolean" => value.is_boolean(),
@@ -1168,15 +1331,74 @@ fn check_field_type(name: &str, field_type: &str, value: &Value) -> Result<(), S
     if ok {
         Ok(())
     } else {
+        let hint = if field_type == "Edm.GeographyPoint" {
+            " Expected a GeoJSON point object \
+             {\"type\": \"Point\", \"coordinates\": [lon, lat]} or a string."
+        } else {
+            ""
+        };
         Err(format!(
-            "Value for field {name:?} is not compatible with type {field_type:?}."
+            "Value for field {name:?} is not compatible with type {field_type:?}.{hint}"
         ))
     }
+}
+
+/// Validates a complex-type value: a JSON object whose members are known
+/// subfields with type-compatible values. Missing subfields are allowed.
+fn check_complex_value(field: &FieldDefinition, value: &Value) -> Result<(), String> {
+    let obj = value.as_object().ok_or_else(|| {
+        format!(
+            "Value for field {:?} must be a JSON object with the subfields of the complex type.",
+            field.name
+        )
+    })?;
+    for (sub_name, sub_value) in obj {
+        let subfield = field
+            .subfields
+            .iter()
+            .find(|f| f.name == *sub_name)
+            .ok_or_else(|| {
+                format!(
+                    "Complex field {:?} has no subfield {:?}; known subfields: {}.",
+                    field.name,
+                    sub_name,
+                    field
+                        .subfields
+                        .iter()
+                        .map(|f| f.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+        check_field_type(subfield, sub_value)?;
+    }
+    Ok(())
+}
+
+/// Whether a value is an acceptable `Edm.GeographyPoint`: the `GeoJSON` point
+/// object the SDKs send (an object with `type` set to "Point" and a two- or
+/// three-element numeric `coordinates` array) or a plain string.
+fn is_geography_point(value: &Value) -> bool {
+    if value.is_string() {
+        return true;
+    }
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    if obj.get("type").and_then(Value::as_str) != Some("Point") {
+        return false;
+    }
+    obj.get("coordinates")
+        .and_then(Value::as_array)
+        .is_some_and(|coords| {
+            (coords.len() == 2 || coords.len() == 3) && coords.iter().all(Value::is_number)
+        })
 }
 
 fn type_ok(inner: &str, value: &Value) -> bool {
     match inner {
         "Edm.String" | "Edm.DateTimeOffset" | "Edm.Guid" => value.is_string(),
+        "Edm.GeographyPoint" => is_geography_point(value),
         "Edm.Int32" | "Edm.Int64" => value.is_i64() || value.is_u64(),
         "Edm.Single" | "Edm.Double" => value.is_number(),
         "Edm.Boolean" => value.is_boolean(),
@@ -1297,6 +1519,85 @@ mod tests {
     }
 
     #[test]
+    fn schema_validation_complex_type() {
+        let service = service();
+        let valid = json!({
+            "name": "x",
+            "fields": [
+                {"name": "id", "type": "Edm.String", "key": true},
+                {
+                    "name": "Address",
+                    "type": "Edm.ComplexType",
+                    "fields": [
+                        {"name": "City", "type": "Edm.String", "searchable": true, "filterable": true},
+                        {"name": "Zip", "type": "Edm.Int32", "filterable": true}
+                    ]
+                }
+            ]
+        });
+        assert!(service.create_index(&valid).is_ok());
+
+        // Failed creations are rejected at validation, before storage, so one
+        // service can check every invalid shape.
+        let invalid_bodies = [
+            // Complex type cannot be the key.
+            json!({
+                "name": "y",
+                "fields": [
+                    {"name": "id", "type": "Edm.String", "key": true},
+                    {"name": "Address", "type": "Edm.ComplexType", "key": true,
+                     "fields": [{"name": "City", "type": "Edm.String"}]}
+                ]
+            }),
+            // Complex type cannot be searchable/sortable/facetable.
+            json!({
+                "name": "y",
+                "fields": [
+                    {"name": "id", "type": "Edm.String", "key": true},
+                    {"name": "Address", "type": "Edm.ComplexType", "searchable": true,
+                     "fields": [{"name": "City", "type": "Edm.String"}]}
+                ]
+            }),
+            // Complex type must define subfields.
+            json!({
+                "name": "y",
+                "fields": [
+                    {"name": "id", "type": "Edm.String", "key": true},
+                    {"name": "Address", "type": "Edm.ComplexType", "fields": []}
+                ]
+            }),
+            // Subfields must be scalar (or collection-of-scalar) types.
+            json!({
+                "name": "y",
+                "fields": [
+                    {"name": "id", "type": "Edm.String", "key": true},
+                    {"name": "Address", "type": "Edm.ComplexType",
+                     "fields": [{"name": "Inner", "type": "Edm.ComplexType",
+                                 "fields": [{"name": "City", "type": "Edm.String"}]}]}
+                ]
+            }),
+            // Subfield names must be unique.
+            json!({
+                "name": "y",
+                "fields": [
+                    {"name": "id", "type": "Edm.String", "key": true},
+                    {"name": "Address", "type": "Edm.ComplexType",
+                     "fields": [
+                         {"name": "City", "type": "Edm.String"},
+                         {"name": "City", "type": "Edm.Int32"}
+                     ]}
+                ]
+            }),
+        ];
+        for body in &invalid_bodies {
+            assert!(
+                service.create_index(body).is_err(),
+                "expected rejection: {body}"
+            );
+        }
+    }
+
+    #[test]
     fn upload_validates_documents_against_schema() {
         let service = service();
         ok(service.create_index(&index_body()));
@@ -1323,6 +1624,69 @@ mod tests {
         assert!(!results[1].succeeded);
         assert_eq!(results[1].status_code, 400);
         assert!(!results[2].succeeded);
+    }
+
+    #[test]
+    fn upload_validates_geography_point_and_complex_values() {
+        let service = service();
+        ok(service.create_index(&json!({
+            "name": "items",
+            "fields": [
+                {"name": "id", "type": "Edm.String", "key": true},
+                {"name": "Location", "type": "Edm.GeographyPoint"},
+                {
+                    "name": "Address",
+                    "type": "Edm.ComplexType",
+                    "fields": [
+                        {"name": "City", "type": "Edm.String"},
+                        {"name": "Zip", "type": "Edm.Int32"}
+                    ]
+                }
+            ]
+        })));
+        let results = ok(service.index_documents(
+            "items",
+            vec![
+                DocumentAction {
+                    kind: ActionKind::Upload,
+                    document: json!({
+                        "id": "1",
+                        "Location": {"type": "Point", "coordinates": [-122.13, 47.67]},
+                        "Address": {"City": "Seattle", "Zip": 98101}
+                    }),
+                },
+                DocumentAction {
+                    kind: ActionKind::Upload,
+                    document: json!({"id": "2", "Location": {"type": "LineString", "coordinates": []}}),
+                },
+                DocumentAction {
+                    kind: ActionKind::Upload,
+                    document: json!({"id": "3", "Location": {"type": "Point", "coordinates": [-122.13]}}),
+                },
+                DocumentAction {
+                    kind: ActionKind::Upload,
+                    document: json!({"id": "4", "Address": {"City": "Seattle", "Unknown": 1}}),
+                },
+                DocumentAction {
+                    kind: ActionKind::Upload,
+                    document: json!({"id": "5", "Address": {"Zip": "not a number"}}),
+                },
+                DocumentAction {
+                    kind: ActionKind::Upload,
+                    document: json!({"id": "6", "Address": "not an object"}),
+                },
+            ],
+        ));
+        assert_eq!(results.len(), 6);
+        assert!(
+            results[0].succeeded,
+            "{}",
+            results[0].error_message.clone().unwrap_or_default()
+        );
+        for (index, result) in results.iter().skip(1).enumerate() {
+            assert!(!result.succeeded, "document {} should fail", index + 2);
+            assert_eq!(result.status_code, 400);
+        }
     }
 
     #[test]
@@ -1604,6 +1968,41 @@ mod tests {
         assert_eq!(entries[1]["count"], 1);
         assert_eq!(entries[2]["value"], "green");
         assert_eq!(entries[2]["count"], 1);
+    }
+
+    #[test]
+    fn search_facets_options_limit_and_total_count() {
+        let service = service();
+        ok(service.create_index(&index_body()));
+        upload(
+            &service,
+            vec![
+                json!({"id": "1", "title": "a", "tags": ["red", "blue"]}),
+                json!({"id": "2", "title": "b", "tags": ["red"]}),
+                json!({"id": "3", "title": "c", "tags": ["green"]}),
+            ],
+        );
+        let query = ok(service.parse_search(
+            "items",
+            &json!({"search": "*", "facets": ["tags,count:1", "$count"]}),
+        ));
+        let outcome = ok(service.search("items", &query));
+        let Some(facets) = outcome.facets else {
+            panic!("expected facets in search outcome");
+        };
+        let Some(entries) = facets["tags"].as_array() else {
+            panic!("expected tags facet array");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["value"], "red");
+        assert_eq!(entries[0]["count"], 2);
+        assert_eq!(facets["$count"], 3);
+
+        // Unknown facet options are rejected explicitly.
+        let api_error = err(service.parse_search("items", &json!({"facets": ["tags,minimum:1"]})));
+        assert_eq!(api_error.code, "InvalidQuery");
+        let api_error = err(service.parse_search("items", &json!({"facets": ["tags,count:many"]})));
+        assert_eq!(api_error.code, "InvalidQuery");
     }
 
     #[test]

@@ -3,10 +3,10 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, Request, State};
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use axum::middleware;
-use axum::response::Response;
-use axum::routing::{get, post};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 
@@ -51,6 +51,12 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/{index}/docs/search.index", post(upload_documents))
         .route("/{index}/docs/search.post.search", post(search_documents))
+        // `docs('key')` is a single OData path segment, so this is a
+        // two-segment route (unlike the three-segment search routes above).
+        // It accepts any method and rejects non-GET requests with a 404 so
+        // that unknown routes keep returning 404 rather than 405 (e.g.
+        // `POST /admin/reset` when the admin surface is disabled).
+        .route("/{index}/{key}", any(document_by_key))
         .layer(middleware::from_fn_with_state(state.clone(), azure_guard));
 
     let mut app = Router::new().route("/health", get(health)).merge(azure);
@@ -213,6 +219,27 @@ async fn upload_documents(
             .collect(),
     );
     Ok(Json(json!({ "value": value })))
+}
+
+/// `GET /indexes('{name}')/docs('{key}')` — Get Document. Any other method
+/// on a two-segment path is not an Azure route: it falls through with the
+/// same empty 404 the router's fallback would produce, so unimplemented
+/// routes keep their pinned signatures (e.g. `POST .../search.analyze`).
+async fn document_by_key(
+    State(state): State<AppState>,
+    method: Method,
+    Path((raw_name, raw_key)): Path<(String, String)>,
+) -> Result<Json<Value>, Response> {
+    if method != Method::GET {
+        return Err(StatusCode::NOT_FOUND.into_response());
+    }
+    let name = parse_index_name(&raw_name).map_err(IntoResponse::into_response)?;
+    let key = parse_document_key(&raw_key).map_err(IntoResponse::into_response)?;
+    state
+        .service
+        .get_document(&name, &key)
+        .map(Json)
+        .map_err(IntoResponse::into_response)
 }
 
 async fn search_documents(
@@ -410,6 +437,28 @@ fn parse_index_name(raw: &str) -> Result<String, ApiError> {
     Ok(name.to_owned())
 }
 
+/// Parses the OData-style document path segment `docs('key')`.
+fn parse_document_key(raw: &str) -> Result<String, ApiError> {
+    let invalid = || {
+        ApiError::bad_request(
+            "InvalidRequest",
+            format!("Invalid document path segment {raw:?}; expected docs('key')."),
+        )
+    };
+    let inner = raw
+        .strip_prefix("docs(")
+        .and_then(|s| s.strip_suffix(')'))
+        .ok_or_else(invalid)?;
+    let key = inner
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .ok_or_else(invalid)?;
+    if key.is_empty() {
+        return Err(invalid());
+    }
+    Ok(key.to_owned())
+}
+
 fn parse_body(body: &axum::body::Bytes) -> Result<Value, ApiError> {
     if body.is_empty() {
         return Err(ApiError::bad_request(
@@ -449,6 +498,13 @@ fn operation_for(method: &axum::http::Method, path: &str) -> &'static str {
     }
     if path.contains("/docs/search.post.search") {
         return "search";
+    }
+    if path.contains("/docs(") {
+        return if method.as_str() == "GET" {
+            "getDocument"
+        } else {
+            "unknown"
+        };
     }
     match method.as_str() {
         "PUT" => "createIndex",

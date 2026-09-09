@@ -159,6 +159,9 @@ def main() -> None:
         ]
     )
 
+    # Get document
+    search_client.get_document(key="1")
+
     # Search
     list(search_client.search(search_text="hello", top=10))
 

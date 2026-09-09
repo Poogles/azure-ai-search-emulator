@@ -32,8 +32,9 @@ machine-readable one.
   - Subprocesses re-apply the plain-HTTP shims via
     `ms_samples/shims/sitecustomize.py` on `PYTHONPATH`.
 - Samples that assume the portal `hotels-sample-index` get it from
-  `ms_samples/setup_hotels.py` (schema subset the emulator supports; seed
-  documents intentionally omit `Location` — see the GeographyPoint gap below).
+  `ms_samples/setup_hotels.py` (schema subset the emulator supports,
+  including an `Address` complex field and `GeoJSON` `Location` values on the
+  seed documents).
 - Async mirrors are excluded: the emulator is a plain HTTP service, so the
   sync and async SDK paths exercise the same wire contract.
 
@@ -60,25 +61,25 @@ Each sample is classified in `KNOWN_ISSUES` (`test_ms_samples.py`):
 
 32 sync samples discovered. `make test-ms`: **12 passed, 20 skipped, 0 failed.**
 
-### Passes (2)
+### Passes (5)
 
 | Sample | Notes |
 |--------|-------|
 | `sample_query_simple.py` | Genuine pass: simple text search returns the seeded hotel. |
-| `sample_documents_buffered_sender.py` | **False pass** (pinned as `falsepass`): exits 0, but the `HotelId: 100` document is never stored. The emulator rejects the SDK's `{"type": "Point", "coordinates": [...]}` GeographyPoint shape (it validates `Edm.GeographyPoint` as a string, see `source/rust/src/service/mod.rs`), and `SearchIndexingBufferedSender` does not raise on per-document errors. Fixing GeographyPoint parsing turns this genuinely green. |
+| `sample_documents_buffered_sender.py` | Genuine pass since the GeographyPoint fix: the `HotelId: 100` document is stored (previously a `falsepass` — the emulator rejected the SDK's `{"type": "Point", "coordinates": [...]}` shape while `SearchIndexingBufferedSender` swallowed the per-document error). |
+| `sample_documents_crud.py` | Genuine pass since the GeographyPoint fix (upload/merge of doc 100) plus the new `GET /indexes('{name}')/docs('{key}')` endpoint (get/delete of doc 100). |
+| `sample_query_facets.py` | Genuine pass since the facet-options fix (`Category,count:3`). |
+| `sample_query_filter.py` | Genuine pass since the complex-type fix (`Address/StateProvince` filter against the `Address` complex field in the seeded hotels index). |
 
-### Documented emulator gaps (10)
+### Documented emulator gaps (7)
 
 | Sample | Fails with | Missing feature |
 |--------|-----------|-----------------|
 | `sample_authentication.py` | 404 `Not Found` | `GET /docs/$count` (`get_document_count`) not implemented. (AAD halves also need `azure-identity`.) |
-| `sample_documents_crud.py` | 404 on `get_document` | GeographyPoint value shape rejected, so doc 100 is never stored; the subsequent get 404s. Same root cause as the buffered-sender false pass. |
 | `sample_index_analyze_text.py` | 404 `Not Found` | `POST /indexes('{name}')/analyze` not implemented. |
 | `sample_index_synonym_map_crud.py` | 405 `Method Not Allowed` | Synonym-map routes not implemented. |
 | `sample_query_autocomplete.py` | 404 `Not Found` | Autocomplete route not implemented. |
 | `sample_query_suggestions.py` | 404 `Not Found` | Suggest route not implemented. |
-| `sample_query_facets.py` | 400 `InvalidQuery` | `"field,count:N"` facet option syntax not parsed (plain field facets work). |
-| `sample_query_filter.py` | 400 `InvalidQuery` | Complex/nested field filters (`Address/StateProvince`) unsupported. |
 | `sample_query_session.py` | 400 `UnsupportedQuery` | `sessionId` rejected as an unsupported query option. |
 | `sample_knowledge_service_stats_preview.py` | 400 `InvalidIndexName` | Service-stats route not implemented; the request falls through to index-path parsing. |
 
