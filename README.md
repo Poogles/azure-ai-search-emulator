@@ -129,5 +129,6 @@ poetry run pytest --collect-only
 - [docs/phase_1_scaffold_and_e2e.md](docs/phase_1_scaffold_and_e2e.md) — minimal service, containerisation, e2e tests.
 - [docs/phase_2_production_api.md](docs/phase_2_production_api.md) — full API surface and test suite.
 - [docs/phase_3_admin_api_and_remaining.md](docs/phase_3_admin_api_and_remaining.md) — admin API, C# compatibility, release.
-
-Additional documents (`docs/decisions/`, `docs/supported_operations.md`, `docs/known_differences.md`) are created as the corresponding phases are implemented.
+- [docs/supported_operations.md](docs/supported_operations.md) — supported-operations matrix: every operation, its SDK method, HTTP request, status codes, and supported/unsupported state.
+- [docs/known_differences.md](docs/known_differences.md) — accepted behavioural differences from real Azure AI Search, with rationale.
+- [docs/decisions/](docs/decisions/) — architecture decision records (HTTP framework, search engine, baseline).
