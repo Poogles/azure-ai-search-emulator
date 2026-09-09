@@ -23,22 +23,25 @@ API_VERSION = "2024-07-01"
 CREDENTIAL = AzureKeyCredential(API_KEY)
 
 
-def _index_client(endpoint: str) -> SearchIndexClient:
+@pytest.fixture()
+def index_client(clean_emulator) -> SearchIndexClient:
     return SearchIndexClient(
-        endpoint=endpoint, credential=CREDENTIAL, api_version=API_VERSION
+        endpoint=clean_emulator, credential=CREDENTIAL, api_version=API_VERSION
     )
 
 
-def _search_client(endpoint: str) -> SearchClient:
+@pytest.fixture()
+def search_client(clean_emulator) -> SearchClient:
     return SearchClient(
-        endpoint=endpoint,
+        endpoint=clean_emulator,
         index_name=INDEX_NAME,
         credential=CREDENTIAL,
         api_version=API_VERSION,
     )
 
 
-def _test_index() -> SearchIndex:
+@pytest.fixture()
+def test_index() -> SearchIndex:
     return SearchIndex(
         name=INDEX_NAME,
         fields=[
@@ -48,79 +51,88 @@ def _test_index() -> SearchIndex:
     )
 
 
-class TestHealth:
-    def test_health_endpoint(self, clean_emulator):
-        with urllib.request.urlopen(f"{clean_emulator}/health", timeout=5) as resp:
-            assert resp.status == 200
-            body = resp.read().decode()
-            assert "ok" in body
+@pytest.fixture()
+def created_index(index_client, test_index) -> SearchIndex:
+    return index_client.create_index(test_index)
 
 
-class TestIndexLifecycle:
-    def test_create_index(self, clean_emulator):
-        client = _index_client(clean_emulator)
-        client.create_index(_test_index())
-        created = client.get_index(INDEX_NAME)
-        assert created.name == INDEX_NAME
-        assert len(created.fields) == 2
-
-    def test_create_duplicate_index_fails(self, clean_emulator):
-        client = _index_client(clean_emulator)
-        client.create_index(_test_index())
-        with pytest.raises(HttpResponseError) as exc_info:
-            client.create_index(_test_index())
-        assert exc_info.value.status_code == 409
-
-    def test_delete_index(self, clean_emulator):
-        client = _index_client(clean_emulator)
-        client.create_index(_test_index())
-        client.delete_index(INDEX_NAME)
-        with pytest.raises(ResourceNotFoundError):
-            client.get_index(INDEX_NAME)
+def test_health_endpoint(clean_emulator):
+    with urllib.request.urlopen(f"{clean_emulator}/health", timeout=5) as resp:
+        assert resp.status == 200
+        body = resp.read().decode()
+        assert "ok" in body
 
 
-class TestDocuments:
-    def test_upload_and_search(self, clean_emulator):
-        index_client = _index_client(clean_emulator)
-        index_client.create_index(_test_index())
+def test_create_index(created_index):
+    assert created_index.name == INDEX_NAME
+    assert len(created_index.fields) == 2
 
-        search_client = _search_client(clean_emulator)
-        docs = [
-            {"id": "1", "title": "hello world"},
-            {"id": "2", "title": "foo bar"},
-            {"id": "3", "title": "hello there"},
+
+def test_create_duplicate_index_fails(index_client, test_index):
+    index_client.create_index(test_index)
+    with pytest.raises(HttpResponseError) as exc_info:
+        index_client.create_index(test_index)
+    assert exc_info.value.status_code == 409
+
+
+def test_list_indexes(index_client, test_index):
+    index_client.create_index(test_index)
+    names = [index.name for index in index_client.list_indexes()]
+    assert names == [INDEX_NAME]
+
+
+def test_update_index(index_client, test_index):
+    index_client.create_index(test_index)
+    updated = test_index
+    updated.fields[1].searchable = False
+    index_client.create_or_update_index(updated)
+    fetched = index_client.get_index(INDEX_NAME)
+    assert fetched.fields[1].searchable is False
+
+
+def test_delete_index(index_client, test_index):
+    index_client.create_index(test_index)
+    index_client.delete_index(INDEX_NAME)
+    with pytest.raises(ResourceNotFoundError):
+        index_client.get_index(INDEX_NAME)
+
+
+def test_upload_and_search(index_client, search_client, test_index):
+    index_client.create_index(test_index)
+
+    docs = [
+        {"id": "1", "title": "hello world"},
+        {"id": "2", "title": "foo bar"},
+        {"id": "3", "title": "hello there"},
+    ]
+    results = search_client.upload_documents(documents=docs)
+    assert len(results) == 3
+    assert all(r.succeeded for r in results)
+
+    search_results = search_client.search(search_text="hello", top=10)
+    found = list(search_results)
+    assert len(found) == 2
+    ids = {doc["id"] for doc in found}
+    assert ids == {"1", "3"}
+
+
+def test_search_match_all(index_client, search_client, test_index):
+    index_client.create_index(test_index)
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "alpha"},
+            {"id": "2", "title": "beta"},
         ]
-        results = search_client.upload_documents(documents=docs)
-        assert len(results) == 3
-        assert all(r.succeeded for r in results)
+    )
 
-        search_results = search_client.search(search_text="hello", top=10)
-        found = list(search_results)
-        assert len(found) == 2
-        ids = {doc["id"] for doc in found}
-        assert ids == {"1", "3"}
+    results = list(search_client.search(search_text="*", top=10))
+    assert len(results) == 2
 
-    def test_search_match_all(self, clean_emulator):
-        index_client = _index_client(clean_emulator)
-        index_client.create_index(_test_index())
 
-        search_client = _search_client(clean_emulator)
-        search_client.upload_documents(
-            documents=[
-                {"id": "1", "title": "alpha"},
-                {"id": "2", "title": "beta"},
-            ]
-        )
+def test_operations_on_deleted_index_fail(index_client, search_client, test_index):
+    index_client.create_index(test_index)
+    index_client.delete_index(INDEX_NAME)
 
-        results = list(search_client.search(search_text="*", top=10))
-        assert len(results) == 2
-
-    def test_operations_on_deleted_index_fail(self, clean_emulator):
-        index_client = _index_client(clean_emulator)
-        index_client.create_index(_test_index())
-        index_client.delete_index(INDEX_NAME)
-
-        search_client = _search_client(clean_emulator)
-        # search() returns a lazy paged iterator; iterate to trigger the request.
-        with pytest.raises(ResourceNotFoundError):
-            list(search_client.search(search_text="test", top=1))
+    # search() returns a lazy paged iterator; iterate to trigger the request.
+    with pytest.raises(ResourceNotFoundError):
+        list(search_client.search(search_text="test", top=1))
