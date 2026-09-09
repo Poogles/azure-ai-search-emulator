@@ -83,6 +83,262 @@ Each sample is classified in `KNOWN_ISSUES` (`test_ms_samples.py`):
 | `sample_query_session.py` | 400 `UnsupportedQuery` | `sessionId` rejected as an unsupported query option. |
 | `sample_knowledge_service_stats_preview.py` | 400 `InvalidIndexName` | Service-stats route not implemented; the request falls through to index-path parsing. |
 
+Implementation plans for each gap are in [Gap implementation plans](#gap-implementation-plans) below.
+
+### Gap implementation plans
+
+Detailed requirements for closing each gap, in recommended implementation
+order (each builds on prior auth-guard / route changes).
+
+#### Completion tracker
+
+| # | Gap | Status | PR / commit |
+|---|-----|--------|-------------|
+| 6 | `sessionId` | ☐ not started | |
+| 1 | Document count (`$count`) | ☐ not started | |
+| 7 | Service stats (`/servicestats`) | ☐ not started | |
+| 2 | Analyze text (`/search.analyze`) | ☐ not started | |
+| 3 | Synonym maps CRUD | ☐ not started | |
+| 4 | Autocomplete | ☐ not started | |
+| 5 | Suggest | ☐ not started | |
+
+---
+
+#### Gap 6 — `sessionId` (trivial, ~5 min)
+
+**Sample:** `sample_query_session.py`
+**Route:** N/A (field in search POST body)
+**Current failure:** 400 `UnsupportedQuery`
+
+**What is required:**
+
+- [ ] Remove `"sessionId"` from `UNSUPPORTED_SEARCH_OPTIONS` in
+      `source/src/service/mod.rs` (~line 1418). The field will be silently
+      ignored (the emulator uses deterministic ordering and constant scoring,
+      so session affinity is irrelevant).
+- [ ] Update `docs/supported_operations.md`: move `sessionId` from the
+      rejected-options list to "accepted but inert".
+- [ ] Remove the `KNOWN_ISSUES` entry in
+      `source/tests/python/tests/ms_samples/test_ms_samples.py`.
+- [ ] Run `make test-ms` to confirm the sample now passes.
+
+---
+
+#### Gap 1 — Document count `GET /indexes('{name}')/docs/$count` (easy, ~30 min)
+
+**Sample:** `sample_authentication.py`
+**Route:** `GET /indexes('{indexName}')/docs/$count`
+**Current failure:** 404 `Not Found`
+
+**What is required:**
+
+- [ ] Add route `GET /{index}/docs/$count` to the azure sub-router in
+      `source/src/api/mod.rs`. The literal three-segment path takes precedence
+      over the existing `/{index}/{key}` catch-all.
+- [ ] Add a handler that parses the index name, calls
+      `storage.get_documents(index)`, and returns the `.len()` as a bare
+      integer body (not JSON-wrapped) with `Content-Type: application/json`.
+- [ ] Add a contract test in `source/tests/python/tests/` exercising
+      `search_client.get_document_count()`.
+- [ ] Remove the `KNOWN_ISSUES` entry.
+- [ ] Run `make test-ms` to confirm.
+
+**Notes:** The AAD halves of `sample_authentication.py` also require
+`azure-identity` and a real token; those remain a `skip` even after this gap
+is closed. The sample will pass if the `get_document_count` call succeeds
+before the AAD section.
+
+---
+
+#### Gap 7 — Service stats `GET /servicestats` (easy, ~30 min)
+
+**Sample:** `sample_knowledge_service_stats_preview.py`
+**Route:** `GET /servicestats`
+**Current failure:** 400 `InvalidIndexName` (falls through to index-path
+parsing)
+
+**What is required:**
+
+- [ ] Add route `GET /servicestats` to the main router in
+      `source/src/api/mod.rs` (literal path, takes precedence over
+      `/{index}`).
+- [ ] Handler returns a static JSON response:
+      ```json
+      {
+        "counters": {
+          "knowledgeBaseCounter": {"usage": 0},
+          "knowledgeSourceCounter": {"usage": 0}
+        },
+        "limits": {
+          "maxVectorIndexSizePerIndexInBytes": 1073741824
+        }
+      }
+      ```
+- [ ] Extend `azure_guard` middleware to cover the `/servicestats` path
+      (currently only covers `/indexes` and `/indexes(`).
+- [ ] Add a contract test.
+- [ ] Remove the `KNOWN_ISSUES` entry.
+- [ ] Run `make test-ms` to confirm.
+
+---
+
+#### Gap 2 — Analyze text `POST /indexes('{name}')/search.analyze` (easy-medium, ~1 hr)
+
+**Sample:** `sample_index_analyze_text.py`
+**Route:** `POST /indexes('{indexName}')/search.analyze`
+**Current failure:** 404 `Not Found`
+
+**What is required:**
+
+- [ ] Extend `analyze()` in `source/src/query/mod.rs` (~line 70) to return
+      structured tokens with offsets. Tantivy's `TokenStream` already provides
+      `token.text`, `token.offset_from`, `token.offset_to`, and
+      `token.position`. Define:
+      ```rust
+      struct AnalyzeToken {
+          token: String,
+          start_offset: usize,
+          end_offset: usize,
+          position: usize,
+      }
+      ```
+- [ ] Add route `POST /{index}/search.analyze` to the azure sub-router.
+      Axum gives precedence to literal routes over the `/{index}/{key}`
+      parameterized route.
+- [ ] Handler: parse the index name, parse the JSON body (extract `text`;
+      accept but ignore `analyzerName` and `field`), call the extended
+      analyze function, return:
+      ```json
+      {"tokens": [{"token": "...", "startOffset": 0, "endOffset": 4, "position": 0}]}
+      ```
+- [ ] Add a contract test.
+- [ ] Remove the `KNOWN_ISSUES` entry.
+- [ ] Run `make test-ms` to confirm.
+
+**Notes:** The sample uses `analyzer_name="standard.lucene"`. The emulator
+always uses Tantivy's default English analyzer; this is an acceptable
+simplification (document in `known_differences.md`).
+
+---
+
+#### Gap 3 — Synonym maps CRUD (medium, ~2-3 hrs)
+
+**Sample:** `sample_index_synonym_map_crud.py`
+**Routes:**
+- `POST /synonymmaps` (create)
+- `GET /synonymmaps` (list)
+- `GET /synonymmaps('{name}')` (get by name)
+- `PUT /synonymmaps('{name}')` (create or update)
+- `DELETE /synonymmaps('{name}')` (delete)
+
+**Current failure:** 405 `Method Not Allowed`
+
+**What is required:**
+
+- [ ] Define a `SynonymMap` struct: `name: String`, `format: String`
+      (always `"solr"`), `synonyms: Vec<String>`, `etag: String`
+      (generated UUID or incrementing counter).
+- [ ] Add storage: a `BTreeMap<String, SynonymMap>` in `SearchService` (or a
+      dedicated `SynonymMapStore`).
+- [ ] Add routes. The OData-style `synonymmaps('name')` is a single path
+      segment, so it conflicts with the existing `/{index}` route. Options:
+      - Register `POST /synonymmaps` and `GET /synonymmaps` as literal routes
+        (no conflict).
+      - For `GET/PUT/DELETE /{segment}`: dispatch in the existing `/{index}`
+        handler — if the raw segment starts with `synonymmaps(`, route to
+        synonym-map logic; otherwise treat as an index name.
+- [ ] Extend `azure_guard` to cover `/synonymmaps` and `/synonymmaps(` paths.
+- [ ] Response format:
+      ```json
+      {"name": "...", "format": "solr", "synonyms": ["a, b, c"], "@odata.etag": "\"...\""}
+      ```
+      List response: `{"value": [...]}`.
+- [ ] Add contract tests (create, list, get, update, delete).
+- [ ] Document in `known_differences.md`: synonym maps are stored but inert
+      (do not affect search results).
+- [ ] Remove the `KNOWN_ISSUES` entry.
+- [ ] Run `make test-ms` to confirm.
+
+---
+
+#### Gap 4 — Autocomplete `POST /indexes('{name}')/docs/search.post.autocomplete` (medium-hard, ~3-4 hrs)
+
+**Sample:** `sample_query_autocomplete.py`
+**Route:** `POST /indexes('{indexName}')/docs/search.post.autocomplete?suggesterName=sg`
+**Current failure:** 404 `Not Found`
+
+**What is required:**
+
+- [ ] **Suggester schema:** Add a `Suggester` struct (`name: String`,
+      `search_fields: Vec<String>`) and a `suggesters: Vec<Suggester>` field
+      to `IndexDefinition`.
+- [ ] Parse the `suggesters` array in `parse_index_definition`.
+- [ ] Validate in `validate_schema` that suggester search fields exist and
+      are `searchable`.
+- [ ] Update `setup_hotels.py` to include a suggester:
+      ```python
+      from azure.search.documents.indexes.models import Suggester
+      # In the SearchIndex definition:
+      suggesters=[Suggester(name="sg", search_fields=["HotelName"])]
+      ```
+- [ ] Add route `POST /{index}/docs/search.post.autocomplete` to the azure
+      sub-router.
+- [ ] Handler: parse index name, extract `suggesterName` from query params,
+      parse body (extract `searchText`), look up the suggester in the index
+      definition, perform case-insensitive prefix matching on the suggester's
+      search fields across all documents. Return:
+      ```json
+      {"value": [{"text": "Boston", "queryPlusText": "bo Boston"}]}
+      ```
+      Limit to `top` results (default 5, from query param or body).
+- [ ] Add contract tests.
+- [ ] Document in `known_differences.md`: autocomplete uses simple prefix
+      matching (not Azure's full suggester algorithm with scoring).
+- [ ] Remove the `KNOWN_ISSUES` entry.
+- [ ] Run `make test-ms` to confirm.
+
+---
+
+#### Gap 5 — Suggest `POST /indexes('{name}')/docs/search.post.suggest` (medium-hard, ~2-3 hrs)
+
+**Sample:** `sample_query_suggestions.py`
+**Route:** `POST /indexes('{indexName}')/docs/search.post.suggest?suggesterName=sg`
+**Current failure:** 404 `Not Found`
+
+**What is required:**
+
+- [ ] Reuse the suggester infrastructure from Gap 4 (schema, parsing,
+      validation, `setup_hotels.py`).
+- [ ] Add route `POST /{index}/docs/search.post.suggest` to the azure
+      sub-router.
+- [ ] Handler: same pattern as autocomplete, but return full documents (all
+      retrievable fields) with an additional `@search.text` field containing
+      the matched text:
+      ```json
+      {"value": [{"@search.text": "coffee", "HotelId": "1", "HotelName": "...", ...}]}
+      ```
+      The sample calls `get_document(key=result["HotelId"])` for each
+      suggestion, so the key field must be present.
+- [ ] Add contract tests.
+- [ ] Remove the `KNOWN_ISSUES` entry.
+- [ ] Run `make test-ms` to confirm.
+
+---
+
+#### Cross-cutting changes (apply as each gap lands)
+
+- [ ] `azure_guard` middleware (`source/src/api/mod.rs`): extend to cover
+      `/synonymmaps`, `/synonymmaps(`, and `/servicestats` paths.
+- [ ] `docs/supported_operations.md`: update the operations matrix for each
+      new endpoint.
+- [ ] `docs/known_differences.md`: document simplifications (inert synonym
+      maps, prefix-match autocomplete/suggest, default analyzer for
+      `/search.analyze`).
+- [ ] `source/tests/python/tests/ms_samples/test_ms_samples.py`: remove
+      `KNOWN_ISSUES` entries as each gap closes.
+- [ ] `source/tests/python/ms_samples/setup_hotels.py`: add suggester
+      definition (needed for Gaps 4 and 5).
+
 ### Skipped — needs `azure-search-documents >= 12.0.0` (17)
 
 Upstream `main` targets SDK 12 (`12.0.0` is latest on PyPI); the harness pins
