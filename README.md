@@ -43,10 +43,10 @@ direnv allow
 
 Entering the directory activates the shell automatically. It provides `rustc`, `cargo`, `clippy`, `rustfmt`, Python 3.14, `poetry`, `pre-commit`, and `docker`.
 
-> **Nix on macOS — linker workaround.** The Nix-provided `cc` wrapper cannot find the system `libiconv`, so `cargo build` / `cargo test` / `cargo clippy` fail at the final link step with `ld: library not found for -liconv`. (This is a pre-existing environment issue, unrelated to any dependency.) Prefix Rust commands to use the system linker instead:
+> **Nix on macOS — linker note.** The Nix darwin SDK root does not ship `usr/lib/libiconv.tbd`, which breaks the final link step of Rust builds (`ld: library not found for -liconv`). The dev shell in [shell.nix](shell.nix) exports `RUSTFLAGS` with the system SDK lib directory on the linker search path, so `cargo build` / `cargo test` / `cargo clippy` work out of the box. Outside the dev shell, set it manually:
 >
 > ```sh
-> RUSTFLAGS="-C linker=/usr/bin/clang" cargo test --manifest-path source/rust/Cargo.toml
+> RUSTFLAGS="-L $(xcrun --show-sdk-path)/usr/lib" cargo test --manifest-path source/rust/Cargo.toml
 > ```
 >
 > The Docker musl build is unaffected.

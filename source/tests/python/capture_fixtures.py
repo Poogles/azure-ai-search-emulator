@@ -91,16 +91,29 @@ class RecordingTransport(HttpTransport):
         return response
 
 
+def _strip_dynamic_headers(headers: dict) -> dict:
+    """Drop per-request dynamic headers (request IDs, timestamps)."""
+    return {
+        k: v
+        for k, v in headers.items()
+        if k.lower() not in {"x-ms-client-request-id", "date"}
+    }
+
+
 def sanitize(record: dict) -> dict:
-    """Strip dynamic values from a recorded exchange."""
+    """Strip dynamic values from a recorded exchange.
+
+    Removes per-request values (client request IDs, timestamps, UUIDs) and
+    normalises environment-dependent values (endpoint host, user agent) so the
+    committed fixtures are deterministic across machines and runs.
+    """
     rec = dict(record)
-    rec["headers"] = {
-        k: v for k, v in rec["headers"].items() if k.lower() != "x-ms-client-request-id"
-    }
-    rec["response_headers"] = {
-        k: v for k, v in rec["response_headers"].items() if k.lower() != "x-ms-client-request-id"
-    }
+    rec["headers"] = _strip_dynamic_headers(rec["headers"])
+    rec["response_headers"] = _strip_dynamic_headers(rec["response_headers"])
+    if "User-Agent" in rec["headers"]:
+        rec["headers"]["User-Agent"] = "<user-agent>"
     rec["url"] = UUID_RE.sub("<UUID>", rec["url"])
+    rec["url"] = re.sub(r"^https?://[^/]+", "http://<endpoint>", rec["url"])
     return rec
 
 

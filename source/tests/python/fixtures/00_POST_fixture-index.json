@@ -1,0 +1,18 @@
+{
+  "method": "POST",
+  "url": "http://<endpoint>/indexes?api-version=2024-07-01",
+  "headers": {
+    "Content-Type": "application/json",
+    "Content-Length": "149",
+    "api-key": "fixture-key",
+    "Accept": "application/json;odata.metadata=minimal",
+    "User-Agent": "<user-agent>"
+  },
+  "request_body": "{\"name\": \"fixture-index\", \"fields\": [{\"name\": \"id\", \"type\": \"Edm.String\", \"key\": true}, {\"name\": \"title\", \"type\": \"Edm.String\", \"searchable\": true}]}",
+  "status_code": 201,
+  "response_headers": {
+    "content-type": "application/json",
+    "content-length": "135"
+  },
+  "response_body": "{\"fields\":[{\"key\":true,\"name\":\"id\",\"type\":\"Edm.String\"},{\"name\":\"title\",\"searchable\":true,\"type\":\"Edm.String\"}],\"name\":\"fixture-index\"}"
+}

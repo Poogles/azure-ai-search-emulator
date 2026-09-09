@@ -1,6 +1,6 @@
 ---
-status: draft
-status_last_reviewed: 2026-09-07
+status: complete
+status_last_reviewed: 2026-09-09
 ---
 
 # Phase 1 — Application Scaffold and End-to-End Test
@@ -98,53 +98,53 @@ Full-text matching for the e2e round trip, backed by **Tantivy** (see `docs/deci
 
 ### Fixture capture
 
-- [ ] HTTP fixtures captured from the Python SDK for: create index, upload docs, search, delete index.
-- [ ] Fixtures committed to `source/tests/python/fixtures/` (sanitized, including `x-ms-client-request-id`).
-- [ ] Endpoint routes and response shapes in the implementation match the captured fixtures.
+- [x] HTTP fixtures captured from the Python SDK for: create index, upload docs, search, delete index.
+- [x] Fixtures committed to `source/tests/python/fixtures/` (sanitized, including `x-ms-client-request-id`).
+- [x] Endpoint routes and response shapes in the implementation match the captured fixtures.
 
 ### Application
 
-- [ ] Application starts locally (`cargo run --manifest-path source/rust/Cargo.toml`) and serves `GET /health` with `200 {"status":"ok"}`.
-- [ ] Configuration (port, storage mode, API version, log level, admin enable) is externalised via `EMULATOR_*` environment variables.
-- [ ] `api-version` query parameter is captured; unsupported versions return `400` with a clear error.
-- [ ] Any non-empty `api-key` header is accepted; missing/empty key returns `401` with Azure error structure.
-- [ ] Index creation (`PUT /indexes('{name}')`) validates the schema and rejects unsupported field types explicitly.
-- [ ] Document upload (`POST /indexes('{name}')/docs/index`) validates documents against the index schema.
-- [ ] Search (`POST /indexes('{name}')/docs/search`) returns Azure-compatible response structure (`value`, `@search.score`, and `@odata.count` when `count=true`), matching the captured fixtures.
-- [ ] Delete index (`DELETE /indexes('{name}')`) works; subsequent operations return `404`.
-- [ ] `EMULATOR_STORAGE__MODE=file` fails fast at startup with a clear "not yet implemented" error.
-- [ ] `POST /admin/reset` clears all state (gated by `EMULATOR_ENABLE_ADMIN`).
-- [ ] Contract tests (Rust integration tests) cover the error paths the SDK cannot exercise: missing/empty `api-key` → `401`, unsupported `api-version` → `400`, operations on a deleted index → `404`.
-- [ ] Errors use Azure-compatible error structure (`{"error":{"code":"...","message":"..."}}`).
-- [ ] Logging records method, endpoint, API version, index, operation, and `x-ms-client-request-id`; request bodies are not logged.
+- [x] Application starts locally (`cargo run --manifest-path source/rust/Cargo.toml`) and serves `GET /health` with `200 {"status":"ok"}`.
+- [x] Configuration (port, storage mode, API version, log level, admin enable) is externalised via `EMULATOR_*` environment variables.
+- [x] `api-version` query parameter is captured; unsupported versions return `400` with a clear error.
+- [x] Any non-empty `api-key` header is accepted; missing/empty key returns `401` with Azure error structure.
+- [x] Index creation (`PUT /indexes('{name}')`) validates the schema and rejects unsupported field types explicitly.
+- [x] Document upload (`POST /indexes('{name}')/docs/index`) validates documents against the index schema.
+- [x] Search (`POST /indexes('{name}')/docs/search`) returns Azure-compatible response structure (`value`, `@search.score`, and `@odata.count` when `count=true`), matching the captured fixtures.
+- [x] Delete index (`DELETE /indexes('{name}')`) works; subsequent operations return `404`.
+- [x] `EMULATOR_STORAGE__MODE=file` fails fast at startup with a clear "not yet implemented" error.
+- [x] `POST /admin/reset` clears all state (gated by `EMULATOR_ENABLE_ADMIN`).
+- [x] Contract tests (Rust integration tests) cover the error paths the SDK cannot exercise: missing/empty `api-key` → `401`, unsupported `api-version` → `400`, operations on a deleted index → `404`.
+- [x] Errors use Azure-compatible error structure (`{"error":{"code":"...","message":"..."}}`).
+- [x] Logging records method, endpoint, API version, index, operation, and `x-ms-client-request-id`; request bodies are not logged.
 
 ### Container
 
-- [ ] Multi-stage `Dockerfile` at `source/rust/Dockerfile` builds successfully (`docker build -t aisearch-emulator source/rust`).
-- [ ] Final stage is `distroless/static` or `scratch` (no build tooling, no shell).
-- [ ] Container starts and passes its `HEALTHCHECK` (binary `healthcheck` subcommand, no shell required).
-- [ ] Container runs without Azure credentials or network access to Azure.
-- [ ] Image size < 20 MB.
+- [x] Multi-stage `Dockerfile` at `source/rust/Dockerfile` builds successfully (`docker build -t aisearch-emulator source/rust`).
+- [x] Final stage is `distroless/static` or `scratch` (no build tooling, no shell).
+- [x] Container starts and passes its `HEALTHCHECK` (binary `healthcheck` subcommand, no shell required).
+- [x] Container runs without Azure credentials or network access to Azure.
+- [x] Image size < 20 MB.
 
 ### E2E tests
 
-- [ ] E2E suite (`source/tests/python/tests/e2e/`) starts the emulator from the built image using testcontainers.
-- [ ] E2E tests use the official Python Azure SDK, not raw HTTP.
-- [ ] Scenario: create index → upload documents → search returns expected documents.
-- [ ] Scenario: deleting an index makes subsequent operations fail with Azure-compatible errors.
-- [ ] Tests are isolated via `POST /admin/reset` between tests (conftest fixture) and deterministic.
-- [ ] E2E suite passes via `cd source/tests/python && poetry run pytest tests/e2e`.
-- [ ] E2E suite runs in CI (with Docker available).
+- [x] E2E suite (`source/tests/python/tests/e2e/`) starts the emulator from the built image using testcontainers.
+- [x] E2E tests use the official Python Azure SDK, not raw HTTP.
+- [x] Scenario: create index → upload documents → search returns expected documents.
+- [x] Scenario: deleting an index makes subsequent operations fail with Azure-compatible errors.
+- [x] Tests are isolated via `POST /admin/reset` between tests (conftest fixture) and deterministic.
+- [x] E2E suite passes via `cd source/tests/python && poetry run pytest tests/e2e`.
+- [x] E2E suite runs in CI (with Docker available).
 
 ### Quality gates
 
-- [ ] `cargo fmt --manifest-path source/rust/Cargo.toml -- --check` passes.
-- [ ] `cargo clippy --manifest-path source/rust/Cargo.toml --all-targets -- -D warnings` passes.
-- [ ] `cargo test --manifest-path source/rust/Cargo.toml` passes (unit tests for query matching and storage, plus contract tests).
-- [ ] E2E suite passes.
+- [x] `cargo fmt --manifest-path source/rust/Cargo.toml -- --check` passes.
+- [x] `cargo clippy --manifest-path source/rust/Cargo.toml --all-targets -- -D warnings` passes.
+- [x] `cargo test --manifest-path source/rust/Cargo.toml` passes (unit tests for query matching and storage, plus contract tests).
+- [x] E2E suite passes.
 - [ ] CI is green including the e2e stage.
-- [ ] README documents local run, Docker run, and e2e test execution.
-- [ ] `docs/decisions/` updated with the chosen HTTP framework (Axum) and JSON library (serde/serde_json).
+- [x] README documents local run, Docker run, and e2e test execution.
+- [x] `docs/decisions/` updated with the chosen HTTP framework (Axum) and JSON library (serde/serde_json).
 
 ## Exit criteria
 
