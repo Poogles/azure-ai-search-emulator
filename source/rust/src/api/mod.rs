@@ -55,6 +55,11 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/{index}/docs/search.index", post(upload_documents))
         .route("/{index}/docs/search.post.search", post(search_documents))
+        .route(
+            "/{index}/docs/search.post.autocomplete",
+            post(autocomplete_documents),
+        )
+        .route("/{index}/docs/search.post.suggest", post(suggest_documents))
         .route("/{index}/docs/$count", get(document_count))
         .route("/{index}/search.analyze", post(analyze_text))
         .route("/servicestats", get(service_stats))
@@ -345,6 +350,63 @@ async fn search_documents(
         &outcome,
         continuation.as_deref(),
     )))
+}
+
+/// `POST /indexes('{name}')/docs/search.post.autocomplete` — Autocomplete.
+/// Returns the completed terms for the search text, matched by prefix against
+/// the suggester's search fields.
+async fn autocomplete_documents(
+    State(state): State<AppState>,
+    Path(raw_name): Path<String>,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let name = parse_index_name(&raw_name)?;
+    let raw = parse_body(&body)?;
+    let (search_text, suggester_name, top) = suggest_request_params(&raw, uri.query())?;
+    let completions = state
+        .service
+        .autocomplete(&name, &suggester_name, &search_text, top)?;
+    let value = completions
+        .iter()
+        .map(|c| {
+            json!({
+                "text": c.text,
+                "queryPlusText": c.query_plus_text,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "value": value })))
+}
+
+/// `POST /indexes('{name}')/docs/search.post.suggest` — Suggest. Returns the
+/// documents that match the search text against the suggester's search
+/// fields, each with an additional `@search.text` field carrying the matched
+/// word.
+async fn suggest_documents(
+    State(state): State<AppState>,
+    Path(raw_name): Path<String>,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let name = parse_index_name(&raw_name)?;
+    let raw = parse_body(&body)?;
+    let (search_text, suggester_name, top) = suggest_request_params(&raw, uri.query())?;
+    let suggestions = state
+        .service
+        .suggest(&name, &suggester_name, &search_text, top)?;
+    let value = suggestions
+        .iter()
+        .map(|s| {
+            let mut entry = Map::new();
+            entry.insert("@search.text".to_owned(), Value::String(s.text.clone()));
+            for (key, value) in &s.document.fields {
+                entry.insert(key.clone(), value.clone());
+            }
+            Value::Object(entry)
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "value": value })))
 }
 
 /// `GET /indexes('{name}')/docs/$count` — Document Count. Returns a bare
@@ -643,6 +705,55 @@ fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
+/// Extracts the suggest/autocomplete request parameters: the search text
+/// (`search`), the suggester name (`suggesterName`), and the result limit
+/// (`top`, default 5). The pinned SDK sends these in the JSON body; the
+/// query-string form (used by the GET variants of the routes) is also
+/// accepted.
+fn suggest_request_params(
+    raw: &Value,
+    query: Option<&str>,
+) -> Result<(String, String, u64), ApiError> {
+    let param = |keys: &[&str]| -> Option<String> {
+        keys.iter().find_map(|key| {
+            let key: &str = key;
+            raw.get(key)
+                .and_then(Value::as_str)
+                .or_else(|| query.and_then(|q| query_param(q, key)))
+                .map(str::to_owned)
+                .filter(|s| !s.trim().is_empty())
+        })
+    };
+    let search_text = param(&["search", "searchText"]).ok_or_else(|| {
+        ApiError::bad_request("InvalidQuery", "The \"search\" field is required.")
+    })?;
+    let suggester_name = param(&["suggesterName"]).ok_or_else(|| {
+        ApiError::bad_request("InvalidQuery", "The \"suggesterName\" field is required.")
+    })?;
+    let top = match raw.get("top") {
+        // An explicit `top` must be a positive integer; an absent (or null)
+        // `top` falls back to the query string, then the default of 5.
+        None | Some(Value::Null) => {
+            match query.and_then(|q| query_param(q, "top").or_else(|| query_param(q, "$top"))) {
+                None => 5,
+                Some(raw_top) => parse_top_param(raw_top)?,
+            }
+        }
+        Some(value) => value.as_u64().filter(|top| *top > 0).ok_or_else(|| {
+            ApiError::bad_request("InvalidQuery", "\"top\" must be a positive integer.")
+        })?,
+    };
+    Ok((search_text, suggester_name, top))
+}
+
+/// Parses a `top`/`$top` query-string value: must be a positive integer.
+fn parse_top_param(raw: &str) -> Result<u64, ApiError> {
+    raw.parse::<u64>()
+        .ok()
+        .filter(|top| *top > 0)
+        .ok_or_else(|| ApiError::bad_request("InvalidQuery", "\"top\" must be a positive integer."))
+}
+
 fn extract_index(path: &str) -> Option<String> {
     let rest = path.strip_prefix("/indexes(")?;
     let name = rest.split(')').next()?;
@@ -662,6 +773,12 @@ fn operation_for(method: &axum::http::Method, path: &str) -> &'static str {
     }
     if path.contains("/docs/search.post.search") {
         return "search";
+    }
+    if path.contains("/docs/search.post.autocomplete") {
+        return "autocomplete";
+    }
+    if path.contains("/docs/search.post.suggest") {
+        return "suggest";
     }
     if path.contains("/docs(") {
         return if method.as_str() == "GET" {

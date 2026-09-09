@@ -21,7 +21,6 @@ Differences fall into two categories:
 | Scoring profiles, parameters, statistics | Rejected | Scoring is a constant placeholder (see below). |
 | Semantic and vector queries | Rejected | Out of scope for the emulator (initial design non-goal). |
 | `queryType` other than `simple` (e.g. `full`/Lucene) | Rejected | Only simple-query semantics are implemented. |
-| Suggest, autocomplete | Route not registered; `404` | Not part of the supported matrix. |
 
 ## Silently different (operation succeeds, result may differ from Azure)
 
@@ -38,6 +37,14 @@ Differences fall into two categories:
 - Tokenization uses Tantivy's default English analyzer: lowercasing and punctuation splitting, **no stemming and no stopword removal**. Azure uses its own analyzers (e.g. the basic English analyzer stems and can drop stopwords), so `running` does not match `run` in the emulator, and `the` is a matchable term.
 - `POST /search.analyze` always uses Tantivy's default analyzer regardless of the `analyzerName` or `field` parameters (accepted but inert). Token offsets and positions are accurate for the default analyzer.
 - **Rationale:** whole-token, case-insensitive matching covers the assertions our tests make; e2e assertions deliberately use whole-token search terms so they would also pass against Azure.
+
+### Autocomplete and suggest
+
+- Autocomplete and suggest use **case-insensitive prefix matching** of the search text against the whitespace-separated words of the suggester's search fields. Azure uses its full suggester algorithm (analyzing infix matching with scoring, fuzzy matching, and `searchMode` behaviour).
+- Autocomplete returns distinct completed terms (`text` + `queryPlusText`); suggest returns the matching documents (all fields) plus an `@search.text` field carrying the first matched word.
+- Results are ordered by index key (deterministic), not by relevance; `top` (default 5) limits the count.
+- The suggester's `searchMode` is accepted but inert, as are the other options the SDKs support on these routes (`filter`, `select`, `searchFields`, `orderby`, fuzzy matching, highlight tags, `autocompleteMode`, `minimumCoverage`). In particular a `filter` does not narrow suggestions — test assertions must not rely on it.
+- **Rationale:** prefix matching covers the assertions the reference samples make (a term that prefixes a field word); real suggester scoring and infix matching are out of scope for a test double.
 
 ### Filter matching
 

@@ -8,6 +8,7 @@ from azure.search.documents.indexes.models import (
     SearchField,
     SearchFieldDataType,
     SearchIndex,
+    SearchSuggester,
 )
 
 endpoint = os.environ["AZURE_SEARCH_SERVICE_ENDPOINT"]
@@ -38,6 +39,9 @@ index = SearchIndex(
                 SearchField(name="Country", type=S, filterable=True),
             ],
         ),
+    ],
+    suggesters=[
+        SearchSuggester(name="sg", source_fields=["HotelName"]),
     ],
 )
 

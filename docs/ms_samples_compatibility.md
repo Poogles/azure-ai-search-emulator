@@ -60,10 +60,10 @@ Each sample is classified in `KNOWN_ISSUES` (`test_ms_samples.py`):
 ## Current state
 
 32 sync samples discovered. `make test-ms`: **10 passed, 22 skipped, 0 failed.**
-(The passed count includes the gap-pinned samples, whose tests pass while the
-sample fails with the documented signature: 8 genuine passes + 2 gap pins.)
+(All 10 passes are genuine; the 2 former gap pins now pass for real: 10
+genuine passes + 0 gap pins.)
 
-### Passes (8)
+### Passes (10)
 
 | Sample | Notes |
 |--------|-------|
@@ -75,15 +75,12 @@ sample fails with the documented signature: 8 genuine passes + 2 gap pins.)
 | `sample_index_analyze_text.py` | Genuine pass since the `POST /search.analyze` fix: tokenizes text and returns tokens with offsets. |
 | `sample_query_session.py` | Genuine pass since the `sessionId` fix: the option is accepted and silently ignored (deterministic ordering makes session affinity irrelevant). |
 | `sample_index_synonym_map_crud.py` | Genuine pass since the synonym-map CRUD fix: create (incl. from file), list, get, and delete of Solr-format maps all round-trip. Maps are stored but inert (see `known_differences.md`). |
+| `sample_query_autocomplete.py` | Genuine pass since the autocomplete fix: `POST /docs/search.post.autocomplete` returns prefix-matched completions (`text` + `queryPlusText`). The seeded hotels yield no match for `"bo"`, so the sample passes on the empty `value` array. |
+| `sample_query_suggestions.py` | Genuine pass since the suggest fix: `POST /docs/search.post.suggest` returns matching documents plus `@search.text`. The seeded hotels yield no match for `"coffee"`, so the sample passes on the empty `value` array. |
 
-### Documented emulator gaps (2)
+### Documented emulator gaps (0)
 
-| Sample | Fails with | Missing feature |
-|--------|-----------|-----------------|
-| `sample_query_autocomplete.py` | 404 `Not Found` | Autocomplete route not implemented. |
-| `sample_query_suggestions.py` | 404 `Not Found` | Suggest route not implemented. |
-
-Implementation plans for each gap are in [Gap implementation plans](#gap-implementation-plans) below.
+All gaps are closed. Historical plans for each gap are in [Gap implementation plans](#gap-implementation-plans) below.
 
 ### Gap implementation plans
 
@@ -99,8 +96,8 @@ order (each builds on prior auth-guard / route changes).
 | 7 | Service stats (`/servicestats`) | ☑ done | |
 | 2 | Analyze text (`/search.analyze`) | ☑ done | |
 | 3 | Synonym maps CRUD | ☑ done | |
-| 4 | Autocomplete | ☐ not started | |
-| 5 | Suggest | ☐ not started | |
+| 4 | Autocomplete | ☑ done | |
+| 5 | Suggest | ☑ done | |
 
 ---
 
@@ -261,57 +258,65 @@ simplification (documented in `known_differences.md`).
 
 ---
 
-#### Gap 4 — Autocomplete `POST /indexes('{name}')/docs/search.post.autocomplete` (medium-hard, ~3-4 hrs)
+#### Gap 4 — Autocomplete `POST /indexes('{name}')/docs/search.post.autocomplete` (medium-hard, ~3-4 hrs) ✅
 
 **Sample:** `sample_query_autocomplete.py`
-**Route:** `POST /indexes('{indexName}')/docs/search.post.autocomplete?suggesterName=sg`
-**Current failure:** 404 `Not Found`
+**Route:** `POST /indexes('{indexName}')/docs/search.post.autocomplete?api-version=...`
+**Current failure:** none (closed)
 
-**What is required:**
+**What was required:**
 
-- [ ] **Suggester schema:** Add a `Suggester` struct (`name: String`,
+- [x] **Suggester schema:** Add a `Suggester` struct (`name: String`,
       `search_fields: Vec<String>`) and a `suggesters: Vec<Suggester>` field
       to `IndexDefinition`.
-- [ ] Parse the `suggesters` array in `parse_index_definition`.
-- [ ] Validate in `validate_schema` that suggester search fields exist and
+- [x] Parse the `suggesters` array in `parse_index_definition`.
+- [x] Validate in `validate_schema` that suggester search fields exist and
       are `searchable`.
-- [ ] Update `setup_hotels.py` to include a suggester:
+- [x] Update `setup_hotels.py` to include a suggester:
       ```python
-      from azure.search.documents.indexes.models import Suggester
+      from azure.search.documents.indexes.models import SearchSuggester
       # In the SearchIndex definition:
-      suggesters=[Suggester(name="sg", search_fields=["HotelName"])]
+      suggesters=[SearchSuggester(name="sg", source_fields=["HotelName"])]
       ```
-- [ ] Add route `POST /{index}/docs/search.post.autocomplete` to the azure
+- [x] Add route `POST /{index}/docs/search.post.autocomplete` to the azure
       sub-router.
-- [ ] Handler: parse index name, extract `suggesterName` from query params,
-      parse body (extract `searchText`), look up the suggester in the index
-      definition, perform case-insensitive prefix matching on the suggester's
-      search fields across all documents. Return:
+- [x] Handler: parse index name, extract `suggesterName` (body first, query
+      fallback), parse body (extract `search`), look up the suggester in the
+      index definition, perform case-insensitive prefix matching on the
+      suggester's search fields across all documents. Return:
       ```json
       {"value": [{"text": "Boston", "queryPlusText": "bo Boston"}]}
       ```
-      Limit to `top` results (default 5, from query param or body).
-- [ ] Add contract tests.
-- [ ] Document in `known_differences.md`: autocomplete uses simple prefix
+      Limit to `top` results (default 5, from body or query param).
+
+Wire notes (correcting the original plan): the pinned SDK 11.6.0 sends
+`search` (not `searchText`) and `suggesterName` in the POST body (only
+`api-version` is a query param), and serializes suggester fields as
+`sourceFields` (not `searchFields`). The emulator accepts `search` (plus a
+`searchText` alias), body-first `suggesterName` with query fallback, and
+both `searchFields` / `sourceFields`.
+
+- [x] Add contract tests.
+- [x] Document in `known_differences.md`: autocomplete uses simple prefix
       matching (not Azure's full suggester algorithm with scoring).
-- [ ] Remove the `KNOWN_ISSUES` entry.
-- [ ] Run `make test-ms` to confirm.
+- [x] Remove the `KNOWN_ISSUES` entry.
+- [x] Run `make test-ms` to confirm.
 
 ---
 
-#### Gap 5 — Suggest `POST /indexes('{name}')/docs/search.post.suggest` (medium-hard, ~2-3 hrs)
+#### Gap 5 — Suggest `POST /indexes('{name}')/docs/search.post.suggest` (medium-hard, ~2-3 hrs) ✅
 
 **Sample:** `sample_query_suggestions.py`
-**Route:** `POST /indexes('{indexName}')/docs/search.post.suggest?suggesterName=sg`
-**Current failure:** 404 `Not Found`
+**Route:** `POST /indexes('{indexName}')/docs/search.post.suggest?api-version=...`
+**Current failure:** none (closed; landed with Gap 4 — shared suggester infrastructure)
 
-**What is required:**
+**What was required:**
 
-- [ ] Reuse the suggester infrastructure from Gap 4 (schema, parsing,
+- [x] Reuse the suggester infrastructure from Gap 4 (schema, parsing,
       validation, `setup_hotels.py`).
-- [ ] Add route `POST /{index}/docs/search.post.suggest` to the azure
+- [x] Add route `POST /{index}/docs/search.post.suggest` to the azure
       sub-router.
-- [ ] Handler: same pattern as autocomplete, but return full documents (all
+- [x] Handler: same pattern as autocomplete, but return full documents (all
       retrievable fields) with an additional `@search.text` field containing
       the matched text:
       ```json
@@ -319,9 +324,9 @@ simplification (documented in `known_differences.md`).
       ```
       The sample calls `get_document(key=result["HotelId"])` for each
       suggestion, so the key field must be present.
-- [ ] Add contract tests.
-- [ ] Remove the `KNOWN_ISSUES` entry.
-- [ ] Run `make test-ms` to confirm.
+- [x] Add contract tests.
+- [x] Remove the `KNOWN_ISSUES` entry.
+- [x] Run `make test-ms` to confirm.
 
 ---
 
@@ -331,16 +336,16 @@ simplification (documented in `known_differences.md`).
       cover `/servicestats` (done with Gap 7) and `/synonymmaps` /
       `/synonymmaps(` (done with Gap 3).
 - [x] `docs/supported_operations.md`: updated for `$count`, `/search.analyze`,
-      `/servicestats`, `sessionId`, and synonym maps (done with Gaps 1, 2, 3,
-      6, 7).
+      `/servicestats`, `sessionId`, synonym maps (done with Gaps 1, 2, 3,
+      6, 7), and autocomplete/suggest (done with Gaps 4, 5).
 - [x] `docs/known_differences.md`: documented `sessionId` as inert,
       `/search.analyze` default-analyzer simplification (done with Gaps 2, 6),
-      and inert synonym maps (done with Gap 3). Still needs: prefix-match
-      autocomplete/suggest (Gaps 4, 5).
+      inert synonym maps (done with Gap 3), and prefix-match
+      autocomplete/suggest (done with Gaps 4, 5).
 - [x] `source/tests/python/tests/ms_samples/test_ms_samples.py`: removed
-      `KNOWN_ISSUES` entries for Gaps 1, 2, 3, 6, 7.
-- [ ] `source/tests/python/ms_samples/setup_hotels.py`: add suggester
-      definition (needed for Gaps 4 and 5).
+      `KNOWN_ISSUES` entries for Gaps 1, 2, 3, 4, 5, 6, 7.
+- [x] `source/tests/python/ms_samples/setup_hotels.py`: added suggester
+      definition (done with Gaps 4 and 5).
 
 ### Skipped — needs `azure-search-documents >= 12.0.0` (18)
 

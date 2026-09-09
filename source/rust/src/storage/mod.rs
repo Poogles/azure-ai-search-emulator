@@ -95,11 +95,67 @@ fn normalize_field_type(field_type: &str) -> String {
     }
 }
 
+/// A suggester: a named set of searchable fields that the autocomplete and
+/// suggest operations match against.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Suggester {
+    pub name: String,
+    /// Field names (or complex-type paths) the suggester searches.
+    pub search_fields: Vec<String>,
+}
+
+impl Suggester {
+    /// Parses a suggester definition from its raw JSON representation.
+    ///
+    /// The search fields are read from `searchFields` (the documented REST
+    /// key) or `sourceFields` (the key the pinned Python SDK serializes);
+    /// `searchFields` wins when both are present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if the value is not an object, is missing a
+    /// non-empty `name` or a search-fields array, or any entry is not a
+    /// non-empty string.
+    pub fn from_json(raw: &Value) -> Result<Self, String> {
+        let obj = raw
+            .as_object()
+            .ok_or_else(|| "suggester definition must be a JSON object".to_owned())?;
+        let name = obj
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "suggester is missing a non-empty \"name\"".to_owned())?;
+        let fields_raw = obj
+            .get("searchFields")
+            .or_else(|| obj.get("sourceFields"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                format!(
+                    "suggester {name:?} is missing a \"searchFields\" (or \"sourceFields\") array"
+                )
+            })?;
+        let mut search_fields = Vec::with_capacity(fields_raw.len());
+        for field in fields_raw {
+            let field_name = field.as_str().filter(|s| !s.is_empty()).ok_or_else(|| {
+                format!("suggester {name:?} search fields entries must be non-empty strings")
+            })?;
+            search_fields.push(field_name.to_owned());
+        }
+        Ok(Suggester {
+            name: name.to_owned(),
+            search_fields,
+        })
+    }
+}
+
 /// An index definition (schema).
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexDefinition {
     pub name: String,
     pub fields: Vec<FieldDefinition>,
+    /// Suggesters declared on the index; used by the autocomplete and suggest
+    /// operations.
+    pub suggesters: Vec<Suggester>,
     /// The raw JSON index definition, preserved for echo in responses.
     pub raw: Value,
 }
@@ -131,9 +187,16 @@ impl IndexDefinition {
         for field in fields_raw {
             fields.push(FieldDefinition::from_json(field.clone())?);
         }
+        let mut suggesters = Vec::new();
+        if let Some(suggesters_raw) = obj.get("suggesters").and_then(Value::as_array) {
+            for suggester in suggesters_raw {
+                suggesters.push(Suggester::from_json(suggester)?);
+            }
+        }
         Ok(IndexDefinition {
             name: name.to_owned(),
             fields,
+            suggesters,
             raw,
         })
     }
@@ -146,6 +209,11 @@ impl IndexDefinition {
     #[must_use]
     pub fn field(&self, name: &str) -> Option<&FieldDefinition> {
         self.fields.iter().find(|f| f.name == name)
+    }
+
+    #[must_use]
+    pub fn suggester(&self, name: &str) -> Option<&Suggester> {
+        self.suggesters.iter().find(|s| s.name == name)
     }
 
     /// Resolves a field path (`Address/StateProvince`) through complex-type

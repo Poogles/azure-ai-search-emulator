@@ -136,7 +136,8 @@ Route: `POST /indexes('{name}')/docs/search.post.search?api-version=...`.
 | Highlighting | `highlight_fields=`, pre/post tags | Unsupported (explicit) |
 | Scoring profiles / parameters / statistics | `scoring_profile=`, ... | Unsupported (explicit) |
 | Semantic / vector queries | `semantic=`, `vector_queries=`, ... | Unsupported (explicit) |
-| Suggest / autocomplete | `SearchClient.suggest(...)`, `autocomplete(...)` | Not implemented (routes not registered; return `404`) |
+| Suggest | `SearchClient.suggest(search_text=..., suggester_name=...)` (`/docs/search.post.suggest`) | Supported (prefix match against the suggester's fields; returns documents + `@search.text`) |
+| Autocomplete | `SearchClient.autocomplete(search_text=..., suggester_name=...)` (`/docs/search.post.autocomplete`) | Supported (prefix match against the suggester's fields; returns `text` + `queryPlusText`) |
 | Analyze text | `SearchIndexClient.analyze_text(...)` (`/search.analyze`) | Supported (Tantivy default analyzer; `analyzerName`/`field` accepted but inert) |
 | Service statistics | `SearchIndexClient.get_service_statistics()` (`/servicestats`) | Supported (static response: zero counters, default limits) |
 | `queryType` other than `simple` | — | Unsupported (explicit) |
@@ -185,6 +186,21 @@ When more results exist beyond the returned page, the response includes `@odata.
 
 `@odata.count` is present only when `count=true`.
 
+### Autocomplete and suggest
+
+Routes: `POST /indexes('{name}')/docs/search.post.autocomplete?api-version=...` and `POST /indexes('{name}')/docs/search.post.suggest?api-version=...`.
+
+Both require the index to define a suggester (a `suggesters` array on the index definition; each suggester has a `name` and a list of searchable fields under `searchFields` — the key the pinned Python SDK serializes as `sourceFields` — both accepted). Suggester search fields must exist and be marked `searchable` (validated at index creation with `400 InvalidIndex`).
+
+Request body (as sent by the pinned Python SDK): `{"search": "...", "suggesterName": "..."}` plus optional `top` (default 5). The query-string form (`search`, `suggesterName`, `top`/`$top`) is also accepted. Missing `search` or `suggesterName` returns `400 InvalidQuery`; an unknown suggester returns `400 InvalidQuery`; a missing index returns `404 ResourceNotFound`; a present-but-invalid `top` (zero, negative, or non-integer) returns `400 InvalidQuery`.
+
+Other options the SDKs support on these routes (`filter`, `select`, `searchFields`, `orderby`, fuzzy matching, highlight tags, `autocompleteMode`, `minimumCoverage`) are accepted but inert (see `docs/known_differences.md`).
+
+Matching is case-insensitive prefix matching of the search text against the whitespace-separated words of the suggester's search fields (see `docs/known_differences.md`).
+
+- Autocomplete response: `{"value": [{"text": "...", "queryPlusText": "..."}]}` — distinct completed terms, ordered by first appearance, limited by `top`.
+- Suggest response: `{"value": [{...document fields..., "@search.text": "..."}]}` — matching documents in key order, each with the first matched word in `@search.text`, limited by `top`.
+
 ## API versioning and authentication
 
 | Behaviour | Response |
@@ -214,11 +230,11 @@ When more results exist beyond the returned page, the response includes `@odata.
 | `400` | `InvalidIndexName` | Malformed `indexes('name')` path segment |
 | `400` | `InvalidRequest` | Missing or invalid JSON request body |
 | `400` | `InvalidDocuments` | Document batch is not an array or `{"value": [...]}` object |
-| `400` | `InvalidQuery` | Search body is not a JSON object; `top`/`skip` not non-negative integers; invalid search text, filter, orderby, select, facets, or searchFields; stale or invalid continuation token |
+| `400` | `InvalidQuery` | Search body is not a JSON object; `top`/`skip` not non-negative integers; invalid search text, filter, orderby, select, facets, or searchFields; stale or invalid continuation token; autocomplete/suggest missing `search`/`suggesterName`, empty search text, unknown suggester, or invalid `top` |
 | `400` | `InvalidSynonymMap` | Missing/empty synonym-map name, format other than `solr`, empty synonyms, malformed `synonymmaps('name')` path segment, path/body name mismatch on `PUT` |
 | `400` | `UnsupportedQuery` | Unsupported search option or `queryType` |
 | `400` | `UnsupportedAction` | Unknown document action (only `upload`, `merge`, `mergeOrUpload`, `delete` are supported) |
-| `404` | `ResourceNotFound` | Get/delete/upload/search/get-document on a missing index; get-document on a missing document key; get/delete on a missing synonym map |
+| `404` | `ResourceNotFound` | Get/delete/upload/search/autocomplete/suggest/get-document on a missing index; get-document on a missing document key; get/delete on a missing synonym map |
 | `409` | `IndexAlreadyExists` | `POST /indexes` with an existing name |
 | `409` | `SynonymMapAlreadyExists` | `POST /synonymmaps` with an existing name |
 | `500` | `InternalError` | Search engine failure |
@@ -242,6 +258,7 @@ When more results exist beyond the returned page, the response includes `@odata.
 | Complex-type schema, documents, filters | `tests/contract/complex_fields.rs` | `service` | `tests/sdk/` |
 | Ordering, projection, facets | `tests/contract/search.rs` | `service` | `tests/sdk/` |
 | Continuation tokens (nextLink, staleness) | `tests/contract/pagination.rs` | `service` | `tests/sdk/` (`by_page()`) |
+| Autocomplete, suggest (prefix match, suggester validation, auth) | `tests/contract/suggest_autocomplete.rs` | `service`, `storage` | `tests/ms_samples/` (`sample_query_autocomplete.py`, `sample_query_suggestions.py`) |
 | Auth, API version, 404s, error structure | `tests/contract/errors.rs` | `version` | `test_emulator.py` |
 | Admin reset, health | `tests/contract/admin.rs` | — | `test_emulator.py` |
 | Configuration parsing | — | `config` | — |

@@ -12,7 +12,9 @@ use serde_json::{Map, Value};
 use crate::error::ApiError;
 use crate::filter::{self, FilterExpr};
 use crate::query::{parse_search_text, FullTextQuery, QueryError, SearchEngine};
-use crate::storage::{Document, FieldDefinition, IndexDefinition, Storage, StorageError};
+use crate::storage::{
+    Document, FieldDefinition, IndexDefinition, Storage, StorageError, Suggester,
+};
 
 /// Field types accepted by the schema validator.
 const SUPPORTED_FIELD_TYPES: &[&str] = &[
@@ -127,6 +129,21 @@ pub struct SearchOutcome {
     pub has_more: bool,
     /// The `skip` value for the next page.
     pub next_skip: u64,
+}
+
+/// A single autocomplete completion: the completed term and the query with
+/// the completed term appended.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutocompleteCompletion {
+    pub text: String,
+    pub query_plus_text: String,
+}
+
+/// A single suggestion: a matched document plus the word that matched.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Suggestion {
+    pub document: Document,
+    pub text: String,
 }
 
 /// A synonym map: a named collection of synonym rules in Solr format.
@@ -864,6 +881,139 @@ impl SearchService {
         )
     }
 
+    /// Runs an autocomplete query: case-insensitive prefix matching of the
+    /// search text against the whitespace-separated words of the suggester's
+    /// search fields. Returns up to `top` distinct completions, ordered by
+    /// first appearance (documents in key order, then field order).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] if the index does not exist, the suggester is
+    /// not defined on the index, or the search text is empty.
+    pub fn autocomplete(
+        &self,
+        index: &str,
+        suggester_name: &str,
+        search_text: &str,
+        top: u64,
+    ) -> Result<Vec<AutocompleteCompletion>, ApiError> {
+        let (documents, suggester) = self.suggester_documents(index, suggester_name)?;
+        let search = search_text.trim();
+        let prefix = search.to_lowercase();
+        if prefix.is_empty() {
+            return Err(ApiError::bad_request(
+                "InvalidQuery",
+                "The autocomplete search text must be a non-empty string.",
+            ));
+        }
+        let limit = usize::try_from(top).unwrap_or(usize::MAX);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut completions = Vec::new();
+        for document in &documents {
+            for field_name in &suggester.search_fields {
+                let Some(value) = resolve_field_value(&document.fields, field_name) else {
+                    continue;
+                };
+                for word in field_words(value) {
+                    if word.to_lowercase().starts_with(&prefix) && seen.insert(word.clone()) {
+                        completions.push(AutocompleteCompletion {
+                            query_plus_text: format!("{search} {word}"),
+                            text: word,
+                        });
+                        if completions.len() >= limit {
+                            return Ok(completions);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(completions)
+    }
+
+    /// Runs a suggest query: a document matches when any whitespace-separated
+    /// word of the suggester's search fields starts with the search text
+    /// (case-insensitive). Returns up to `top` matching documents in key
+    /// order, each with the first matched word.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] if the index does not exist, the suggester is
+    /// not defined on the index, or the search text is empty.
+    pub fn suggest(
+        &self,
+        index: &str,
+        suggester_name: &str,
+        search_text: &str,
+        top: u64,
+    ) -> Result<Vec<Suggestion>, ApiError> {
+        let (documents, suggester) = self.suggester_documents(index, suggester_name)?;
+        let prefix = search_text.trim().to_lowercase();
+        if prefix.is_empty() {
+            return Err(ApiError::bad_request(
+                "InvalidQuery",
+                "The suggest search text must be a non-empty string.",
+            ));
+        }
+        let limit = usize::try_from(top).unwrap_or(usize::MAX);
+        let mut suggestions = Vec::new();
+        for document in &documents {
+            let mut matched = None;
+            for field_name in &suggester.search_fields {
+                let Some(value) = resolve_field_value(&document.fields, field_name) else {
+                    continue;
+                };
+                for word in field_words(value) {
+                    if word.to_lowercase().starts_with(&prefix) {
+                        matched = Some(word);
+                        break;
+                    }
+                }
+                if matched.is_some() {
+                    break;
+                }
+            }
+            if let Some(text) = matched {
+                suggestions.push(Suggestion {
+                    document: document.clone(),
+                    text,
+                });
+                if suggestions.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(suggestions)
+    }
+
+    /// Looks up the index and its suggester, returning the index's documents
+    /// (in key order) and a clone of the suggester definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] if the index does not exist or the suggester
+    /// is not defined on the index.
+    fn suggester_documents(
+        &self,
+        index: &str,
+        suggester_name: &str,
+    ) -> Result<(Vec<Document>, Suggester), ApiError> {
+        let definition = self.require_index(index)?;
+        let suggester = definition
+            .suggester(suggester_name)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    "InvalidQuery",
+                    format!("Suggester {suggester_name:?} is not defined on index {index:?}."),
+                )
+            })?;
+        let documents = self
+            .storage
+            .get_documents(&definition.name)
+            .map_err(|e| ApiError::not_found(e.to_string()))?;
+        Ok((documents, suggester))
+    }
+
     pub fn reset(&self) {
         self.storage.reset();
         self.engine.reset();
@@ -1330,6 +1480,32 @@ fn key_display(value: &Value) -> Option<String> {
     }
 }
 
+/// Resolves a field path (`Address/City`, or a plain field name) against a
+/// document's field map, walking into complex-type objects.
+fn resolve_field_value<'a>(fields: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
+    let mut segments = path.split('/');
+    let first = segments.next()?;
+    let mut current = fields.get(first)?;
+    for segment in segments {
+        current = current.as_object()?.get(segment)?;
+    }
+    Some(current)
+}
+
+/// Extracts the whitespace-separated words of a string (or collection of
+/// string) field value, for suggester prefix matching.
+fn field_words(value: &Value) -> Vec<String> {
+    match value {
+        Value::String(text) => text.split_whitespace().map(str::to_owned).collect(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .flat_map(|text| text.split_whitespace().map(str::to_owned))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Maps a query-engine failure onto an Azure-compatible [`ApiError`].
 fn engine_error(index: &str, error: QueryError) -> ApiError {
     match error {
@@ -1398,6 +1574,56 @@ fn validate_schema(definition: &IndexDefinition) -> Result<(), ApiError> {
             "InvalidIndex",
             format!("Index schema must define exactly one key field; found {key_count}."),
         ));
+    }
+    validate_suggesters(definition)?;
+    Ok(())
+}
+
+/// Validates the suggesters of an index definition: unique names, at least
+/// one search field per suggester, and every search field must exist and be
+/// marked `searchable`.
+fn validate_suggesters(definition: &IndexDefinition) -> Result<(), ApiError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for suggester in &definition.suggesters {
+        if !seen.insert(suggester.name.as_str()) {
+            return Err(ApiError::bad_request(
+                "InvalidIndex",
+                format!(
+                    "Duplicate suggester name {:?} in index schema.",
+                    suggester.name
+                ),
+            ));
+        }
+        if suggester.search_fields.is_empty() {
+            return Err(ApiError::bad_request(
+                "InvalidIndex",
+                format!(
+                    "Suggester {:?} must define a non-empty \"searchFields\" array.",
+                    suggester.name
+                ),
+            ));
+        }
+        for field_name in &suggester.search_fields {
+            let field_def = definition.field_path(field_name).ok_or_else(|| {
+                ApiError::bad_request(
+                    "InvalidIndex",
+                    format!(
+                        "Suggester {:?} references unknown field {:?}.",
+                        suggester.name, field_name
+                    ),
+                )
+            })?;
+            if !field_def.searchable {
+                return Err(ApiError::bad_request(
+                    "InvalidIndex",
+                    format!(
+                        "Suggester {:?} references field {:?}, which is not searchable; \
+                         mark it \"searchable\": true in the index schema.",
+                        suggester.name, field_name
+                    ),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -2283,6 +2509,143 @@ mod tests {
         let service = service();
         let api_error = err(service.parse_search("missing", &Value::Null));
         assert_eq!(api_error.status, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    fn suggester_index_body() -> Value {
+        json!({
+            "name": "items",
+            "fields": [
+                {"name": "id", "type": "Edm.String", "key": true, "filterable": true, "sortable": true},
+                {"name": "title", "type": "Edm.String", "searchable": true, "filterable": true},
+                {"name": "tags", "type": "Edm.Collection(Edm.String)", "searchable": true, "filterable": true, "facetable": true}
+            ],
+            "suggesters": [
+                {"name": "sg", "searchFields": ["title", "tags"]}
+            ]
+        })
+    }
+
+    #[test]
+    fn schema_validation_rejects_bad_suggesters() {
+        let service = service();
+        // Unknown search field.
+        let unknown_field = json!({
+            "name": "x",
+            "fields": [
+                {"name": "id", "type": "Edm.String", "key": true},
+                {"name": "title", "type": "Edm.String", "searchable": true}
+            ],
+            "suggesters": [{"name": "sg", "searchFields": ["missing"]}]
+        });
+        assert!(service.create_index(&unknown_field).is_err());
+        // Non-searchable search field.
+        let not_searchable = json!({
+            "name": "x",
+            "fields": [
+                {"name": "id", "type": "Edm.String", "key": true},
+                {"name": "title", "type": "Edm.String", "filterable": true}
+            ],
+            "suggesters": [{"name": "sg", "searchFields": ["title"]}]
+        });
+        assert!(service.create_index(&not_searchable).is_err());
+        // Duplicate suggester names.
+        let duplicate = json!({
+            "name": "x",
+            "fields": [
+                {"name": "id", "type": "Edm.String", "key": true},
+                {"name": "title", "type": "Edm.String", "searchable": true}
+            ],
+            "suggesters": [
+                {"name": "sg", "searchFields": ["title"]},
+                {"name": "sg", "searchFields": ["title"]}
+            ]
+        });
+        assert!(service.create_index(&duplicate).is_err());
+        // Malformed suggester (missing searchFields).
+        let malformed = json!({
+            "name": "x",
+            "fields": [
+                {"name": "id", "type": "Edm.String", "key": true},
+                {"name": "title", "type": "Edm.String", "searchable": true}
+            ],
+            "suggesters": [{"name": "sg"}]
+        });
+        assert!(service.create_index(&malformed).is_err());
+    }
+
+    #[test]
+    fn autocomplete_prefix_matches_and_dedupes() {
+        let service = service();
+        ok(service.create_index(&suggester_index_body()));
+        upload(
+            &service,
+            vec![
+                json!({"id": "1", "title": "Boston Harbor Hotel", "tags": ["spa"]}),
+                json!({"id": "2", "title": "Boston Airport Inn", "tags": ["boston", "wifi"]}),
+                json!({"id": "3", "title": "Seattle Downtown", "tags": ["wifi"]}),
+            ],
+        );
+        let completions = ok(service.autocomplete("items", "sg", "bos", 5));
+        let texts: Vec<_> = completions.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(texts, vec!["Boston", "boston"]);
+        assert_eq!(completions[0].query_plus_text, "bos Boston");
+        // Case-insensitive: "BOS" matches the same words.
+        let completions = ok(service.autocomplete("items", "sg", "BOS", 5));
+        assert_eq!(completions.len(), 2);
+        // No match.
+        assert!(ok(service.autocomplete("items", "sg", "zzz", 5)).is_empty());
+        // top limits the results.
+        let completions = ok(service.autocomplete("items", "sg", "bos", 1));
+        assert_eq!(completions.len(), 1);
+    }
+
+    #[test]
+    fn suggest_returns_matching_documents_with_text() {
+        let service = service();
+        ok(service.create_index(&suggester_index_body()));
+        upload(
+            &service,
+            vec![
+                json!({"id": "1", "title": "Boston Harbor Hotel", "tags": ["spa"]}),
+                json!({"id": "2", "title": "Seattle Downtown", "tags": ["boston", "wifi"]}),
+                json!({"id": "3", "title": "Portland Lodge", "tags": ["wifi"]}),
+            ],
+        );
+        let suggestions = ok(service.suggest("items", "sg", "bos", 5));
+        assert_eq!(suggestions.len(), 2);
+        // Documents come back in key order, with the matched word.
+        assert_eq!(suggestions[0].document.key, "1");
+        assert_eq!(suggestions[0].text, "Boston");
+        assert_eq!(suggestions[1].document.key, "2");
+        assert_eq!(suggestions[1].text, "boston");
+        // The full document fields are preserved.
+        assert_eq!(
+            suggestions[0].document.fields["title"],
+            "Boston Harbor Hotel"
+        );
+        // top limits the results.
+        let suggestions = ok(service.suggest("items", "sg", "bos", 1));
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].document.key, "1");
+    }
+
+    #[test]
+    fn autocomplete_and_suggest_reject_bad_requests() {
+        let service = service();
+        ok(service.create_index(&suggester_index_body()));
+        // Missing index.
+        let api_error = err(service.autocomplete("missing", "sg", "bos", 5));
+        assert_eq!(api_error.status, axum::http::StatusCode::NOT_FOUND);
+        // Unknown suggester.
+        let api_error = err(service.autocomplete("items", "nope", "bos", 5));
+        assert_eq!(api_error.code, "InvalidQuery");
+        let api_error = err(service.suggest("items", "nope", "bos", 5));
+        assert_eq!(api_error.code, "InvalidQuery");
+        // Empty search text.
+        let api_error = err(service.autocomplete("items", "sg", "   ", 5));
+        assert_eq!(api_error.code, "InvalidQuery");
+        let api_error = err(service.suggest("items", "sg", "", 5));
+        assert_eq!(api_error.code, "InvalidQuery");
     }
 
     #[test]

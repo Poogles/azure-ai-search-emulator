@@ -40,11 +40,6 @@ except RuntimeError as exc:  # submodule not checked out
 
 # sample filename -> (category, detail)
 KNOWN_ISSUES = {
-    # --- Emulator gaps: the feature is not implemented. Pinned to the Azure
-    #     error signature so the gap is documented and the test alerts us when
-    #     the feature lands (the sample starts passing -> promote it).
-    "sample_query_autocomplete.py": ("gap", "Not Found"),  # autocomplete 404
-    "sample_query_suggestions.py": ("gap", "Not Found"),  # suggest 404
     # --- Cannot run here: needs azure-search-documents >= 12.0.0 (harness pins 11.6.0).
     "sample_agentic_retrieval.py": ("skip", "needs azure-search-documents>=12 (knowledgebases)"),
     "sample_knowledge_service_stats_preview.py": ("skip", "needs azure-search-documents>=12 (typed service stats model)"),
