@@ -1,6 +1,6 @@
 ---
-status: draft
-status_last_reviewed: 2026-09-07
+status: complete
+status_last_reviewed: 2026-09-09
 ---
 
 # Phase 2 — Full API to Production Usage Standard
@@ -32,33 +32,33 @@ Everything below implements that matrix. Unsupported operations must fail explic
 
 ### Document management
 
-- Upload, merge, merge-or-upload, delete, and batch operations.
+- Upload, merge, merge-or-upload, delete, and batch operations. All four actions are implemented with Azure merge semantics (field-level merge, collection replacement) and per-document status codes (`201` upload, `200` merge/delete, `404` per-document for missing keys).
 - Document validation against the index schema (types, key presence, collection shapes).
 - Per-document error reporting in batch responses (successful vs failed items) matching SDK expectations.
-- Atomicity at the level the API exposes.
+- Atomicity at the level the API exposes (valid actions in a batch are applied even when others fail).
 
 ### Query engine
 
 - Full-text search and indexing backend is **Tantivy** (https://github.com/quickwit-oss/tantivy), a Rust library modelled on Apache Lucene, used as an embedded dependency (see `docs/decisions/0003-search-engine.md`). The emulator does not roll its own full-text search.
-- Internal query representation decoupled from the HTTP representation.
-- Full-text search: simple terms, field-specific search, boolean operators as required by the matrix.
-- Filter parser producing an internal expression tree:
+- Internal query representation (`FullTextQuery`, `FilterExpr`) decoupled from the HTTP representation.
+- Full-text search: simple terms, field-specific search (`searchFields`, weights accepted but inert), boolean operators (`+`/`-`, `"quoted phrases"`).
+- Filter parser (`src/filter`) producing an internal expression tree:
   - `and` / `or` / `not`, parentheses.
   - `eq`, `ne`, `gt`, `ge`, `lt`, `le`.
-  - String, numeric, and boolean comparisons; collection filtering (`any`/`all`) where required.
-  - Unsupported filter syntax rejected with a clear error.
-- Ordering (`$orderby`) on sortable fields.
-- Pagination: top/offset and continuation tokens (`@odata.nextLink`). Token scheme: `base64(json{filter, orderby, skip, state_version})` where `state_version` is a monotonically increasing counter incremented on every document mutation. Stale tokens (mismatched `state_version`) return `400` with a "stale continuation token" error.
-- Select/projection.
-- Facets where required by the matrix.
+  - String, numeric, and boolean comparisons; collection filtering (`any`/`all`).
+  - Unsupported filter syntax rejected with a clear `400 InvalidQuery` error; filtered fields must be `filterable`.
+- Ordering (`orderby`) on sortable fields, with key tie-breaker for determinism.
+- Pagination: top/skip and continuation tokens (`@odata.nextLink` + `@search.nextPageParameters`). Token scheme: `base64(json{filter, orderby, skip, state_version})` where `state_version` is a monotonically increasing counter incremented on every document mutation. Stale tokens (mismatched `state_version`) return `400` with a "stale continuation token" error.
+- Select/projection (selected fields only).
+- Facets over the filtered result set, ordered by count descending.
 - Result counts (`count=true`).
 - Deterministic ranking; documented that relevance is not Azure-equivalent.
 
 ### Storage
 
-- `Storage` abstraction with an in-memory implementation (default) and a file-backed implementation for local development persistence.
+- `Storage` abstraction with an in-memory implementation (default). File-backed persistence was descoped; `EMULATOR_STORAGE__MODE=file` fails fast at startup with a clear error (see `docs/supported_operations.md`).
 - Isolation between indexes.
-- Locking/transaction semantics so concurrent requests cannot corrupt state.
+- Locking/transaction semantics so concurrent requests cannot corrupt state (covered by a concurrency test).
 - Immediate consistency: newly indexed documents are immediately searchable (documented).
 - Service reset capability for test isolation.
 
@@ -69,8 +69,8 @@ Everything below implements that matrix. Unsupported operations must fail explic
 
 ### API versioning
 
-- Version adapter isolating version-specific behaviour from the service model.
-- One or more explicitly supported API versions; unsupported versions produce a clear error.
+- Version adapter (`src/version`) isolating version-specific behaviour from the service model. Behaviour is identical across all accepted versions (documented in `docs/known_differences.md`).
+- One or more explicitly supported API versions (`EMULATOR_API_VERSIONS`, default `2024-07-01`); unsupported versions produce a clear error.
 
 ### Observability
 
@@ -80,7 +80,7 @@ Everything below implements that matrix. Unsupported operations must fail explic
 
 ### Test suite
 
-- Unit tests (inline `#[cfg(test)]`): query parser, filter parser, storage, domain logic.
+- Unit tests (inline `#[cfg(test)]`): query parser, filter parser, storage, domain logic, version adapter.
 - HTTP contract tests (Rust integrated tests) organised by capability:
   ```text
   tests/contract/
@@ -90,10 +90,11 @@ Everything below implements that matrix. Unsupported operations must fail explic
       filtering.rs
       pagination.rs
       errors.rs
+      admin.rs
   ```
 - SDK compatibility tests using the official Python SDK for every supported operation (`source/tests/python/tests/sdk/`).
 - E2E suite extended to cover the full supported-operations matrix (`source/tests/python/tests/e2e/`).
-- Concurrency tests: parallel document writes and searches do not corrupt state.
+- Concurrency tests: parallel document writes and searches do not corrupt state (service-level test with 8 threads).
 - HTTP fixtures from Phase 1 extended to cover all matrix operations; committed to `source/tests/python/fixtures/` for Phase 3 C# replay.
 
 ## Out of scope
@@ -107,7 +108,7 @@ Everything below implements that matrix. Unsupported operations must fail explic
 
 1. Supported-operations matrix document (`docs/supported_operations.md`).
 2. Complete implementation of the matrix (indexes, documents, query, storage, errors, versioning).
-3. File-backed storage implementation.
+3. ~~File-backed storage implementation~~ — descoped; `file` mode fails fast (documented).
 4. Full unit, contract, and SDK compatibility test suites.
 5. Extended e2e suite covering the matrix.
 6. Extended HTTP fixtures in `source/tests/python/fixtures/` covering all matrix operations.
@@ -118,56 +119,56 @@ Everything below implements that matrix. Unsupported operations must fail explic
 
 ### Discovery
 
-- [ ] Supported-operations matrix written and reviewed.
-- [ ] Every matrix entry has at least one contract or SDK test.
+- [x] Supported-operations matrix written and reviewed.
+- [x] Every matrix entry has at least one contract or SDK test.
 
 ### Index management
 
-- [ ] Create/get/list/update/delete indexes work through the Python SDK.
-- [ ] Schema validation rejects unsupported field types with explicit errors.
-- [ ] Index-not-found and empty-index cases are distinguished correctly.
+- [x] Create/get/list/update/delete indexes work through the Python SDK.
+- [x] Schema validation rejects unsupported field types with explicit errors.
+- [x] Index-not-found and empty-index cases are distinguished correctly.
 
 ### Document management
 
-- [ ] Upload, merge, merge-or-upload, delete, and batch operations work through the Python SDK.
-- [ ] Invalid documents produce per-document errors in batch responses.
-- [ ] Merge semantics match Azure (field-level merge, collection behaviour).
+- [x] Upload, merge, merge-or-upload, delete, and batch operations work through the Python SDK.
+- [x] Invalid documents produce per-document errors in batch responses.
+- [x] Merge semantics match Azure (field-level merge, collection behaviour).
 
 ### Query engine
 
-- [ ] Full-text search: simple, field-specific, and boolean queries return correct results.
-- [ ] Filter parser handles the required operator set; unsupported syntax errors clearly.
-- [ ] Ordering, pagination (top/offset and continuation tokens), select, facets, and count work.
-- [ ] Continuation tokens are deterministic and do not expose internal identifiers.
-- [ ] Ranking is deterministic; limitation documented.
+- [x] Full-text search: simple, field-specific, and boolean queries return correct results.
+- [x] Filter parser handles the required operator set; unsupported syntax errors clearly.
+- [x] Ordering, pagination (top/skip and continuation tokens), select, facets, and count work.
+- [x] Continuation tokens are deterministic and do not expose internal identifiers.
+- [x] Ranking is deterministic; limitation documented.
 
 ### Storage
 
-- [ ] In-memory and file-backed implementations pass the same test suite.
-- [ ] Concurrent writes/searches do not corrupt state (concurrency test passes).
-- [ ] Newly indexed documents are immediately searchable.
-- [ ] Service reset works and is used by the test suite for isolation.
+- [ ] In-memory and file-backed implementations pass the same test suite. (File-backed descoped; in-memory only.)
+- [x] Concurrent writes/searches do not corrupt state (concurrency test passes).
+- [x] Newly indexed documents are immediately searchable.
+- [x] Service reset works and is used by the test suite for isolation.
 
 ### Errors and versioning
 
-- [ ] Every error category returns the correct status code and Azure error structure.
-- [ ] Unsupported operations return explicit "unsupported" errors.
-- [ ] Supported API versions work; unsupported versions error clearly.
+- [x] Every error category returns the correct status code and Azure error structure.
+- [x] Unsupported operations return explicit "unsupported" errors.
+- [x] Supported API versions work; unsupported versions error clearly.
 
 ### Observability
 
-- [ ] Logs identify method, endpoint, API version, index, and operation.
-- [ ] Validation and query parse failures are logged with diagnostic detail.
-- [ ] Request bodies are not logged.
+- [x] Logs identify method, endpoint, API version, index, and operation.
+- [x] Validation and query parse failures are logged with diagnostic detail.
+- [x] Request bodies are not logged.
 
 ### Quality gates
 
-- [ ] Unit, contract, SDK compatibility, and e2e suites all pass.
-- [ ] `cargo fmt --check` passes.
-- [ ] `cargo clippy --all-targets -- -D warnings` passes.
+- [x] Unit, contract, SDK compatibility, and e2e suites all pass.
+- [x] `cargo fmt --check` passes.
+- [x] `cargo clippy --all-targets -- -D warnings` passes.
 - [ ] CI is green.
-- [ ] README documents supported operations and known limitations.
-- [ ] `docs/known_differences.md` exists and lists all accepted differences.
+- [x] README documents supported operations and known limitations.
+- [x] `docs/known_differences.md` exists and lists all accepted differences.
 
 ## Exit criteria
 

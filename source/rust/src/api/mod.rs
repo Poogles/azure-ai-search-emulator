@@ -13,21 +13,25 @@ use serde_json::{json, Map, Value};
 use crate::config::Config;
 use crate::error::ApiError;
 use crate::query::SearchEngine;
-use crate::service::{parse_search_request, SearchService};
+use crate::service::{ActionKind, DocumentAction, SearchOutcome, SearchService};
+use crate::version::VersionAdapter;
 
 #[derive(Clone)]
 pub struct AppState {
     pub service: Arc<SearchService>,
     pub config: Config,
+    pub versions: VersionAdapter,
 }
 
 impl AppState {
     #[must_use]
     pub fn new(config: Config, storage: Arc<dyn crate::storage::Storage>) -> Self {
         let engine = Arc::new(SearchEngine::new());
+        let versions = VersionAdapter::new(config.api_versions.clone());
         Self {
             service: Arc::new(SearchService::new(storage, engine)),
             config,
+            versions,
         }
     }
 }
@@ -157,23 +161,27 @@ async fn upload_documents(
             ))
         }
     };
-    let mut documents = Vec::with_capacity(actions.len());
+    let mut batch = Vec::with_capacity(actions.len());
     for action in &actions {
         let action_type = action
             .get("@search.action")
             .and_then(Value::as_str)
             .unwrap_or("upload");
-        if action_type != "upload" {
-            return Err(ApiError::unsupported(
-                "UnsupportedAction",
-                format!(
-                    "Document action {action_type:?} is not supported by the emulator (Phase 1)."
-                ),
-            ));
-        }
+        let kind = match action_type {
+            "upload" => ActionKind::Upload,
+            "merge" => ActionKind::Merge,
+            "mergeOrUpload" => ActionKind::MergeOrUpload,
+            "delete" => ActionKind::Delete,
+            other => {
+                return Err(ApiError::unsupported(
+                    "UnsupportedAction",
+                    format!("Document action {other:?} is not supported by the emulator."),
+                ))
+            }
+        };
         // Two wire shapes are accepted:
-        //   - Documented Azure format: {"@search.action": "upload", "document": {...}}
-        //   - Python SDK format:       {"@search.action": "upload", ...fields}
+        //   - Documented Azure format: {"@search.action": "...", "document": {...}}
+        //   - Python SDK format:       {"@search.action": "...", ...fields}
         //     (the SDK spreads the document fields at the top level of the action)
         let doc = match action.get("document") {
             Some(document) => document.clone(),
@@ -192,9 +200,12 @@ async fn upload_documents(
                     .collect(),
             ),
         };
-        documents.push(doc);
+        batch.push(DocumentAction {
+            kind,
+            document: doc,
+        });
     }
-    let results = state.service.upload_documents(&name, documents)?;
+    let results = state.service.index_documents(&name, batch)?;
     let value = Value::Array(
         results
             .iter()
@@ -207,6 +218,7 @@ async fn upload_documents(
 async fn search_documents(
     State(state): State<AppState>,
     Path(raw_name): Path<String>,
+    uri: axum::http::Uri,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let name = parse_index_name(&raw_name)?;
@@ -215,21 +227,44 @@ async fn search_documents(
     } else {
         parse_body(&body)?
     };
-    let query = parse_search_request(&raw)?;
+    let api_version = uri
+        .query()
+        .and_then(|q| query_param(q, "api-version"))
+        .map(str::to_owned);
+    let query = state.service.parse_search(&name, &raw)?;
     let outcome = state.service.search(&name, &query)?;
-    Ok(Json(search_response(&outcome, query.count)))
+    let continuation = state.service.next_continuation(&query, &outcome);
+    Ok(Json(search_response(
+        &name,
+        api_version.as_ref(),
+        &raw,
+        &query,
+        &outcome,
+        continuation.as_deref(),
+    )))
 }
 
-fn search_response(outcome: &crate::service::SearchOutcome, count: bool) -> Value {
+fn search_response(
+    name: &str,
+    api_version: Option<&String>,
+    raw_request: &Value,
+    query: &crate::service::SearchQuery,
+    outcome: &SearchOutcome,
+    continuation: Option<&str>,
+) -> Value {
     let mut map = Map::new();
     map.insert(
         "@odata.context".to_owned(),
         Value::String("/$metadata#documents".to_owned()),
     );
-    if count {
+    if query.count {
         map.insert("@odata.count".to_owned(), Value::from(outcome.total));
     }
-    map.insert("@search.facets".to_owned(), Value::Null);
+    let facets_value = match &outcome.facets {
+        Some(facets) => facets.clone(),
+        None => Value::Null,
+    };
+    map.insert("@search.facets".to_owned(), facets_value);
     let value = outcome
         .documents
         .iter()
@@ -237,12 +272,42 @@ fn search_response(outcome: &crate::service::SearchOutcome, count: bool) -> Valu
             let mut entry = Map::new();
             entry.insert("@search.score".to_owned(), json!(1.0));
             for (key, value) in &doc.fields {
-                entry.insert(key.clone(), value.clone());
+                if query.select.is_empty() || query.select.iter().any(|s| s == key) {
+                    entry.insert(key.clone(), value.clone());
+                }
             }
             Value::Object(entry)
         })
         .collect();
     map.insert("value".to_owned(), Value::Array(value));
+    if let Some(token) = continuation {
+        let mut next_link = format!("/indexes('{name}')/docs/search.post.search");
+        let mut params = Vec::new();
+        if let Some(version) = api_version {
+            params.push(format!("api-version={version}"));
+        }
+        params.push(format!("continuation={token}"));
+        next_link.push('?');
+        next_link.push_str(&params.join("&"));
+        map.insert("@odata.nextLink".to_owned(), Value::String(next_link));
+        // The pinned Python SDK pages by re-POSTing `@search.nextPageParameters`
+        // (a serialized search request) rather than following nextLink, so the
+        // next request is the original body plus the continuation token. The
+        // SDK drops unknown properties on re-serialization, so the paging
+        // cursor is also carried in the first-class `skip` property (which
+        // survives the round-trip); `continuation` additionally enables stale
+        // token detection for clients that preserve it.
+        let mut next_params = match raw_request {
+            Value::Object(map) => map.clone(),
+            _ => Map::new(),
+        };
+        next_params.insert("continuation".to_owned(), Value::String(token.to_owned()));
+        next_params.insert("skip".to_owned(), Value::from(outcome.next_skip));
+        map.insert(
+            "@search.nextPageParameters".to_owned(),
+            Value::Object(next_params),
+        );
+    }
     Value::Object(map)
 }
 
@@ -281,20 +346,8 @@ async fn azure_guard(
         .uri()
         .query()
         .and_then(|q| query_param(q, "api-version"));
-    match api_version {
-        None => Err(ApiError::bad_request(
-            "ApiVersionMissing",
-            "The 'api-version' query parameter is required.",
-        )),
-        Some(version) if !state.config.supports_api_version(version) => Err(ApiError::bad_request(
-            "ApiVersionUnsupported",
-            format!(
-                "API version {version} is not supported. Supported versions: {}.",
-                state.config.api_versions.join(", ")
-            ),
-        )),
-        Some(_) => Ok(next.run(request).await),
-    }
+    state.versions.check(api_version)?;
+    Ok(next.run(request).await)
 }
 
 /// Structured request logging: method, endpoint, API version, index,

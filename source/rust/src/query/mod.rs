@@ -1,27 +1,29 @@
-//! Phase 1 query engine: full-text search backed by [Tantivy].
+//! Query engine: full-text search backed by [Tantivy].
 //!
 //! Tantivy (<https://github.com/quickwit-oss/tantivy>) is a Rust full-text
 //! search library modelled on Apache Lucene. It is used as an embedded, in-process
 //! dependency rather than rolling our own full-text search (see
 //! `docs/decisions/0003-search-engine.md`).
 //!
-//! Semantics (see `docs/phase_1_scaffold_and_e2e.md`):
-//! - Token-based full-text match across all `searchable: true` string fields,
+//! Semantics (see `docs/supported_operations.md`):
+//! - Token-based full-text match across `searchable: true` string fields,
 //!   using Tantivy's default (English) analyzer.
 //! - `*` or an empty search term matches all documents.
-//! - A multi-term search term matches a document when every whitespace-separated
-//!   term matches at least one searchable string field (Azure simple-query AND
+//! - A multi-term search term matches a document when every required term
+//!   matches at least one searchable string field (Azure simple-query AND
 //!   semantics).
-//! - No boolean operators, field-specific search, or filters (Phase 2).
+//! - Simple-query boolean operators: `+term` (required, the default),
+//!   `-term` (excluded), and `"quoted phrases"`.
+//! - Field-specific search via [`FullTextQuery::fields`].
 //!
 //! The engine is responsible only for full-text matching. It returns the keys of
 //! the matching documents; the service layer resolves those keys back to the full
-//! stored documents, applies deterministic key ordering, and pages the results.
+//! stored documents, applies filters, ordering, projection, and paging.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use tantivy::collector::TopDocs;
-use tantivy::query::{AllQuery, BooleanQuery, EmptyQuery, Occur, Query, TermQuery};
+use tantivy::query::{AllQuery, BooleanQuery, EmptyQuery, Occur, PhraseQuery, Query, TermQuery};
 use tantivy::schema::Value as _;
 use tantivy::schema::{Field, IndexRecordOption, Schema, STORED, STRING, TEXT};
 use tantivy::tokenizer::{TokenStream, TokenizerManager};
@@ -59,14 +61,6 @@ impl std::fmt::Display for QueryError {
 
 impl std::error::Error for QueryError {}
 
-/// Returns `true` when the search term matches no documents selectively, i.e.
-/// it is empty or the match-all wildcard.
-#[must_use]
-pub fn is_match_all(term: &str) -> bool {
-    let trimmed = term.trim();
-    trimmed.is_empty() || trimmed == "*"
-}
-
 /// Tokenizes search text with Tantivy's default analyzer, so query terms match
 /// the analyzed terms stored in the index (same lowercasing and punctuation
 /// splitting applied at index time). A hand-rolled whitespace split would
@@ -83,6 +77,107 @@ pub fn analyze(text: &str) -> Vec<String> {
         tokens.push(stream.token().text.clone());
     }
     tokens
+}
+
+/// One clause of a parsed simple query: a single term or a quoted phrase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Clause {
+    Term(String),
+    Phrase(String),
+}
+
+/// A parsed full-text query: required and excluded clauses, optionally
+/// restricted to a set of Azure field names.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FullTextQuery {
+    pub required: Vec<Clause>,
+    pub excluded: Vec<Clause>,
+    /// Azure field names to restrict the search to; `None` means all
+    /// `searchable` string fields.
+    pub fields: Option<Vec<String>>,
+}
+
+impl FullTextQuery {
+    /// Returns `true` when the query matches every document.
+    #[must_use]
+    pub fn is_match_all(&self) -> bool {
+        self.required.is_empty() && self.excluded.is_empty()
+    }
+}
+
+/// Parses a simple-query search text into required and excluded clauses.
+///
+/// Supports `+term` (required; the default), `-term` (excluded), and
+/// `"quoted phrases"`. An empty text or `*` produces a match-all query.
+///
+/// # Errors
+///
+/// Returns an error string for an unterminated phrase or a `+`/`-` modifier
+/// with no term.
+pub fn parse_search_text(text: &str) -> Result<FullTextQuery, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == "*" {
+        return Ok(FullTextQuery::default());
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut pos = 0usize;
+    let mut query = FullTextQuery::default();
+    while pos < chars.len() {
+        if chars[pos].is_whitespace() {
+            pos += 1;
+            continue;
+        }
+        let mut sign: Option<char> = None;
+        if chars[pos] == '+' || chars[pos] == '-' {
+            sign = Some(chars[pos]);
+            pos += 1;
+            if pos >= chars.len() || chars[pos].is_whitespace() {
+                return Err(
+                    "Search modifier '+' or '-' must be followed by a search term.".to_owned(),
+                );
+            }
+        }
+        let clause = read_clause(&chars, &mut pos)?;
+        match sign {
+            Some('-') => query.excluded.push(clause),
+            _ => query.required.push(clause),
+        }
+    }
+    Ok(query)
+}
+
+/// Reads one clause starting at `chars[*pos]`, advancing `pos` past it.
+fn read_clause(chars: &[char], pos: &mut usize) -> Result<Clause, String> {
+    if chars[*pos] == '"' {
+        *pos += 1;
+        let mut text = String::new();
+        loop {
+            if *pos >= chars.len() {
+                return Err("Unterminated quoted phrase in search text.".to_owned());
+            }
+            match chars[*pos] {
+                '"' => {
+                    // `""` escapes a literal quote inside a phrase.
+                    if chars.get(*pos + 1) == Some(&'"') {
+                        text.push('"');
+                        *pos += 2;
+                        continue;
+                    }
+                    *pos += 1;
+                    return Ok(Clause::Phrase(text));
+                }
+                other => {
+                    text.push(other);
+                    *pos += 1;
+                }
+            }
+        }
+    }
+    let start = *pos;
+    while *pos < chars.len() && !chars[*pos].is_whitespace() {
+        *pos += 1;
+    }
+    Ok(Clause::Term(chars[start..*pos].iter().collect()))
 }
 
 /// A single Tantivy-backed search index.
@@ -204,6 +299,40 @@ impl SearchEngine {
         Ok(())
     }
 
+    /// Removes the documents with the given keys from the Tantivy index for
+    /// `name`. Commits so the deletions are immediately visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueryError::IndexNotFound`] if the index does not exist, or
+    /// [`QueryError::Engine`] if a Tantivy operation fails.
+    pub fn delete_documents(&self, name: &str, keys: &[String]) -> Result<(), QueryError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let engine = guard
+            .get_mut(name)
+            .ok_or_else(|| QueryError::IndexNotFound(name.to_owned()))?;
+        for key in keys {
+            engine
+                .writer
+                .delete_term(Term::from_field_text(engine.key_field, key));
+        }
+        engine
+            .writer
+            .commit()
+            .map_err(|e| QueryError::Engine(e.to_string()))?;
+        engine
+            .reader
+            .reload()
+            .map_err(|e| QueryError::Engine(e.to_string()))?;
+        Ok(())
+    }
+
     /// Runs a full-text search, returning the keys of all matching documents as
     /// a set for efficient lookup by the service layer.
     ///
@@ -211,7 +340,11 @@ impl SearchEngine {
     ///
     /// Returns [`QueryError::IndexNotFound`] if the index does not exist, or
     /// [`QueryError::Engine`] if a Tantivy operation fails.
-    pub fn search(&self, name: &str, term: &str) -> Result<BTreeSet<String>, QueryError> {
+    pub fn search(
+        &self,
+        name: &str,
+        query: &FullTextQuery,
+    ) -> Result<BTreeSet<String>, QueryError> {
         let guard = self
             .inner
             .read()
@@ -219,14 +352,31 @@ impl SearchEngine {
         let engine = guard
             .get(name)
             .ok_or_else(|| QueryError::IndexNotFound(name.to_owned()))?;
-        // A non-match-all term cannot match when there are no searchable fields.
-        if !is_match_all(term) && engine.searchable.is_empty() {
+        let fields = match &query.fields {
+            Some(names) => engine
+                .searchable
+                .iter()
+                .filter(|(name, _)| names.contains(name))
+                .map(|(_, field)| *field)
+                .collect::<Vec<Field>>(),
+            None => engine
+                .searchable
+                .iter()
+                .map(|(_, field)| *field)
+                .collect::<Vec<Field>>(),
+        };
+        // A non-match-all query cannot match when there are no searchable
+        // fields in scope.
+        if !query.is_match_all() && fields.is_empty() {
             return Ok(BTreeSet::new());
         }
-        let query = build_query(term, &engine.searchable);
+        let tantivy_query = build_query(query, &fields);
         let searcher = engine.reader.searcher();
         let top_docs = searcher
-            .search(&*query, &TopDocs::with_limit(MAX_MATCHES).order_by_score())
+            .search(
+                &*tantivy_query,
+                &TopDocs::with_limit(MAX_MATCHES).order_by_score(),
+            )
             .map_err(|e| QueryError::Engine(e.to_string()))?;
         let mut keys = BTreeSet::new();
         for (_score, doc_address) in top_docs {
@@ -267,32 +417,68 @@ fn build_schema(fields: &[FieldDefinition]) -> (Schema, Field, Vec<(String, Fiel
     (builder.build(), key_field, searchable)
 }
 
-/// Builds the Tantivy query for a search term: match-all for `*`/empty,
-/// otherwise an AND over analyzer-produced tokens, each token an OR over all
-/// searchable fields. A non-match-all term that analyzes to no tokens (e.g.
-/// punctuation only) matches nothing.
-fn build_query(term: &str, searchable: &[(String, Field)]) -> Box<dyn Query> {
-    if is_match_all(term) {
+/// Builds the Tantivy query for a [`FullTextQuery`]: match-all when the query
+/// has no clauses, otherwise a boolean combination where each required clause
+/// is `Must` and each excluded clause is `MustNot`. Each clause is an OR over
+/// the in-scope searchable fields (a term query per analyzer token, or a
+/// phrase query for quoted phrases). A clause that analyzes to no tokens
+/// (e.g. punctuation only) matches nothing.
+fn build_query(query: &FullTextQuery, fields: &[Field]) -> Box<dyn Query> {
+    if query.is_match_all() {
         return Box::new(AllQuery);
     }
-    let tokens = analyze(term);
-    if tokens.is_empty() {
-        return Box::new(EmptyQuery);
+    let mut clauses: Vec<(Occur, Box<dyn Query>)> =
+        Vec::with_capacity(query.required.len() + query.excluded.len() + 1);
+    // An exclusion-only query (no required clauses) starts from all documents
+    // and removes the excluded matches; a boolean query needs a positive clause.
+    if query.required.is_empty() {
+        clauses.push((Occur::Must, Box::new(AllQuery)));
     }
-    let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(tokens.len());
-    for token in &tokens {
-        let field_clauses: Vec<(Occur, Box<dyn Query>)> = searchable
-            .iter()
-            .map(|(_, field)| {
-                let term = Term::from_field_text(*field, token);
-                let query: Box<dyn Query> =
-                    Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
-                (Occur::Should, query)
-            })
-            .collect();
-        clauses.push((Occur::Must, Box::new(BooleanQuery::new(field_clauses))));
+    for clause in &query.required {
+        clauses.push((Occur::Must, clause_query(clause, fields)));
+    }
+    for clause in &query.excluded {
+        clauses.push((Occur::MustNot, clause_query(clause, fields)));
     }
     Box::new(BooleanQuery::new(clauses))
+}
+
+/// Builds the per-field OR query for a single clause.
+fn clause_query(clause: &Clause, fields: &[Field]) -> Box<dyn Query> {
+    match clause {
+        Clause::Term(term) => {
+            let tokens = analyze(term);
+            if tokens.is_empty() {
+                return Box::new(EmptyQuery);
+            }
+            let mut term_clauses: Vec<(Occur, Box<dyn Query>)> =
+                Vec::with_capacity(tokens.len() * fields.len());
+            for token in &tokens {
+                for field in fields {
+                    let term = Term::from_field_text(*field, token);
+                    let query: Box<dyn Query> =
+                        Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
+                    term_clauses.push((Occur::Should, query));
+                }
+            }
+            Box::new(BooleanQuery::new(term_clauses))
+        }
+        Clause::Phrase(phrase) => {
+            let tokens = analyze(phrase);
+            if tokens.is_empty() {
+                return Box::new(EmptyQuery);
+            }
+            let mut phrase_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(fields.len());
+            for field in fields {
+                let terms = tokens
+                    .iter()
+                    .map(|token| Term::from_field_text(*field, token))
+                    .collect();
+                phrase_clauses.push((Occur::Should, Box::new(PhraseQuery::new(terms))));
+            }
+            Box::new(BooleanQuery::new(phrase_clauses))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -380,8 +566,10 @@ mod tests {
     }
 
     fn keys(engine: &SearchEngine, term: &str) -> Vec<String> {
+        let query =
+            parse_search_text(term).unwrap_or_else(|e| panic!("parse failed for {term:?}: {e}"));
         engine
-            .search("items", term)
+            .search("items", &query)
             .unwrap_or_else(|e| panic!("search failed: {e}"))
             .into_iter()
             .collect()
@@ -438,8 +626,9 @@ mod tests {
     fn delete_index_removes_search_state() {
         let engine = engine_with_docs();
         engine.delete_index("items");
+        let query = FullTextQuery::default();
         assert!(matches!(
-            engine.search("items", "*"),
+            engine.search("items", &query),
             Err(QueryError::IndexNotFound(_))
         ));
     }
@@ -448,8 +637,9 @@ mod tests {
     fn reset_clears_all_indexes() {
         let engine = engine_with_docs();
         engine.reset();
+        let query = FullTextQuery::default();
         assert!(matches!(
-            engine.search("items", "*"),
+            engine.search("items", &query),
             Err(QueryError::IndexNotFound(_))
         ));
     }
@@ -471,5 +661,86 @@ mod tests {
         // "brown-fox" analyzes to ["brown", "fox"], matching document 1.
         // A whitespace-only split would look up "brown-fox" and miss.
         assert_eq!(keys(&engine, "brown-fox"), vec!["1"]);
+    }
+
+    #[test]
+    fn excluded_terms_remove_matches() {
+        let engine = engine_with_docs();
+        // "azure -emulators" matches doc 1 (azure search) but not doc 2.
+        assert_eq!(keys(&engine, "azure -emulators"), vec!["1"]);
+        // Exclusion only: everything except docs containing "azure".
+        assert_eq!(keys(&engine, "-azure"), vec!["3"]);
+        // A term excluded and required cancels to no matches.
+        assert!(keys(&engine, "azure +azure -azure").is_empty());
+    }
+
+    #[test]
+    fn explicit_plus_is_the_default() {
+        let engine = engine_with_docs();
+        assert_eq!(keys(&engine, "+azure +fox"), vec!["1"]);
+        assert_eq!(keys(&engine, "azure fox"), vec!["1"]);
+    }
+
+    #[test]
+    fn quoted_phrases_require_adjacent_tokens() {
+        let engine = engine_with_docs();
+        assert_eq!(keys(&engine, r#""quick brown""#), vec!["1"]);
+        // Tokens present but not adjacent.
+        assert!(keys(&engine, r#""brown quick""#).is_empty());
+        // Phrase combined with a required term.
+        assert_eq!(keys(&engine, r#"azure "lazy dogs""#), vec!["2"]);
+    }
+
+    #[test]
+    fn field_specific_search_restricts_scope() {
+        let engine = engine_with_docs();
+        let query = FullTextQuery {
+            required: vec![Clause::Term("azure".to_owned())],
+            ..Default::default()
+        };
+        // Across all fields: docs 1 and 2 (title).
+        assert_eq!(
+            engine
+                .search("items", &query)
+                .map(|k| k.into_iter().collect::<Vec<_>>()),
+            Ok(vec!["1".to_owned(), "2".to_owned()])
+        );
+        // Restricted to `body`: no match ("azure" only appears in titles).
+        let scoped = FullTextQuery {
+            required: vec![Clause::Term("azure".to_owned())],
+            fields: Some(vec!["body".to_owned()]),
+            ..Default::default()
+        };
+        assert!(engine.search("items", &scoped).is_ok_and(|k| k.is_empty()));
+        // Restricted to `title`: both docs.
+        let scoped = FullTextQuery {
+            required: vec![Clause::Term("azure".to_owned())],
+            fields: Some(vec!["title".to_owned()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            engine
+                .search("items", &scoped)
+                .map(|k| k.into_iter().collect::<Vec<_>>()),
+            Ok(vec!["1".to_owned(), "2".to_owned()])
+        );
+    }
+
+    #[test]
+    fn parse_search_text_rejects_dangling_modifiers() {
+        assert!(parse_search_text("+").is_err());
+        assert!(parse_search_text("-").is_err());
+        assert!(parse_search_text("azure +").is_err());
+        assert!(parse_search_text(r#""unterminated"#).is_err());
+        let query =
+            parse_search_text(r#"a "b""c" -d"#).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        assert_eq!(
+            query.required,
+            vec![
+                Clause::Term("a".to_owned()),
+                Clause::Phrase("b\"c".to_owned())
+            ]
+        );
+        assert_eq!(query.excluded, vec![Clause::Term("d".to_owned())]);
     }
 }

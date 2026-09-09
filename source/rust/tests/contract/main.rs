@@ -4,6 +4,9 @@
 
 mod admin;
 mod common;
-mod documents;
+mod document_management;
 mod errors;
+mod filtering;
 mod index_management;
+mod pagination;
+mod search;

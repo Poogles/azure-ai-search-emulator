@@ -43,7 +43,7 @@ impl FieldDefinition {
             .ok_or_else(|| format!("field {name:?} is missing a non-empty \"type\""))?;
         Ok(FieldDefinition {
             name: name.to_owned(),
-            field_type: field_type.to_owned(),
+            field_type: normalize_field_type(field_type),
             is_key: obj.get("key").and_then(Value::as_bool).unwrap_or(false),
             searchable: obj
                 .get("searchable")
@@ -67,6 +67,22 @@ impl FieldDefinition {
                 .unwrap_or(true),
             raw,
         })
+    }
+}
+
+/// Normalizes a field type to the canonical `Edm.*` form. The SDK serializes
+/// collection types as `Collection(Edm.String)` (without the `Edm.` prefix),
+/// while the documented REST form is `Edm.Collection(Edm.String)`; both are
+/// accepted and normalized so downstream code only handles one shape. The raw
+/// definition is still echoed verbatim in responses.
+fn normalize_field_type(field_type: &str) -> String {
+    if let Some(inner) = field_type
+        .strip_prefix("Collection(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        format!("Edm.Collection({inner})")
+    } else {
+        field_type.to_owned()
     }
 }
 
@@ -189,6 +205,20 @@ pub trait Storage: Send + Sync {
     /// Returns [`StorageError::IndexNotFound`] if the index does not exist.
     fn put_documents(&self, index: &str, documents: Vec<Document>) -> Result<(), StorageError>;
 
+    /// Returns a clone of the document with the given key, if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::IndexNotFound`] if the index does not exist.
+    fn get_document(&self, index: &str, key: &str) -> Result<Option<Document>, StorageError>;
+
+    /// Deletes the documents with the given keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::IndexNotFound`] if the index does not exist.
+    fn delete_documents(&self, index: &str, keys: &[String]) -> Result<(), StorageError>;
+
     /// Returns all documents in the index, ordered by key.
     ///
     /// # Errors
@@ -286,6 +316,31 @@ impl Storage for InMemoryStorage {
             .ok_or_else(|| StorageError::IndexNotFound(index.to_owned()))?;
         for document in documents {
             entry.documents.insert(document.key.clone(), document);
+        }
+        Ok(())
+    }
+
+    fn get_document(&self, index: &str, key: &str) -> Result<Option<Document>, StorageError> {
+        let indexes = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = indexes
+            .get(index)
+            .ok_or_else(|| StorageError::IndexNotFound(index.to_owned()))?;
+        Ok(entry.documents.get(key).cloned())
+    }
+
+    fn delete_documents(&self, index: &str, keys: &[String]) -> Result<(), StorageError> {
+        let mut indexes = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = indexes
+            .get_mut(index)
+            .ok_or_else(|| StorageError::IndexNotFound(index.to_owned()))?;
+        for key in keys {
+            entry.documents.remove(key);
         }
         Ok(())
     }

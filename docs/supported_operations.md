@@ -47,7 +47,7 @@ Supported field types:
 
 Everything else (e.g. `Edm.Vector(...)`, complex types, `Edm.Int8`/`Edm.Int16`, `Edm.Time`, `Edm.Duration`, `Edm.Binary`) is rejected explicitly with the list of supported types in the message.
 
-Field attributes (`searchable`, `filterable`, `sortable`, `facetable`, `retrievable`) are parsed, stored, and echoed. Only `searchable` changes behaviour today (the field is full-text indexed); `filterable`/`sortable`/`facetable` are accepted in schemas but inert because the corresponding query options are rejected (below).
+Field attributes (`searchable`, `filterable`, `sortable`, `facetable`, `retrievable`) are parsed, stored, and echoed. `searchable` controls full-text indexing; `filterable`, `sortable`, and `facetable` gate the corresponding query options (a field used in `filter`/`orderby`/`facets` must carry the matching attribute, else `400 InvalidQuery`). Collection types may be written with or without the `Edm.` prefix (`Collection(Edm.String)` as sent by the SDK, or `Edm.Collection(Edm.String)`); both are accepted and normalized.
 
 ## Document management
 
@@ -56,9 +56,15 @@ All batch operations use one route: `POST /indexes('{name}')/docs/search.index?a
 | Operation | SDK method | `@search.action` | Success | Errors | Status |
 |-----------|-----------|------------------|---------|--------|--------|
 | Upload (batch) | `SearchClient.upload_documents` | `upload` | `200` + per-document results | `404 ResourceNotFound` (index), `400 InvalidDocuments` (malformed batch) | Supported |
-| Merge | `SearchClient.merge_documents` | `merge` | — | `400 UnsupportedAction` | Unsupported (explicit) |
-| Merge or upload | `SearchClient.merge_or_upload_documents` | `mergeOrUpload` | — | `400 UnsupportedAction` | Unsupported (explicit) |
-| Delete (batch) | `SearchClient.delete_documents` | `delete` | — | `400 UnsupportedAction` | Unsupported (explicit) |
+| Merge | `SearchClient.merge_documents` | `merge` | `200` + per-document results (`200` per doc, `404` for missing keys) | `404 ResourceNotFound` (index) | Supported |
+| Merge or upload | `SearchClient.merge_or_upload_documents` | `mergeOrUpload` | `200` + per-document results (`200` merged, `201` uploaded) | `404 ResourceNotFound` (index) | Supported |
+| Delete (batch) | `SearchClient.delete_documents` | `delete` | `200` + per-document results (`200` per doc, `404` for missing keys) | `404 ResourceNotFound` (index) | Supported |
+
+### Merge semantics
+
+- `merge` applies a field-level merge: scalar fields are overwritten, collection fields are replaced wholesale. Merging a missing document reports a per-document `404`; valid actions in the same batch are still applied.
+- `mergeOrUpload` merges when the key exists (`200`) and uploads when it does not (`201`).
+- `delete` removes the document by key; deleting a missing document reports a per-document `404`. Deleted documents are immediately unsearchable.
 
 ### Batch wire formats
 
@@ -90,29 +96,46 @@ Route: `POST /indexes('{name}')/docs/search.post.search?api-version=...`.
 | Operation | SDK usage | Status |
 |-----------|-----------|--------|
 | Full-text search (simple) | `SearchClient.search(search_text=...)` | Supported |
+| Boolean operators | `+term`, `-term`, `"quoted phrases"` | Supported |
 | Match-all | `search_text="*"` or empty | Supported |
 | Result count | `search(count=True)` → `@odata.count` | Supported |
 | Paging | `top=`, `skip=` | Supported |
+| Continuation tokens | `by_page()` → `@odata.nextLink` + `@search.nextPageParameters` | Supported |
 | Count documents | `SearchClient.count_documents()` (`/docs/$count`) | Not implemented (route not registered; returns `404`) |
-| Filters | `filter=` | Unsupported (explicit `400 UnsupportedQuery`) |
-| Ordering | `orderby=` | Unsupported (explicit) |
-| Projection | `select=` | Unsupported (explicit) |
-| Facets | `facets=` | Unsupported (explicit) |
-| Field-specific search | `search_fields=` | Unsupported (explicit) |
-| Search modes | `search_mode=` | Unsupported (explicit) |
+| Filters | `filter=` | Supported (see Filter below) |
+| Ordering | `orderby=` | Supported (sortable fields only) |
+| Projection | `select=` | Supported |
+| Facets | `facets=` | Supported (facetable fields only) |
+| Field-specific search | `search_fields=` | Supported (searchable fields only; weights accepted but inert) |
+| Search modes | `search_mode=` | Unsupported (explicit `400 UnsupportedQuery`; AND semantics are fixed) |
 | Highlighting | `highlight_fields=`, pre/post tags | Unsupported (explicit) |
 | Scoring profiles / parameters / statistics | `scoring_profile=`, ... | Unsupported (explicit) |
 | Semantic / vector queries | `semantic=`, `vector_queries=`, ... | Unsupported (explicit) |
 | Suggest / autocomplete | `SearchClient.suggest(...)`, `autocomplete(...)` | Not implemented (routes not registered; return `404`) |
 | `queryType` other than `simple` | — | Unsupported (explicit) |
 
-The full list of search options rejected with `400 UnsupportedQuery`: `filter`, `facets`, `orderby`, `searchFields`, `searchMode`, `select`, `highlight`, `highlightPreTag`, `highlightPostTag`, `scoringProfile`, `scoringParameters`, `scoringStatistics`, `sessionId`, `minimumCoverage`, `answers`, `captions`, `semanticConfiguration`, `semanticQuery`, `semanticErrorHandling`, `semanticMaxWaitInMilliseconds`, `vectorQueries`, `vectorFilterMode`, `debug`.
+The full list of search options rejected with `400 UnsupportedQuery`: `searchMode`, `highlight`, `highlightPreTag`, `highlightPostTag`, `scoringProfile`, `scoringParameters`, `scoringStatistics`, `sessionId`, `minimumCoverage`, `answers`, `captions`, `semanticConfiguration`, `semanticQuery`, `semanticErrorHandling`, `semanticMaxWaitInMilliseconds`, `vectorQueries`, `vectorFilterMode`, `debug`.
+
+### Filter
+
+OData `$filter` with `and` / `or` / `not`, parentheses, `eq` / `ne` / `gt` / `ge` / `lt` / `le` on string, numeric, and boolean values, and collection filtering with `any` / `all`. Referenced fields must exist and be marked `filterable`. Invalid syntax, unknown fields, non-filterable fields, and incompatible operators (ordering on booleans or collections, `any`/`all` on non-collections) are rejected with `400 InvalidQuery`.
+
+### Ordering, projection, facets
+
+- `orderby`: comma-separated `field [asc|desc]` (or a JSON array). Every field must exist and be marked `sortable`. Missing values sort last; the key field is the final tie-breaker for determinism.
+- `select`: comma-separated field names (or a JSON array). Every field must exist. Only the selected fields are returned per document.
+- `facets`: comma-separated field names or `*` (or a JSON array). Named fields must exist and be marked `facetable`; `*` expands to all facetable fields. Counts are computed over the full filtered result set, ordered by count descending then value ascending.
+
+### Continuation tokens
+
+When more results exist beyond the returned page, the response includes `@odata.nextLink` (a URL with a `continuation` parameter) and `@search.nextPageParameters` (the next request: original body plus `continuation`, with `skip` advanced). The token is `base64(json{filter, orderby, skip, state_version})`; `state_version` is incremented on every document mutation, and a stale token (index changed since issuance) returns `400 InvalidQuery`. An invalid token also returns `400 InvalidQuery`. The pinned SDK drops unknown properties when re-POSTing `nextPageParameters`, so paging state is additionally carried in the first-class `skip` property; SDK paging works, but staleness detection applies only when `continuation` is preserved.
 
 ### Search semantics
 
-- Token-based full-text match across all `searchable: true` **string** fields, using Tantivy's default (English) analyzer (lowercasing and punctuation splitting; no stemming, no stopword removal).
+- Token-based full-text match across `searchable: true` **string** fields (all of them, or the `searchFields` subset), using Tantivy's default (English) analyzer (lowercasing and punctuation splitting; no stemming, no stopword removal).
 - `*` or an empty term matches all documents.
-- A multi-term search matches a document when **every** analyzer token matches at least one searchable string field (AND semantics).
+- A multi-term search matches a document when **every** required analyzer token matches at least one searchable string field (AND semantics).
+- Simple-query boolean operators: `+term` (required, the default), `-term` (excluded), and `"quoted phrases"` (adjacent tokens). An exclusion-only query matches all documents except the excluded ones.
 - Non-string fields are not full-text indexed; searching for a value that only appears in a numeric/boolean field matches nothing.
 - Results are ordered by key field (deterministic), not by relevance. `@search.score` is `1.0` for all results. See `docs/known_differences.md`.
 - Newly indexed documents are immediately searchable (synchronous commit + reader reload per batch).
@@ -162,9 +185,9 @@ The full list of search options rejected with `400 UnsupportedQuery`: `filter`, 
 | `400` | `InvalidIndexName` | Malformed `indexes('name')` path segment |
 | `400` | `InvalidRequest` | Missing or invalid JSON request body |
 | `400` | `InvalidDocuments` | Document batch is not an array or `{"value": [...]}` object |
-| `400` | `InvalidQuery` | Search body is not a JSON object; `top` not a non-negative integer |
+| `400` | `InvalidQuery` | Search body is not a JSON object; `top`/`skip` not non-negative integers; invalid search text, filter, orderby, select, facets, or searchFields; stale or invalid continuation token |
 | `400` | `UnsupportedQuery` | Unsupported search option or `queryType` |
-| `400` | `UnsupportedAction` | `merge` / `mergeOrUpload` / `delete` document action |
+| `400` | `UnsupportedAction` | Unknown document action (only `upload`, `merge`, `mergeOrUpload`, `delete` are supported) |
 | `404` | `ResourceNotFound` | Get/delete/upload/search on a missing index |
 | `409` | `IndexAlreadyExists` | `POST /indexes` with an existing name |
 | `500` | `InternalError` | Search engine failure |
@@ -178,11 +201,15 @@ The full list of search options rejected with `400 UnsupportedQuery`: `filter`, 
 
 ## Test coverage map
 
-| Capability | Contract tests | Unit tests | Python e2e |
+| Capability | Contract tests | Unit tests | Python SDK/e2e |
 |------------|----------------|------------|------------|
-| Index create/get/list/update/delete | `tests/contract/index_management.rs` | `service`, `storage` | `test_emulator.py` |
-| Document upload, per-document errors, batch shapes | `tests/contract/documents.rs` | `service` | `test_emulator.py` |
-| Search shape, count, match-all, paging | `tests/contract/documents.rs` | `query`, `service` | `test_emulator.py` |
-| Auth, API version, 404s, error structure | `tests/contract/errors.rs` | — | `test_emulator.py` |
+| Index create/get/list/update/delete | `tests/contract/index_management.rs` | `service`, `storage` | `test_emulator.py`, `tests/sdk/` |
+| Document upload/merge/mergeOrUpload/delete, per-document errors, batch shapes | `tests/contract/document_management.rs` | `service` | `tests/sdk/` |
+| Search shape, count, match-all, boolean operators, searchFields | `tests/contract/search.rs` | `query`, `service` | `tests/sdk/` |
+| Filters | `tests/contract/filtering.rs` | `filter`, `service` | `tests/sdk/` |
+| Ordering, projection, facets | `tests/contract/search.rs` | `service` | `tests/sdk/` |
+| Continuation tokens (nextLink, staleness) | `tests/contract/pagination.rs` | `service` | `tests/sdk/` (`by_page()`) |
+| Auth, API version, 404s, error structure | `tests/contract/errors.rs` | `version` | `test_emulator.py` |
 | Admin reset, health | `tests/contract/admin.rs` | — | `test_emulator.py` |
 | Configuration parsing | — | `config` | — |
+| Concurrency (parallel writes/searches) | — | `service` | — |

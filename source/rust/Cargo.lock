@@ -17,6 +17,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "http",
  "serde",
  "serde_json",

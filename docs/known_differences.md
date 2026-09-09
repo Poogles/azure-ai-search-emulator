@@ -16,16 +16,11 @@ Differences fall into two categories:
 
 | Azure behaviour | Emulator behaviour | Rationale |
 |-----------------|--------------------|-----------|
-| `filter` expressions (`$filter` DSL) | Rejected | No filter parser is implemented; approximating filter semantics would produce silently wrong result sets. |
-| `orderby` on sortable fields | Rejected | Results are always ordered by key; pretending to sort would mask ordering assumptions in tests. |
-| `select` (projection) | Rejected | Full documents are always returned. |
-| `facets` | Rejected | `@search.facets` is always `null`. |
-| `searchFields` / `searchMode` | Rejected | Search always spans all `searchable` string fields with AND semantics. |
+| `searchMode` (`any` vs `all`) | Rejected | Search always uses AND semantics; `searchMode` is rejected explicitly rather than silently ignored. |
 | Highlighting (`highlight`, pre/post tags) | Rejected | No highlight fragments are produced. |
 | Scoring profiles, parameters, statistics | Rejected | Scoring is a constant placeholder (see below). |
 | Semantic and vector queries | Rejected | Out of scope for the emulator (initial design non-goal). |
 | `queryType` other than `simple` (e.g. `full`/Lucene) | Rejected | Only simple-query semantics are implemented. |
-| `merge` / `mergeOrUpload` / `delete` document actions | Rejected (`400 UnsupportedAction`) | Only `upload` is implemented; merge semantics (field-level merge, collection behaviour) are not. |
 | `count_documents()` (`/docs/$count`), suggest, autocomplete | Route not registered; `404` | Not part of the supported matrix. |
 
 ## Silently different (operation succeeds, result may differ from Azure)
@@ -38,14 +33,33 @@ Differences fall into two categories:
 
 ### Query matching
 
-- Only **simple** query semantics: a multi-term search matches when every analyzer token matches at least one searchable string field (AND). Azure simple queries additionally support quoted phrases, `+`/`-` modifiers, and proximity behaviour.
+- **Simple** query semantics with `+`/`-` modifiers and `"quoted phrases"`: a multi-term search matches when every required analyzer token matches at least one searchable string field (AND). Azure simple queries additionally support proximity behaviour and more modifiers.
 - Tokenization uses Tantivy's default English analyzer: lowercasing and punctuation splitting, **no stemming and no stopword removal**. Azure uses its own analyzers (e.g. the basic English analyzer stems and can drop stopwords), so `running` does not match `run` in the emulator, and `the` is a matchable term.
 - **Rationale:** whole-token, case-insensitive matching covers the assertions our tests make; e2e assertions deliberately use whole-token search terms so they would also pass against Azure.
+
+### Filter matching
+
+- Only the documented operator set (`and`/`or`/`not`, parentheses, `eq`/`ne`/`gt`/`ge`/`lt`/`le`, `any`/`all`); anything else (e.g. `in`, string functions, `search.ismatch`) is rejected with `400 InvalidQuery` rather than approximated.
+- String comparisons are ordinal and case-sensitive; Azure can be configured otherwise. Type mismatches and missing fields never match.
+- **Rationale:** explicit rejection beats silently wrong result sets; test filters stay within the supported set.
 
 ### Searchable field coverage
 
 - Only `searchable: true` **string** fields are full-text indexed. A search term that appears only in a numeric, boolean, or collection field matches nothing. Azure indexes and matches across more field types.
-- **Rationale:** string full-text search is the behaviour exercised by our applications; numeric matching belongs to filtering, which is rejected.
+- **Rationale:** string full-text search is the behaviour exercised by our applications; numeric matching belongs to filtering, which is implemented separately.
+
+### Facets, ordering, projection
+
+- Facet counts are exact (computed over the in-memory result set); Azure returns approximate counts at scale.
+- Missing values sort last regardless of direction; Azure sorts nulls first in ascending order.
+- `searchFields` weights (`field^2`) are accepted but inert (scoring is constant).
+- **Rationale:** deterministic, exact behaviour suits a test double; assertions must not depend on Azure's scale approximations or null ordering.
+
+### Pagination
+
+- Continuation tokens embed a `state_version` that is bumped on every document mutation; following a token after the index changed returns `400` (stale token) and the search must be restarted. Azure tokens remain valid across mutations (results may shift).
+- The pinned Python SDK drops the opaque `continuation` property when re-POSTing `@search.nextPageParameters`, so SDK paging advances via `skip` and does not get staleness detection; direct HTTP clients that preserve `continuation` do.
+- **Rationale:** fail-fast staleness beats silently shifted pages in tests; SDK paging still terminates correctly via `skip`.
 
 ### Index update semantics
 

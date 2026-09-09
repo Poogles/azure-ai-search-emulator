@@ -1,0 +1,179 @@
+"""SDK compatibility tests: every supported operation through the official SDK."""
+
+import pytest
+from azure.core.credentials import AzureKeyCredential
+from azure.core.exceptions import HttpResponseError
+from azure.search.documents import SearchClient
+from azure.search.documents.indexes import SearchIndexClient
+from azure.search.documents.indexes.models import (
+    SearchableField,
+    SearchField,
+    SearchFieldDataType,
+    SearchIndex,
+    SimpleField,
+)
+
+API_KEY = "test-key"
+INDEX_NAME = "sdk-index"
+API_VERSION = "2024-07-01"
+CREDENTIAL = AzureKeyCredential(API_KEY)
+
+
+@pytest.fixture()
+def index_client(clean_emulator) -> SearchIndexClient:
+    return SearchIndexClient(
+        endpoint=clean_emulator, credential=CREDENTIAL, api_version=API_VERSION
+    )
+
+
+@pytest.fixture()
+def search_client(clean_emulator) -> SearchClient:
+    return SearchClient(
+        endpoint=clean_emulator,
+        index_name=INDEX_NAME,
+        credential=CREDENTIAL,
+        api_version=API_VERSION,
+    )
+
+
+@pytest.fixture()
+def full_index() -> SearchIndex:
+    return SearchIndex(
+        name=INDEX_NAME,
+        fields=[
+            SearchField(name="id", type=SearchFieldDataType.String, key=True),
+            SearchableField(name="title", type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="price", type=SearchFieldDataType.Double, filterable=True, sortable=True),
+            SimpleField(
+                name="tags",
+                type=SearchFieldDataType.Collection(SearchFieldDataType.String),
+                filterable=True,
+                facetable=True,
+            ),
+        ],
+    )
+
+
+@pytest.fixture()
+def created_index(index_client, full_index):
+    return index_client.create_index(full_index)
+
+
+def test_index_crud(index_client, full_index):
+    created = index_client.create_index(full_index)
+    assert created.name == INDEX_NAME
+    fetched = index_client.get_index(INDEX_NAME)
+    assert fetched.name == INDEX_NAME
+    names = [index.name for index in index_client.list_indexes()]
+    assert names == [INDEX_NAME]
+    index_client.delete_index(INDEX_NAME)
+    with pytest.raises(HttpResponseError):
+        index_client.get_index(INDEX_NAME)
+
+
+def test_upload_merge_delete(index_client, search_client, full_index):
+    index_client.create_index(full_index)
+    results = search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "one", "price": 1.0, "tags": ["a"]},
+            {"id": "2", "title": "two", "price": 2.0, "tags": ["b"]},
+        ]
+    )
+    assert all(r.succeeded for r in results)
+
+    results = search_client.merge_documents(documents=[{"id": "1", "price": 9.0}])
+    assert all(r.succeeded for r in results)
+
+    found = list(search_client.search(search_text="one"))
+    assert len(found) == 1
+    assert found[0]["price"] == 9.0
+    assert found[0]["title"] == "one"
+
+    results = search_client.delete_documents(documents=[{"id": "1"}])
+    assert all(r.succeeded for r in results)
+    assert len(list(search_client.search(search_text="*"))) == 1
+
+
+def test_merge_or_upload(index_client, search_client, full_index):
+    index_client.create_index(full_index)
+    search_client.upload_documents(documents=[{"id": "1", "title": "one", "price": 1.0}])
+
+    results = search_client.merge_or_upload_documents(
+        documents=[
+            {"id": "1", "price": 5.0},
+            {"id": "2", "title": "two", "price": 3.0},
+        ]
+    )
+    assert all(r.succeeded for r in results)
+    found = {doc["id"]: doc for doc in search_client.search(search_text="*")}
+    assert found["1"]["price"] == 5.0
+    assert found["1"]["title"] == "one"
+    assert found["2"]["title"] == "two"
+
+
+@pytest.fixture()
+def created_full_index(index_client, full_index):
+    return index_client.create_index(full_index)
+
+
+@pytest.fixture()
+def priced_docs(search_client, created_full_index):
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "cheap red", "price": 5.0, "tags": ["red"]},
+            {"id": "2", "title": "mid blue", "price": 50.0, "tags": ["blue", "red"]},
+            {"id": "3", "title": "expensive green", "price": 500.0, "tags": ["green"]},
+        ]
+    )
+    return search_client
+
+
+def test_search_filter(priced_docs):
+    found = list(priced_docs.search(search_text="*", filter="price ge 50"))
+    assert {doc["id"] for doc in found} == {"2", "3"}
+    found = list(priced_docs.search(search_text="*", filter="price lt 10 or price gt 100"))
+    assert {doc["id"] for doc in found} == {"1", "3"}
+    found = list(priced_docs.search(search_text="mid", filter="price gt 10"))
+    assert [doc["id"] for doc in found] == ["2"]
+
+
+def test_search_order_by(priced_docs):
+    found = list(priced_docs.search(search_text="*", order_by="price desc"))
+    assert [doc["id"] for doc in found] == ["3", "2", "1"]
+    found = list(priced_docs.search(search_text="*", order_by="price asc"))
+    assert [doc["id"] for doc in found] == ["1", "2", "3"]
+
+
+def test_search_select(priced_docs):
+    found = list(priced_docs.search(search_text="*", select=["id", "price"]))
+    assert len(found) == 3
+    for doc in found:
+        assert "id" in doc
+        assert "price" in doc
+        assert "title" not in doc
+        assert "tags" not in doc
+
+
+def test_search_facets(priced_docs):
+    results = priced_docs.search(search_text="*", facets=["tags"])
+    facets = results.get_facets()
+    assert facets is not None
+    values = {entry["value"]: entry["count"] for entry in facets["tags"]}
+    assert values == {"red": 2, "blue": 1, "green": 1}
+
+
+def test_search_fields(priced_docs):
+    found = list(priced_docs.search(search_text="red", search_fields=["title"]))
+    assert {doc["id"] for doc in found} == {"1"}
+
+
+def test_search_paging(priced_docs):
+    pages = list(priced_docs.search(search_text="*", top=2).by_page())
+    assert len(pages) == 2
+    assert [doc["id"] for doc in pages[0]] == ["1", "2"]
+    assert [doc["id"] for doc in pages[1]] == ["3"]
+
+
+def test_search_count(priced_docs):
+    results = priced_docs.search(search_text="*", include_total_count=True)
+    assert results.get_count() == 3
