@@ -1,6 +1,6 @@
 ---
-status: draft
-status_last_reviewed: 2026-09-07
+status: complete
+status_last_reviewed: 2026-09-09
 ---
 
 # Phase 0 — Repository Setup
@@ -90,38 +90,38 @@ Record the following in `docs/decisions/` as they are made:
 
 ### Repository
 
-- [ ] Git repository initialised with an initial commit.
-- [ ] `.gitignore` present and covering Cargo (`target/`), IDE, OS, and Python (`__pycache__/`, `.venv/`) artifacts.
-- [ ] `README.md` explains how to enter the dev shell and run the toolchain.
+- [x] Git repository initialised with an initial commit.
+- [x] `.gitignore` present and covering Cargo (`target/`), IDE, OS, and Python (`__pycache__/`, `.venv/`) artifacts.
+- [x] `README.md` explains how to enter the dev shell and run the toolchain.
 
 ### Project
 
-- [ ] `Cargo.toml` created; `cargo build` succeeds in the nix shell.
-- [ ] Crate `aisearch-emulator` compiles with `lib.rs` and `main.rs`.
-- [ ] Layer modules (`api`, `service`, `query`, `storage`) exist and compile.
-- [ ] Placeholder test in `tests/` passes via `cargo test`.
-- [ ] `source/tests/python/` Poetry project created; `poetry install` succeeds; `poetry run pytest --collect-only` runs (no tests yet).
+- [x] `Cargo.toml` created; `cargo build` succeeds in the nix shell.
+- [x] Crate `aisearch-emulator` compiles with `lib.rs` and `main.rs`.
+- [x] Layer modules (`api`, `service`, `query`, `storage`) exist and compile.
+- [x] Placeholder test in `tests/` passes via `cargo test`.
+- [x] `source/tests/python/` Poetry project created; `poetry install` succeeds; `poetry run pytest --collect-only` runs (no tests yet).
 
 ### Tooling
 
-- [ ] `cargo fmt --check` passes.
-- [ ] Clippy configured (warnings denied) and `cargo clippy --all-targets` passes.
-- [ ] `cargo test` runs and passes.
-- [ ] Pre-commit hooks installed and pass on a clean tree.
+- [x] `cargo fmt --check` passes.
+- [x] Clippy configured (warnings denied) and `cargo clippy --all-targets` passes.
+- [x] `cargo test` runs and passes.
+- [x] Pre-commit hooks installed and pass on a clean tree.
 
 ### Nix shell
 
-- [ ] `shell.nix` provides rustc, cargo, clippy, rustfmt, and Python 3.12+.
-- [ ] `direnv allow` applied; toolchain works inside the shell.
+- [x] `shell.nix` provides rustc, cargo, clippy, rustfmt, and Python 3.12+.
+- [x] `direnv allow` applied; toolchain works inside the shell.
 
 ### Decisions
 
-- [ ] `docs/decisions/` created with pinned API version, SDK version, auth rule, and config env var names.
+- [x] `docs/decisions/` created with pinned API version, SDK version, auth rule, and config env var names.
 
 ### CI
 
-- [ ] CI workflow runs fmt, clippy, and tests.
-- [ ] CI is green on the initial commit.
+- [x] CI workflow runs fmt, clippy, and tests.
+- [x] CI is green on the initial commit.
 
 ## Exit criteria
 
