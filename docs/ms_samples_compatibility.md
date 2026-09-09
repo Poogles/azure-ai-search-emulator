@@ -80,7 +80,7 @@ genuine passes + 0 gap pins.)
 
 ### Documented emulator gaps (0)
 
-All gaps are closed. Historical plans for each gap are in [Gap implementation plans](#gap-implementation-plans) below.
+All error-signature gaps are closed. Historical plans for each gap are in [Gap implementation plans](#gap-implementation-plans) below. The remaining 22 skips are tracked as Gaps 8–10 (same format, `☐ not started`).
 
 ### Gap implementation plans
 
@@ -98,6 +98,9 @@ order (each builds on prior auth-guard / route changes).
 | 3 | Synonym maps CRUD | ☑ done | |
 | 4 | Autocomplete | ☑ done | |
 | 5 | Suggest | ☑ done | |
+| 8 | SDK 12 harness bump (18 samples) | ☐ not started | |
+| 9 | Indexers + data sources (3 samples) | ☐ not started | |
+| 10 | AAD bearer auth (1 sample half) | ☐ not started | |
 
 ---
 
@@ -330,6 +333,88 @@ both `searchFields` / `sourceFields`.
 
 ---
 
+#### Gap 8 — SDK 12 harness bump (medium)
+
+**Samples (18):** `sample_agentic_retrieval.py`, `sample_knowledge_service_stats_preview.py`, `sample_index_alias_crud.py`, `sample_index_client_custom_request.py`, `sample_index_crud.py`, `sample_query_semantic.py`, `sample_query_vector.py`, `sample_search_client_custom_request.py`, `sample_knowledge_base_configuration_preview.py`, `sample_knowledge_base_crud.py`, `sample_knowledge_retrieval_response_preview.py`, `sample_knowledge_source_crud.py`, `sample_knowledge_source_fabric_data_agent_preview.py`, `sample_knowledge_source_fabric_ontology_preview.py`, `sample_knowledge_source_file_preview.py`, `sample_knowledge_source_freshness_preview.py`, `sample_knowledge_source_mcp_server_preview.py`, `sample_knowledge_source_workiq_preview.py`
+**Route:** N/A (harness dependency)
+**Current failure:** samples fail at import / SDK internals (`SearchAlias`, `DEFAULT_VERSION`, `SearchFieldDataType.STRING`, semantic query kwargs, typed service-stats model, `knowledgebases` module) before any HTTP reaches the emulator; classified as `skip`.
+
+**What is required:**
+
+- [ ] Bump `azure-search-documents==11.6.0` to 12.x in
+      `source/tests/python/pyproject.toml`, regenerate the lockfile, rebuild
+      the venv (check `requires-python` compatibility: harness is `>=3.12`).
+- [ ] Re-validate the emulator's wire contract against 12.x **before**
+      triaging: 12 renames models and enums (precedent: `SearchSuggester` →
+      `Suggester`, `sourceFields` → `searchFields` between 11.6.0 and the
+      REST docs). Expect the currently-passing 10 to wobble; fix regressions
+      first (new `KNOWN_ISSUES` `gap` pins only for genuine new divergences).
+- [ ] Triage the newly-runnable samples into new emulator gaps vs new
+      external-service skips. Expected new gaps: index aliases, semantic
+      query, vector query (see `phase_2_1_vector_indexing.md`), knowledge
+      base/source CRUD, agentic retrieval. Expected permanently unrunnable
+      here: the Fabric/ontology/file/freshness/MCP/WorkIQ knowledge-source
+      samples, which point at live external data.
+- [ ] Update `docs/supported_operations.md` (SDK version under test) and this
+      document (state table, pinned wire notes).
+- [ ] Run `make test-ms` to confirm.
+
+---
+
+#### Gap 9 — Indexers + data sources (large)
+
+**Samples (3):** `sample_indexer_crud.py`, `sample_indexer_datasource_crud.py`, `sample_indexer_workflow.py`
+**Routes:** indexer, data-source (and skillset) CRUD + run/status — none registered
+**Current failure:** samples require `AZURE_STORAGE_CONNECTION_STRING`; classified as `skip`.
+
+**What is required:**
+
+- [ ] Provision a storage backend for runs: Azurite (local storage emulator)
+      or a real Azure Storage account exposed to the probe as
+      `AZURE_STORAGE_CONNECTION_STRING`.
+- [ ] Add indexer resource routes (create/get/list/delete, run, status) to
+      the azure sub-router.
+- [ ] Add data-source resource routes (Azure Blob/ADLS shapes the samples
+      use).
+- [ ] Add skillset routes if the workflow sample needs them, or classify that
+      sample as permanently skipped with the reason.
+- [ ] Implement the execution engine: pull blobs from the storage backend,
+      parse documents, index into the target index (reuse the existing
+      document pipeline).
+- [ ] Add contract tests (CRUD, validation, run lifecycle) and document the
+      surface in `docs/supported_operations.md` / `docs/known_differences.md`.
+- [ ] Remove the `KNOWN_ISSUES` entries.
+- [ ] Run `make test-ms` to confirm.
+
+**Notes:** Indexers were explicitly out of scope in the initial design
+(`known_differences.md`: "No indexers, data sources, skillsets"). This gap
+is a feature project, not a route fix; keep the out-of-scope notice until it
+lands.
+
+---
+
+#### Gap 10 — AAD bearer auth (small-medium)
+
+**Sample:** `sample_authentication.py` (AAD half only; the API-key half passes via `GET /docs/$count`)
+**Route:** N/A (auth mechanism)
+**Current failure:** needs `azure-identity` and a real Azure AD environment; classified as `skip`.
+
+**What is required:**
+
+- [ ] Add `azure-identity` to the harness dependencies.
+- [ ] Provision Entra: app registration, Search role assignments (Data Reader
+      suffices for the sample's AAD half), tenant/client IDs as probe env.
+- [ ] Accept `Authorization: Bearer` in `azure_guard`
+      (`source/rust/src/api/mod.rs`) — at minimum permissively (any
+      non-empty bearer, mirroring the `api-key` compatibility mechanism);
+      document the choice in `docs/known_differences.md` (authentication is a
+      compatibility mechanism, not a security boundary).
+- [ ] Add contract tests (bearer accepted, missing/empty auth still 401).
+- [ ] Remove the `KNOWN_ISSUES` entry (or narrow it if only part lands).
+- [ ] Run `make test-ms` to confirm.
+
+---
+
 #### Cross-cutting changes (apply as each gap lands)
 
 - [x] `azure_guard` middleware (`source/rust/src/api/mod.rs`): extended to
@@ -359,15 +444,18 @@ before emulator behaviour is reached:
 - all knowledge-base/source previews: `sample_knowledge_base_configuration_preview.py`, `sample_knowledge_base_crud.py`, `sample_knowledge_retrieval_response_preview.py`, `sample_knowledge_source_crud.py`, `sample_knowledge_source_fabric_data_agent_preview.py`, `sample_knowledge_source_fabric_ontology_preview.py`, `sample_knowledge_source_file_preview.py`, `sample_knowledge_source_freshness_preview.py`, `sample_knowledge_source_mcp_server_preview.py`, `sample_knowledge_source_workiq_preview.py`.
 
 Bumping the harness SDK would unblock these and give a truer gap list, but the
-emulator's wire format would need re-validation against 12.x first.
+emulator's wire format would need re-validation against 12.x first. Tracked
+as [Gap 8](#gap-8--sdk-12-harness-bump-medium).
 
 ### Skipped — external service (4)
 
 `sample_indexer_crud.py`, `sample_indexer_datasource_crud.py`,
-`sample_indexer_workflow.py` require `AZURE_STORAGE_CONNECTION_STRING`.
+`sample_indexer_workflow.py` require `AZURE_STORAGE_CONNECTION_STRING`
+(tracked as [Gap 9](#gap-9--indexers--data-sources-large)).
 `sample_authentication.py` requires `azure-identity` and a real Azure AD
 environment for its AAD half (the API-key half, which exercises
-`GET /docs/$count`, passes).
+`GET /docs/$count`, passes; tracked as
+[Gap 10](#gap-10--aad-bearer-auth-small-medium)).
 
 ## Updating the submodule
 
