@@ -31,6 +31,8 @@ SEARCH_ENDPOINT=http://localhost:8080                     # local emulator
 
 The SDK constructs requests and interprets responses; the emulator implements the service-side behaviour behind the same HTTP contract. Authentication is a compatibility mechanism, not a security boundary: any non-empty `api-key` header is accepted, and a missing/empty key returns `401` with the Azure error structure.
 
+See [docs/getting_started.md](docs/getting_started.md) for a step-by-step guide to running the emulator and using it with testcontainers in Python and .NET.
+
 ## Development environment
 
 The toolchain (Rust, Python, Poetry, Docker, etc.) is provided by a Nix dev shell via `direnv`.
@@ -126,6 +128,7 @@ poetry run pytest --collect-only
 
 ## Documentation
 
+- [docs/getting_started.md](docs/getting_started.md) — run the emulator locally and wire it into test suites with testcontainers (Python and .NET).
 - [docs/initial_design.md](docs/initial_design.md) — problem statement, requirements, architecture, alternatives, design principles.
 - [docs/phase_0_repository_setup.md](docs/phase_0_repository_setup.md) — repository and tooling setup.
 - [docs/phase_1_scaffold_and_e2e.md](docs/phase_1_scaffold_and_e2e.md) — minimal service, containerisation, e2e tests.
