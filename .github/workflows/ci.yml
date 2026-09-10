@@ -67,3 +67,21 @@ jobs:
       - name: Run E2E tests
         working-directory: source/tests/python
         run: poetry run pytest tests/e2e -v
+
+  csharp:
+    name: C# SDK tests
+    runs-on: ubuntu-latest
+    needs: docker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - uses: actions/download-artifact@v4
+        with:
+          name: aisearch-emulator-image
+      - name: Load image
+        run: gunzip -c aisearch-emulator.tar.gz | docker load
+      - name: Run C# tests
+        working-directory: source/tests/csharp
+        run: dotnet test
