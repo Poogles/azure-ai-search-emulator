@@ -10,7 +10,9 @@ from azure.search.documents.indexes.models import (
     HnswAlgorithmConfiguration,
     HnswParameters,
     SearchField,
+    SearchFieldDataType,
     SearchIndex,
+    SimpleField,
     VectorSearch,
     VectorSearchProfile,
 )
@@ -191,3 +193,210 @@ def test_vector_filter_modes(vector_docs):
     )
     # Candidates are the misc docs first; top-1 is doc 4.
     assert [doc["id"] for doc in pre] == ["4"]
+
+
+def test_multiple_vector_queries_union(vector_docs):
+    found = list(
+        vector_docs.search(
+            vector_queries=[
+                VectorizedQuery(
+                    vector=[1.0, 0.0, 0.0], k_nearest_neighbors=1, fields="content_vector"
+                ),
+                VectorizedQuery(
+                    vector=[0.0, 1.0, 0.0], k_nearest_neighbors=1, fields="content_vector"
+                ),
+            ]
+        )
+    )
+    assert {doc["id"] for doc in found} == {"1", "2"}
+
+
+def _metric_index(metric: str) -> SearchIndex:
+    return SearchIndex(
+        name=INDEX_NAME,
+        fields=[
+            SearchField(name="id", type="Edm.String", key=True),
+            SearchField(
+                name="v",
+                type="Collection(Edm.Single)",
+                searchable=True,
+                vector_search_dimensions=2,
+                vector_search_profile_name="p",
+            ),
+        ],
+        vector_search=VectorSearch(
+            algorithms=[
+                HnswAlgorithmConfiguration(
+                    name="hnsw-1",
+                    kind="hnsw",
+                    parameters=HnswParameters(m=4, ef_construction=40, ef_search=20, metric=metric),
+                )
+            ],
+            profiles=[VectorSearchProfile(name="p", algorithm_configuration_name="hnsw-1")],
+        ),
+    )
+
+
+def test_dot_product_metric(index_client, search_client):
+    index_client.create_index(_metric_index("dotProduct"))
+    search_client.upload_documents(
+        documents=[
+            {"id": "neg", "v": [-3.0, 0.0]},
+            {"id": "zero", "v": [0.0, 0.0]},
+            {"id": "big", "v": [100.0, 100.0]},
+            {"id": "unit", "v": [1.0, 0.0]},
+        ]
+    )
+    found = list(
+        search_client.search(
+            vector_queries=[
+                VectorizedQuery(vector=[1.0, 1.0], k_nearest_neighbors=4, fields="v")
+            ]
+        )
+    )
+    # Raw inner products: 200, 1, 0, -3.
+    assert [doc["id"] for doc in found] == ["big", "unit", "zero", "neg"]
+    assert found[0]["@search.score"] == 200.0
+
+
+def test_euclidean_metric(index_client, search_client):
+    index_client.create_index(_metric_index("euclidean"))
+    search_client.upload_documents(
+        documents=[
+            {"id": "a", "v": [0.0, 0.0]},
+            {"id": "b", "v": [1.0, 0.0]},
+            {"id": "c", "v": [3.0, 0.0]},
+        ]
+    )
+    found = list(
+        search_client.search(
+            vector_queries=[
+                VectorizedQuery(vector=[0.0, 0.0], k_nearest_neighbors=3, fields="v")
+            ]
+        )
+    )
+    # Scores are 1/(1+l2): 1.0, 0.5, 0.25.
+    assert [doc["id"] for doc in found] == ["a", "b", "c"]
+    assert [doc["@search.score"] for doc in found] == [1.0, 0.5, 0.25]
+
+
+def test_non_retrievable_vector_omitted_unless_selected(index_client, search_client):
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type="Edm.String", key=True),
+                SearchField(
+                    name="content_vector",
+                    type="Collection(Edm.Single)",
+                    searchable=True,
+                    retrievable=False,
+                    vector_search_dimensions=3,
+                    vector_search_profile_name="cos",
+                ),
+                SearchField(
+                    name="flat_vector",
+                    type="Collection(Edm.Single)",
+                    searchable=True,
+                    vector_search_dimensions=3,
+                    vector_search_profile_name="eknn",
+                ),
+            ],
+            vector_search=VectorSearch(
+                algorithms=[
+                    HnswAlgorithmConfiguration(
+                        name="hnsw-1",
+                        kind="hnsw",
+                        parameters=HnswParameters(m=4, ef_construction=40, ef_search=20),
+                    ),
+                    ExhaustiveKnnAlgorithmConfiguration(
+                        name="eknn-1",
+                        kind="exhaustiveKnn",
+                        parameters=ExhaustiveKnnParameters(),
+                    ),
+                ],
+                profiles=[
+                    VectorSearchProfile(name="cos", algorithm_configuration_name="hnsw-1"),
+                    VectorSearchProfile(name="eknn", algorithm_configuration_name="eknn-1"),
+                ],
+            ),
+        )
+    )
+    search_client.upload_documents(
+        documents=[
+            {
+                "id": "1",
+                "content_vector": [1.0, 0.0, 0.0],
+                "flat_vector": [1.0, 0.0, 0.0],
+            },
+            {
+                "id": "2",
+                "content_vector": [0.0, 1.0, 0.0],
+                "flat_vector": [0.0, 1.0, 0.0],
+            },
+        ]
+    )
+    queries = [
+        VectorizedQuery(
+            vector=[1.0, 0.0, 0.0], k_nearest_neighbors=1, fields="content_vector"
+        )
+    ]
+    found = list(search_client.search(vector_queries=queries))
+    assert found[0]["id"] == "1"
+    assert "content_vector" not in found[0]
+    assert "flat_vector" in found[0]
+
+    found = list(
+        search_client.search(select=["id", "content_vector"], vector_queries=queries)
+    )
+    assert found[0]["id"] == "1"
+    assert "content_vector" in found[0]
+
+
+def test_vector_search_with_orderby_orders_by_field(index_client, search_client):
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type="Edm.String", key=True),
+                SimpleField(name="price", type=SearchFieldDataType.Double, sortable=True),
+                SearchField(
+                    name="content_vector",
+                    type="Collection(Edm.Single)",
+                    searchable=True,
+                    vector_search_dimensions=3,
+                    vector_search_profile_name="cos",
+                ),
+            ],
+            vector_search=VectorSearch(
+                algorithms=[
+                    HnswAlgorithmConfiguration(
+                        name="hnsw-1",
+                        kind="hnsw",
+                        parameters=HnswParameters(m=4, ef_construction=40, ef_search=20),
+                    )
+                ],
+                profiles=[
+                    VectorSearchProfile(name="cos", algorithm_configuration_name="hnsw-1")
+                ],
+            ),
+        )
+    )
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "price": 5.0, "content_vector": [1.0, 0.0, 0.0]},
+            {"id": "2", "price": 1.0, "content_vector": [0.0, 1.0, 0.0]},
+        ]
+    )
+    # The vector query ranks doc 2 first, but orderby takes precedence.
+    found = list(
+        search_client.search(
+            vector_queries=[
+                VectorizedQuery(
+                    vector=[0.0, 1.0, 0.0], k_nearest_neighbors=2, fields="content_vector"
+                )
+            ],
+            order_by="price asc",
+        )
+    )
+    assert [doc["id"] for doc in found] == ["2", "1"]

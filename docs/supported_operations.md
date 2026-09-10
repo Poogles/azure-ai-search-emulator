@@ -191,7 +191,7 @@ Route: `POST /indexes('{name}')/docs/search.post.search?api-version=...`.
 | Result count | `search(count=True)` → `@odata.count` | Supported |
 | Paging | `top=`, `skip=` | Supported |
 | Continuation tokens | `by_page()` → `@odata.nextLink` + `@search.nextPageParameters` | Supported |
-| Count documents | `SearchClient.count_documents()` (`/docs/$count`) | Supported (returns bare integer) |
+| Count documents | `SearchClient.get_document_count()` (`/docs/$count`) | Supported (returns bare integer) |
 | Filters | `filter=` | Supported, including nested complex-type paths (`Address/StateProvince`; see Filter below) |
 | Ordering | `orderby=` | Supported (sortable top-level fields only) |
 | Projection | `select=` | Supported (top-level fields only) |
@@ -223,6 +223,7 @@ OData `$filter` with `and` / `or` / `not`, parentheses, `eq` / `ne` / `gt` / `ge
 - `orderby`: comma-separated `field [asc|desc]` (or a JSON array). Every field must exist and be marked `sortable`. Missing values sort last; the key field is the final tie-breaker for determinism.
 - `select`: comma-separated field names (or a JSON array). Every field must exist. Only the selected fields are returned per document.
 - `facets`: comma-separated entries or `*` (or a JSON array). Each entry is a field name, optionally followed by `,count:N` (or `,top:N`) to limit the number of returned facet values (e.g. `Category,count:3`). Named fields must exist and be marked `facetable`; `*` expands to all facetable fields. The special `$count` entry reports the total number of documents in the filtered result set as a plain number. Unknown facet options are rejected with `400 InvalidQuery`. Counts are computed over the full filtered result set, ordered by count descending then value ascending.
+  - Note: the pinned Python SDK types `SearchDocumentsResult.facets` as `dict[str, list[FacetResult]]` and cannot deserialize the bare-number `$count` entry (the whole response falls back to a raw dict). The emulator's shape matches Azure; `$count` is therefore exercised over raw HTTP in `tests/e2e/test_emulator.py::test_search_facet_count`.
 
 ### Continuation tokens
 
@@ -326,17 +327,17 @@ Matching is case-insensitive prefix matching of the search text against the whit
 | Capability | Contract tests | Unit tests | Python SDK/e2e |
 |------------|----------------|------------|------------|
 | Index create/get/list/update/delete | `tests/contract/index_management.rs` | `service`, `storage` | `test_emulator.py`, `tests/sdk/` |
-| Synonym map create/update/get/list/delete, auth, validation, reset | `tests/contract/synonym_maps.rs` | `service` | `tests/ms_samples/` (`sample_index_synonym_map_crud.py`) |
+| Synonym map create/update/get/list/delete, auth, validation, reset | `tests/contract/synonym_maps.rs` | `service` | `tests/sdk/`, `tests/ms_samples/` (`sample_index_synonym_map_crud.py`) |
 | Document upload/merge/mergeOrUpload/delete, per-document errors, batch shapes, get-document, document count, GeographyPoint values | `tests/contract/document_management.rs` | `service` | `tests/sdk/` |
-| Search shape, count, match-all, boolean operators, searchFields, facet options, analyze text, service stats | `tests/contract/search.rs` | `query`, `service` | `tests/sdk/` |
-| Filters, including nested complex-type paths | `tests/contract/filtering.rs` | `filter`, `service` | `tests/sdk/` |
-| Complex-type schema, documents, filters | `tests/contract/complex_fields.rs` | `service` | `tests/sdk/` |
-| Ordering, projection, facets | `tests/contract/search.rs` | `service` | `tests/sdk/` |
+| Search shape, count, match-all, boolean operators, empty text, searchFields, facet options (incl. `$count` via raw HTTP), analyze text, service stats, unsupported-option rejection | `tests/contract/search.rs` | `query`, `service` | `tests/sdk/`, `test_emulator.py` (`$count`) |
+| Filters, including nested complex-type paths and collection `any`/`all` | `tests/contract/filtering.rs` | `filter`, `service` | `tests/sdk/` |
+| Complex-type schema, documents, filters, collection-of-complex | `tests/contract/complex_fields.rs` | `service` | `tests/sdk/` |
+| Ordering (multi-field), projection, facets | `tests/contract/search.rs` | `service` | `tests/sdk/` |
 | Continuation tokens (nextLink, staleness) | `tests/contract/pagination.rs` | `service` | `tests/sdk/` (`by_page()`) |
-| Autocomplete, suggest (prefix match, suggester validation, auth) | `tests/contract/suggest_autocomplete.rs` | `service`, `storage` | `tests/ms_samples/` (`sample_query_autocomplete.py`, `sample_query_suggestions.py`) |
-| Vector search (schema, document validation, vector/hybrid, filter modes, exhaustive) | `tests/contract/vector_search.rs` | `vector`, `service` | `tests/sdk/test_vectors.py`, `test_emulator.py` (RAG flow) |
-| Index aliases (CRUD, validation, auth, reset) | `tests/contract/aliases_knowledge.rs` | `service` | `tests/ms_samples/` (`sample_index_alias_crud.py`) |
-| Knowledge sources/bases + retrieval (CRUD, validation, auth, reset, empty retrieval) | `tests/contract/aliases_knowledge.rs` | `service` | `tests/ms_samples/` (`sample_agentic_retrieval.py`) |
+| Autocomplete, suggest (prefix match, suggester validation, auth) | `tests/contract/suggest_autocomplete.rs` | `service`, `storage` | `tests/sdk/`, `tests/ms_samples/` (`sample_query_autocomplete.py`, `sample_query_suggestions.py`) |
+| Vector search (schema, document validation, vector/hybrid, filter modes, exhaustive, dotProduct/euclidean metrics, non-retrievable, multi-query, vector+orderby) | `tests/contract/vector_search.rs` | `vector`, `service` | `tests/sdk/test_vectors.py`, `test_emulator.py` (RAG flow) |
+| Index aliases (CRUD, validation, auth, reset) | `tests/contract/aliases_knowledge.rs` | `service` | `tests/sdk/`, `tests/ms_samples/` (`sample_index_alias_crud.py`) |
+| Knowledge sources/bases + retrieval (CRUD, validation, auth, reset, empty retrieval) | `tests/contract/aliases_knowledge.rs` | `service` | `tests/sdk/`, `tests/ms_samples/` (`sample_agentic_retrieval.py`) |
 | Auth, API version, 404s, error structure | `tests/contract/errors.rs` | `version` | `test_emulator.py` |
 | Admin reset, health | `tests/contract/admin.rs` | — | `test_emulator.py` |
 | Configuration parsing | — | `config` | — |

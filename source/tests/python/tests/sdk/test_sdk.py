@@ -2,15 +2,26 @@
 
 import pytest
 from azure.core.credentials import AzureKeyCredential
-from azure.core.exceptions import HttpResponseError
+from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
 from azure.search.documents import SearchClient
 from azure.search.documents.indexes import SearchIndexClient
 from azure.search.documents.indexes.models import (
+    AnalyzeTextOptions,
+    KnowledgeBase,
     SearchableField,
+    SearchAlias,
     SearchField,
     SearchFieldDataType,
     SearchIndex,
+    SearchIndexKnowledgeSource,
+    SearchSuggester,
     SimpleField,
+    SynonymMap,
+)
+from azure.search.documents.knowledgebases import KnowledgeBaseRetrievalClient
+from azure.search.documents.knowledgebases.models import (
+    KnowledgeBaseRetrievalRequest,
+    KnowledgeRetrievalSemanticIntent,
 )
 
 API_KEY = "test-key"
@@ -251,3 +262,384 @@ def test_complex_type_filter(index_client, search_client):
     found = list(search_client.search(search_text="*", filter="address/state eq 'FL'"))
     assert [doc["id"] for doc in found] == ["1"]
     assert found[0]["address"] == {"city": "Miami", "state": "FL"}
+
+
+def test_collection_of_complex_type(index_client, search_client):
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchField(name="name", type=SearchFieldDataType.String, searchable=True),
+                SearchField(
+                    name="address",
+                    type=SearchFieldDataType.Collection(SearchFieldDataType.ComplexType),
+                    fields=[
+                        SearchField(name="city", type=SearchFieldDataType.String, searchable=True),
+                        SearchField(name="state", type=SearchFieldDataType.String),
+                    ],
+                ),
+            ],
+        )
+    )
+    results = search_client.upload_documents(
+        documents=[
+            {
+                "id": "1",
+                "name": "contoso",
+                "address": [
+                    {"city": "Miami", "state": "FL"},
+                    {"city": "Seattle", "state": "WA"},
+                ],
+            },
+            {"id": "2", "name": "fabrikam", "address": [{"city": "Montreal", "state": "QC"}]},
+        ]
+    )
+    assert all(r.succeeded for r in results)
+
+    # A searchable subfield is indexed across all collection elements.
+    found = list(search_client.search(search_text="Seattle"))
+    assert [doc["id"] for doc in found] == ["1"]
+    doc = search_client.get_document(key="1")
+    assert doc["address"] == [
+        {"city": "Miami", "state": "FL"},
+        {"city": "Seattle", "state": "WA"},
+    ]
+
+
+def test_count_documents(priced_docs):
+    assert priced_docs.get_document_count() == 3
+
+
+def test_count_documents_empty(index_client, search_client, full_index):
+    index_client.create_index(full_index)
+    assert search_client.get_document_count() == 0
+
+
+def test_count_documents_missing_index(clean_emulator):
+    client = SearchClient(
+        endpoint=clean_emulator,
+        index_name="missing",
+        credential=CREDENTIAL,
+        api_version=API_VERSION,
+    )
+    with pytest.raises(ResourceNotFoundError):
+        client.get_document_count()
+
+
+def test_service_statistics(index_client):
+    stats = index_client.get_service_statistics()
+    assert stats.counters is not None
+    assert stats.limits is not None
+
+
+def test_analyze_text(index_client, created_index):
+    result = index_client.analyze_text(INDEX_NAME, AnalyzeTextOptions(text="Hello, World!"))
+    tokens = [token.token for token in result.tokens]
+    assert "hello" in tokens
+    assert "world" in tokens
+
+
+def test_search_boolean_operators(index_client, search_client):
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchField(name="title", type=SearchFieldDataType.String, searchable=True),
+            ],
+        )
+    )
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "azure search"},
+            {"id": "2", "title": "azure emulators"},
+            {"id": "3", "title": "other"},
+            {"id": "4", "title": "quick brown fox"},
+            {"id": "5", "title": "brown quick"},
+        ]
+    )
+
+    found = list(search_client.search(search_text="azure -emulators"))
+    assert [doc["id"] for doc in found] == ["1"]
+
+    found = list(search_client.search(search_text="-azure"))
+    assert {doc["id"] for doc in found} == {"3", "4", "5"}
+
+    found = list(search_client.search(search_text='"quick brown"'))
+    assert [doc["id"] for doc in found] == ["4"]
+
+
+def test_search_empty_text_matches_all(priced_docs):
+    found = list(priced_docs.search(search_text=""))
+    assert len(found) == 3
+
+
+def test_search_collection_any_all(priced_docs):
+    found = list(priced_docs.search(search_text="*", filter="tags any t eq 'red'"))
+    assert {doc["id"] for doc in found} == {"1", "2"}
+
+    found = list(priced_docs.search(search_text="*", filter="tags/any(t: t eq 'red')"))
+    assert {doc["id"] for doc in found} == {"1", "2"}
+
+    found = list(priced_docs.search(search_text="*", filter="tags/all(t: t ne 'green')"))
+    assert {doc["id"] for doc in found} == {"1", "2"}
+
+
+def test_search_facet_top_option(priced_docs):
+    results = priced_docs.search(search_text="*", facets=["tags,top:1"])
+    facets = results.get_facets()
+    assert len(facets["tags"]) == 1
+    assert facets["tags"][0]["value"] == "red"
+    assert facets["tags"][0]["count"] == 2
+
+
+def test_search_facet_star_expands_all_facetable(priced_docs):
+    results = priced_docs.search(search_text="*", facets=["*"])
+    facets = results.get_facets()
+    assert "tags" in facets
+
+
+def test_search_order_by_multiple_fields(index_client, search_client):
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SimpleField(name="price", type=SearchFieldDataType.Double, sortable=True),
+                SimpleField(name="rating", type=SearchFieldDataType.Int32, sortable=True),
+            ],
+        )
+    )
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "price": 5.0, "rating": 2},
+            {"id": "2", "price": 5.0, "rating": 1},
+            {"id": "3", "price": 1.0, "rating": 9},
+        ]
+    )
+    found = list(search_client.search(search_text="*", order_by="price asc, rating desc"))
+    assert [doc["id"] for doc in found] == ["3", "1", "2"]
+
+
+def test_create_or_update_index_discards_documents(index_client, search_client, full_index):
+    index_client.create_index(full_index)
+    search_client.upload_documents(documents=[{"id": "1", "title": "one"}])
+    assert search_client.get_document_count() == 1
+
+    index_client.create_or_update_index(full_index)
+    assert search_client.get_document_count() == 0
+
+
+def test_merge_missing_document_reports_404(index_client, search_client, full_index):
+    index_client.create_index(full_index)
+    results = search_client.merge_documents(documents=[{"id": "missing", "price": 1.0}])
+    assert results[0].succeeded is False
+    assert results[0].status_code == 404
+
+
+def test_delete_missing_document_reports_404(index_client, search_client, full_index):
+    index_client.create_index(full_index)
+    results = search_client.delete_documents(documents=[{"id": "missing"}])
+    assert results[0].succeeded is False
+    assert results[0].status_code == 404
+
+
+def test_upload_invalid_document_reports_per_document_error(
+    index_client, search_client, full_index
+):
+    index_client.create_index(full_index)
+    results = search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "one", "price": 1.0},
+            {"id": "2", "title": "two", "price": "not-a-number"},
+        ]
+    )
+    assert results[0].succeeded is True
+    assert results[1].succeeded is False
+    assert results[1].status_code == 400
+    # The valid document in the same batch is still indexed.
+    assert search_client.get_document_count() == 1
+
+
+def test_upload_to_missing_index_returns_404(clean_emulator):
+    client = SearchClient(
+        endpoint=clean_emulator,
+        index_name="missing",
+        credential=CREDENTIAL,
+        api_version=API_VERSION,
+    )
+    with pytest.raises(ResourceNotFoundError):
+        client.upload_documents(documents=[{"id": "1"}])
+
+
+def test_unsupported_query_options_rejected(priced_docs):
+    cases = [
+        {"search_mode": "exact"},
+        {"highlight_fields": "title"},
+        {"scoring_profile": "profile"},
+        {"semantic_configuration_name": "config"},
+        {"query_type": "full"},
+    ]
+    for options in cases:
+        with pytest.raises(HttpResponseError) as exc_info:
+            list(priced_docs.search(search_text="*", **options))
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.response.json()["error"]["code"] == "UnsupportedQuery"
+
+
+def test_error_body_is_azure_structured(index_client):
+    with pytest.raises(HttpResponseError) as exc_info:
+        index_client.get_index("missing")
+    body = exc_info.value.response.json()
+    assert set(body) == {"error"}
+    assert set(body["error"]) == {"code", "message"}
+    assert body["error"]["code"] == "ResourceNotFound"
+
+
+def test_suggest_and_autocomplete(index_client, search_client):
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchField(name="title", type=SearchFieldDataType.String, searchable=True),
+            ],
+            suggesters=[SearchSuggester(name="sg", source_fields=["title"])],
+        )
+    )
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "Boston Harbor Hotel"},
+            {"id": "2", "title": "Portland Airport Inn"},
+        ]
+    )
+
+    suggestions = search_client.suggest(search_text="bos", suggester_name="sg")
+    assert [doc["id"] for doc in suggestions] == ["1"]
+    assert suggestions[0].text == "Boston"
+
+    completions = search_client.autocomplete(search_text="bos", suggester_name="sg")
+    assert [item.text for item in completions] == ["Boston"]
+    assert completions[0].query_plus_text == "bos Boston"
+
+
+def test_synonym_map_crud(index_client):
+    created = index_client.create_synonym_map(SynonymMap(name="sm", synonyms=["a", "b"]))
+    assert created.name == "sm"
+
+    fetched = index_client.get_synonym_map("sm")
+    assert fetched.synonyms == ["a", "b"]
+
+    names = [sm.name for sm in index_client.get_synonym_maps()]
+    assert names == ["sm"]
+
+    updated = index_client.create_or_update_synonym_map(
+        SynonymMap(name="sm", synonyms=["a", "c"])
+    )
+    assert updated.synonyms == ["a", "c"]
+
+    index_client.delete_synonym_map("sm")
+    with pytest.raises(ResourceNotFoundError):
+        index_client.get_synonym_map("sm")
+
+
+def test_alias_crud(index_client):
+    created = index_client.create_alias(SearchAlias(name="al", indexes=["i1"]))
+    assert created.name == "al"
+
+    fetched = index_client.get_alias("al")
+    assert fetched.indexes == ["i1"]
+
+    names = [alias.name for alias in index_client.list_aliases()]
+    assert names == ["al"]
+
+    updated = index_client.create_or_update_alias(SearchAlias(name="al", indexes=["i2"]))
+    assert updated.indexes == ["i2"]
+
+    index_client.delete_alias("al")
+    with pytest.raises(ResourceNotFoundError):
+        index_client.get_alias("al")
+
+
+def test_knowledge_source_crud(index_client):
+    created = index_client.create_knowledge_source(
+        SearchIndexKnowledgeSource(
+            name="src1",
+            kind="searchIndex",
+            search_index_parameters={"searchIndexName": "i1"},
+        )
+    )
+    assert created.name == "src1"
+
+    fetched = index_client.get_knowledge_source("src1")
+    assert fetched.kind == "searchIndex"
+
+    names = [source.name for source in index_client.list_knowledge_sources()]
+    assert names == ["src1"]
+
+    updated = index_client.create_or_update_knowledge_source(
+        SearchIndexKnowledgeSource(
+            name="src1",
+            kind="searchIndex",
+            description="updated",
+            search_index_parameters={"searchIndexName": "i1"},
+        )
+    )
+    assert updated.description == "updated"
+
+    index_client.delete_knowledge_source("src1")
+    with pytest.raises(ResourceNotFoundError):
+        index_client.get_knowledge_source("src1")
+
+
+def test_knowledge_base_crud(clean_emulator, index_client):
+    index_client.create_knowledge_source(
+        SearchIndexKnowledgeSource(
+            name="src1",
+            kind="searchIndex",
+            search_index_parameters={"searchIndexName": "i1"},
+        )
+    )
+    created = index_client.create_knowledge_base(
+        KnowledgeBase(name="kb1", knowledge_sources=[{"name": "src1"}])
+    )
+    assert created.name == "kb1"
+
+    fetched = index_client.get_knowledge_base("kb1")
+    assert fetched.knowledge_sources[0]["name"] == "src1"
+
+    names = [base.name for base in index_client.list_knowledge_bases()]
+    assert names == ["kb1"]
+
+    index_client.delete_knowledge_base("kb1")
+    with pytest.raises(ResourceNotFoundError):
+        index_client.get_knowledge_base("kb1")
+
+
+def test_knowledge_base_retrieve_returns_empty(clean_emulator, index_client):
+    index_client.create_knowledge_source(
+        SearchIndexKnowledgeSource(
+            name="src1",
+            kind="searchIndex",
+            search_index_parameters={"searchIndexName": "i1"},
+        )
+    )
+    index_client.create_knowledge_base(
+        KnowledgeBase(name="kb1", knowledge_sources=[{"name": "src1"}])
+    )
+
+    client = KnowledgeBaseRetrievalClient(
+        endpoint=clean_emulator,
+        knowledge_base_name="kb1",
+        credential=CREDENTIAL,
+        api_version=API_VERSION,
+    )
+    response = client.retrieve(
+        KnowledgeBaseRetrievalRequest(
+            intents=[KnowledgeRetrievalSemanticIntent(type="semantic", search="hotels")]
+        )
+    )
+    assert response.response == []
+    assert response.activity == []
+    assert response.references == []

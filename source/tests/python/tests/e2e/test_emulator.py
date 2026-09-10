@@ -1,5 +1,7 @@
 """E2E tests: official Azure AI Search SDK against the containerised emulator."""
 
+import json
+import urllib.error
 import urllib.request
 
 import pytest
@@ -61,6 +63,95 @@ def test_health_endpoint(clean_emulator):
         assert resp.status == 200
         body = resp.read().decode()
         assert "ok" in body
+
+
+def _raw_get(url, api_key=None):
+    """Issue a GET and return (status, parsed JSON body) without raising on 4xx/5xx."""
+    headers = {"Accept": "application/json"}
+    if api_key is not None:
+        headers["api-key"] = api_key
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode())
+
+
+def test_missing_api_key_returns_401(clean_emulator):
+    url = f"{clean_emulator}/indexes?api-version={API_VERSION}"
+    status, body = _raw_get(url, api_key=None)
+    assert status == 401
+    assert body["error"]["code"] == "AuthenticationFailed"
+
+
+def test_empty_api_key_returns_401(clean_emulator):
+    url = f"{clean_emulator}/indexes?api-version={API_VERSION}"
+    status, body = _raw_get(url, api_key="")
+    assert status == 401
+    assert body["error"]["code"] == "AuthenticationFailed"
+
+
+def test_missing_api_version_returns_400(clean_emulator):
+    status, body = _raw_get(f"{clean_emulator}/indexes", api_key=API_KEY)
+    assert status == 400
+    assert body["error"]["code"] == "ApiVersionMissing"
+
+
+def test_unsupported_api_version_returns_400(clean_emulator):
+    client = SearchIndexClient(
+        endpoint=clean_emulator, credential=CREDENTIAL, api_version="1900-01-01"
+    )
+    with pytest.raises(HttpResponseError) as exc_info:
+        list(client.list_indexes())
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.response.json()["error"]["code"] == "ApiVersionUnsupported"
+
+
+def test_error_body_is_azure_structured(clean_emulator):
+    url = f"{clean_emulator}/indexes?api-version={API_VERSION}"
+    status, body = _raw_get(url, api_key=None)
+    assert status == 401
+    assert set(body) == {"error"}
+    assert set(body["error"]) == {"code", "message"}
+    assert isinstance(body["error"]["message"], str)
+
+
+def _raw_post(url, payload, api_key=API_KEY):
+    """Issue a JSON POST and return (status, parsed JSON body) without raising."""
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"api-key": api_key, "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode())
+
+
+def test_search_facet_count(clean_emulator, index_client, search_client, test_index):
+    """The ``$count`` facet reports the result-set size as a bare number.
+
+    Exercised over raw HTTP because the pinned SDK types
+    ``SearchDocumentsResult.facets`` as ``dict[str, list[FacetResult]]`` and
+    cannot deserialize the bare-number ``$count`` entry (the whole response
+    falls back to a raw dict). The emulator's shape matches Azure.
+    """
+    index_client.create_index(test_index)
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "alpha"},
+            {"id": "2", "title": "beta"},
+            {"id": "3", "title": "gamma"},
+        ]
+    )
+    url = f"{clean_emulator}/indexes('{INDEX_NAME}')/docs/search.post.search?api-version={API_VERSION}"
+    status, body = _raw_post(url, {"search": "*", "facets": ["$count"]})
+    assert status == 200
+    assert body["@search.facets"]["$count"] == 3
 
 
 def test_create_index(created_index):
