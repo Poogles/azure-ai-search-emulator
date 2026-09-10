@@ -40,12 +40,6 @@ except RuntimeError as exc:  # submodule not checked out
 
 # sample filename -> (category, detail)
 KNOWN_ISSUES = {
-    # --- Emulator gaps: the feature is not implemented; pinned to the Azure error
-    # signature so the suite goes red if the gap is closed or the signature changes.
-    "sample_agentic_retrieval.py": ("gap", 'Invalid index path segment "knowledgesources('),
-    "sample_index_alias_crud.py": ("gap", "Method Not Allowed"),
-    "sample_index_crud.py": ("gap", 'Unsupported field type "Edm.Collection(Edm.ComplexType)"'),
-    "sample_knowledge_source_crud.py": ("gap", 'Invalid index path segment "knowledgesources('),
     # --- Cannot run here: the sample targets a newer/preview SDK than the pinned 12.0.0.
     "sample_knowledge_service_stats_preview.py": ("skip", "SDK 12.0.0 SearchServiceCounters lacks knowledge_base_counter (preview SDK feature)"),
     "sample_query_semantic.py": ("skip", "SDK 12.0.0 leaks query_language/query_speller into the HTTP transport (TypeError); semantic search is out of scope"),
@@ -55,9 +49,12 @@ KNOWN_ISSUES = {
     "sample_knowledge_source_fabric_data_agent_preview.py": ("skip", "needs a preview SDK (FabricDataAgentKnowledgeSource) + live Fabric data"),
     "sample_knowledge_source_fabric_ontology_preview.py": ("skip", "needs a preview SDK (FabricOntologyKnowledgeSource) + live Fabric data"),
     "sample_knowledge_source_file_preview.py": ("skip", "needs a preview SDK (FileUploadMetadata) + live file data"),
-    "sample_knowledge_source_freshness_preview.py": ("skip", "knowledge bases/sources not implemented + points at live external data"),
+    "sample_knowledge_source_freshness_preview.py": ("skip", "points at live external data for its freshness policy"),
     "sample_knowledge_source_mcp_server_preview.py": ("skip", "needs a preview SDK (McpServerAutoOutputParsing) + a live MCP server"),
     "sample_knowledge_source_workiq_preview.py": ("skip", "needs a preview SDK (EntraAppAuthentication) + live WorkIQ data"),
+    # --- Emulator implements the feature, but the sample needs preview SDK models for some steps.
+    "sample_index_crud.py": ("skip", "needs a preview SDK (ListingSearchType not in 12.0.0; create/get/update/delete with collection-of-complex work)"),
+    "sample_knowledge_source_crud.py": ("skip", "needs a preview SDK (SearchIndexKnowledgeSourceFilterHint/QueryHints not in 12.0.0; create/get/list/delete work)"),
     # --- Cannot run here: needs azure-identity and a real Azure AD environment.
     "sample_authentication.py": ("skip", "needs azure-identity + real AAD for the AAD half (API-key half passes)"),
     # --- Cannot run here: needs an external Azure Storage account.

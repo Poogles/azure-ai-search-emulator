@@ -307,10 +307,10 @@ impl SearchEngine {
             let mut tantivy_doc = TantivyDocument::new();
             tantivy_doc.add_text(engine.key_field, &document.key);
             for (field_name, field) in &engine.searchable {
-                if let Some(value) = resolve_doc_path(&document.fields, field_name)
-                    .and_then(serde_json::Value::as_str)
-                {
-                    tantivy_doc.add_text(*field, value);
+                for value in resolve_doc_paths(&document.fields, field_name) {
+                    if let Some(text) = value.as_str() {
+                        tantivy_doc.add_text(*field, text);
+                    }
                 }
             }
             engine
@@ -457,7 +457,12 @@ fn collect_searchable(
         } else {
             format!("{prefix}/{}", field.name)
         };
-        if field.field_type == "Edm.ComplexType" {
+        if field.field_type == "Edm.ComplexType"
+            || field.field_type == "Edm.Collection(Edm.ComplexType)"
+        {
+            // Complex types (single or collection) index their searchable
+            // subfields under the field path; a collection contributes one
+            // value per element at index time.
             collect_searchable(builder, searchable, &path, &field.subfields);
         } else if field.searchable && !field.is_vector_field() {
             // Vector fields require `searchable: true` per Azure but are not
@@ -469,15 +474,40 @@ fn collect_searchable(
 }
 
 /// Resolves a field path (`Address/City`, or a plain field name) against a
-/// document's field map, walking into complex-type objects.
-fn resolve_doc_path<'a>(fields: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
+/// document's field map, walking into complex-type objects. When a segment
+/// resolves to a JSON array (a collection field), the remaining path is
+/// resolved against every element, so a collection-of-complex path yields one
+/// value per element. A plain (non-collection) path yields at most one value.
+fn resolve_doc_paths<'a>(fields: &'a Map<String, Value>, path: &str) -> Vec<&'a Value> {
     let mut segments = path.split('/');
-    let first = segments.next()?;
-    let mut current = fields.get(first)?;
+    let Some(first) = segments.next() else {
+        return Vec::new();
+    };
+    let mut current = match fields.get(first) {
+        Some(value) => vec![value],
+        None => return Vec::new(),
+    };
     for segment in segments {
-        current = current.as_object()?.get(segment)?;
+        let mut next = Vec::new();
+        for value in current {
+            match value {
+                Value::Array(items) => {
+                    for item in items {
+                        if let Some(sub) = item.as_object().and_then(|o| o.get(segment)) {
+                            next.push(sub);
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(sub) = value.as_object().and_then(|o| o.get(segment)) {
+                        next.push(sub);
+                    }
+                }
+            }
+        }
+        current = next;
     }
-    Some(current)
+    current
 }
 
 /// Builds the Tantivy query for a [`FullTextQuery`]: match-all when the query

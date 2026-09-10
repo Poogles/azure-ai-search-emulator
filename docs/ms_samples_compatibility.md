@@ -59,11 +59,10 @@ Each sample is classified in `KNOWN_ISSUES` (`test_ms_samples.py`):
 
 ## Current state
 
-32 sync samples discovered. `make test-ms`: **17 passed, 15 skipped, 0 failed.**
-(13 genuine passes + 4 gap pins that fail with the documented Azure error
-signature: 13 genuine + 4 pinned.)
+32 sync samples discovered. `make test-ms`: **15 passed, 17 skipped, 0 failed.**
+(All 15 passes are genuine; there are no gap pins remaining.)
 
-### Passes (13)
+### Passes (15)
 
 | Sample | Notes |
 |--------|-------|
@@ -80,17 +79,14 @@ signature: 13 genuine + 4 pinned.)
 | `sample_query_vector.py` | Genuine pass since the SDK 12 bump plus the OData lambda-filter fix: the sample creates a vector index (`Collection(Edm.Single)` + `vectorSearch` profiles), uploads 7 pre-embedded hotel docs, and runs single-vector, filtered-vector (`Tags/any(tag: tag eq 'free wifi')`), and hybrid searches. |
 | `sample_index_client_custom_request.py` | Genuine pass since the SDK 12 bump: `SearchIndexClient.send_request` GETs the seeded hotels index and prints the echoed definition. |
 | `sample_search_client_custom_request.py` | Genuine pass since the SDK 12 bump: `SearchClient.send_request` GETs `/docs/$count` and prints the document count (4). |
+| `sample_index_alias_crud.py` | Genuine pass since the alias CRUD fix: create, get, update (re-point to the v2 index, which exercises collection-of-complex), and delete of the `hotels-sample-alias` all round-trip. |
+| `sample_agentic_retrieval.py` | Genuine pass since the knowledge CRUD + retrieval fix: creates a knowledge source and knowledge base over the seeded hotels index, `POST /knowledgebases('{name}')/retrieve` returns an empty response (no model inference — see `known_differences.md`), and cleanup deletes both. Passes on the empty `response` array. |
 
-### Documented emulator gaps (4)
+### Documented emulator gaps (0)
 
-| Sample | Pinned signature | Gap |
-|--------|------------------|-----|
-| `sample_agentic_retrieval.py` | `Invalid index path segment "knowledgesources(` | [Gap 13](#gap-13--knowledge-sourcesbases--agentic-retrieval-large) — knowledge sources not implemented |
-| `sample_index_alias_crud.py` | `Method Not Allowed` | [Gap 11](#gap-11--index-aliases-mediummedium-plus) — index aliases not implemented |
-| `sample_index_crud.py` | `Unsupported field type "Edm.Collection(Edm.ComplexType)"` | [Gap 12](#gap-12--collection-of-complex-types-mediummedium-plus) — collection-of-complex fields rejected |
-| `sample_knowledge_source_crud.py` | `Invalid index path segment "knowledgesources(` | [Gap 13](#gap-13--knowledge-sourcesbases--agentic-retrieval-large) — knowledge sources not implemented |
+All emulator gaps are closed. Gaps 11–13 landed (see the tracker and plans below); their `KNOWN_ISSUES` pins have been removed.
 
-Historical plans for closed gaps, and requirements for the open ones, are in [Gap implementation plans](#gap-implementation-plans) below. The remaining 15 skips are tracked as Gaps 9–10 plus preview-SDK / SDK-bug skips (same format, `☐ not started` where applicable).
+Historical plans for all gaps are in [Gap implementation plans](#gap-implementation-plans) below. The remaining 17 skips are tracked as Gaps 9–10 (external-service, `☐ not started`) plus preview-SDK / SDK-bug skips.
 
 ### Gap implementation plans
 
@@ -111,9 +107,9 @@ order (each builds on prior auth-guard / route changes).
 | 8 | SDK 12 harness bump (18 samples) | ☑ done | |
 | 9 | Indexers + data sources (3 samples) | ☐ not started | |
 | 10 | AAD bearer auth (1 sample half) | ☐ not started | |
-| 11 | Index aliases (1 sample) | ☐ not started | |
-| 12 | Collection-of-complex field types (1 sample) | ☐ not started | |
-| 13 | Knowledge sources/bases + agentic retrieval (2 samples) | ☐ not started | |
+| 11 | Index aliases (1 sample) | ☑ done | |
+| 12 | Collection-of-complex field types (1 sample) | ☑ done | |
+| 13 | Knowledge sources/bases + agentic retrieval (2 samples) | ☑ done | |
 
 ---
 
@@ -453,60 +449,104 @@ lands.
 
 ---
 
-#### Gap 11 — Index aliases (medium/medium-plus)
+#### Gap 11 — Index aliases (medium/medium-plus) ✅
 
 **Samples (1):** `sample_index_alias_crud.py`
 **Routes:** alias CRUD — none registered (`POST /aliases`, `GET /aliases`, `GET /aliases('{name}')`, `PUT /aliases('{name}')`, `DELETE /aliases('{name}')`)
-**Current failure:** `create_alias` fails with `Operation returned an invalid status 'Method Not Allowed'`; pinned as `gap` on `Method Not Allowed`.
+**Was:** `create_alias` fails with `Operation returned an invalid status 'Method Not Allowed'`.
 
-**What is required:**
+**What was done:**
 
-- [ ] Define an `Alias` resource (`name`, `indexes`, `etag`) in `source/rust/src/service/mod.rs` with service-level storage (like synonym maps) and `reset()` coverage.
-- [ ] Add the five alias routes to the azure sub-router, mirroring the synonym-map shapes: create returns `201`, duplicate create returns `409`, missing alias returns `404`, delete returns `204`; validate (missing/empty name, unknown index references, path/body name mismatch) with `400`.
-- [ ] Extend `azure_guard` to cover `/aliases` and `/aliases(` paths.
-- [ ] Decide alias resolution semantics: at minimum, alias CRUD round-trips; document whether search/document routes resolve an alias name to its index (Azure does) in `known_differences.md` either way.
-- [ ] Add contract tests (CRUD, validation, auth, reset) and document the surface in `docs/supported_operations.md` / `docs/known_differences.md`.
-- [ ] Remove the `KNOWN_ISSUES` entry.
-- [ ] Run `make test-ms` to confirm.
+- [x] Added a reusable `NamedResource` store (`name`, `etag`, raw body) in
+      `source/rust/src/service/mod.rs` with service-level storage (mirroring
+      the synonym-map pattern) and `reset()` coverage. Aliases use this store.
+- [x] Added the five alias routes to the azure sub-router, mirroring the
+      synonym-map shapes: create returns `201`, duplicate create returns
+      `409 AliasAlreadyExists`, missing alias returns `404`, delete returns
+      `204`; validated (missing/empty name, empty `indexes`, path/body name
+      mismatch) with `400 InvalidAlias`. Referenced-index existence is not
+      checked (aliases are stored opaquely).
+- [x] Extended `azure_guard` to cover `/aliases` and `/aliases(` paths.
+- [x] Alias resolution: aliases are CRUD-only; search/document routes do not
+      resolve an alias name to its index. Documented in `known_differences.md`.
+- [x] Added contract tests in `source/rust/tests/contract/aliases_knowledge.rs`
+      (CRUD, validation, auth, reset) and documented the surface in
+      `docs/supported_operations.md` / `docs/known_differences.md`.
+- [x] Removed the `KNOWN_ISSUES` entry.
+- [x] `make test-ms` confirms the sample passes.
 
 ---
 
-#### Gap 12 — Collection-of-complex field types (medium/medium-plus)
+#### Gap 12 — Collection-of-complex field types (medium/medium-plus) ✅
 
 **Samples (1):** `sample_index_crud.py`
 **Route:** N/A (schema validation)
-**Current failure:** `create_index` with a `ComplexField(..., collection=True)` fails with `400 InvalidIndex`: `Unsupported field type "Edm.Collection(Edm.ComplexType)"`; pinned as `gap` on that signature.
+**Was:** `create_index` with a `ComplexField(..., collection=True)` fails with `400 InvalidIndex`: `Unsupported field type "Edm.Collection(Edm.ComplexType)"`.
 
-**What is required:**
+**What was done:**
 
-- [ ] Accept `Collection(Edm.ComplexType)` in `validate_schema` (`source/rust/src/service/mod.rs`): a complex field with `collection: true`, non-empty `fields` array of scalar/collection-of-scalar subfields (same subfield rules as `Edm.ComplexType`).
-- [ ] Accept arrays of objects in document validation (per-element subfield checking, same as single complex values) and in indexing (full-text indexing of searchable string subfields across all elements).
-- [ ] Decide filter/projection semantics for collections of complex objects (`Address/any(...)` shapes) — at minimum reject explicitly with `400 InvalidQuery` where unsupported, and document the choice in `known_differences.md`.
-- [ ] Echo the type faithfully in `GET /indexes('{name}')` so SDK round-trips (`create` → `get`) agree.
-- [ ] Add contract tests (schema accept/reject, document validation, search/filter behaviour) and update `docs/supported_operations.md` (supported field types).
-- [ ] Remove the `KNOWN_ISSUES` entry.
-- [ ] Run `make test-ms` to confirm.
+- [x] Accept `Edm.Collection(Edm.ComplexType)` in `validate_schema`
+      (`source/rust/src/service/mod.rs`): same rules as `Edm.ComplexType`
+      (cannot be key/searchable/sortable/facetable; non-empty `fields` array
+      of scalar/collection-of-scalar subfields via shared `is_complex_type`
+      helper and `validate_subfields`).
+- [x] Accept arrays of objects in document validation (`check_complex_collection_value`:
+      per-element subfield checking via `check_complex_value`) and in indexing
+      (full-text indexing of searchable string subfields across all elements
+      via `collect_searchable` recursion and `resolve_doc_paths` array expansion
+      in `source/rust/src/query/mod.rs`).
+- [x] Filter semantics: collection-of-complex subfields filter via the same
+      `Address/State` path syntax as single complex types (lambda `any(...)`
+      shapes are not specially handled); documented in `known_differences.md`.
+- [x] Echo the type faithfully in `GET /indexes('{name}')` (raw definition
+      round-trip) so SDK `create` → `get` agree.
+- [x] Added contract tests in `source/rust/tests/contract/complex_fields.rs`
+      (schema accept/echo, document validation, search across elements) and
+      updated `docs/supported_operations.md` (supported field types).
+- [x] Removed the `KNOWN_ISSUES` entry. Note: `sample_index_crud.py` itself is
+      now `skip` — the collection-of-complex create/get steps pass, but the
+      sample's `list_index_names` step imports preview-SDK `ListingSearchType`
+      absent from pinned 12.0.0.
+- [x] `make test-ms` confirms the new state (the sample is skipped for the
+      preview-SDK reason, not the emulator gap).
 
-**Notes:** `sample_index_crud.py` also exercises `CorsOptions` and (empty) `scoringProfiles` on the index definition; those are already accepted (the sample fails only on the field type), so no extra work is expected there — re-validate when the gap lands.
+**Notes:** `sample_index_crud.py` also exercises `CorsOptions` and (empty) `scoringProfiles` on the index definition; those were already accepted, so no extra work was needed there.
 
 ---
 
-#### Gap 13 — Knowledge sources/bases + agentic retrieval (large)
+#### Gap 13 — Knowledge sources/bases + agentic retrieval (large) ✅
 
 **Samples (2):** `sample_knowledge_source_crud.py`, `sample_agentic_retrieval.py`
 **Routes:** knowledge-source, knowledge-base, and retrieval routes — none registered (`/knowledgesources…`, `/knowledgebases…`, agentic retrieval)
-**Current failure:** `create_or_update_knowledge_source` fails with `400 InvalidIndexName`: `Invalid index path segment "knowledgesources('…')"; expected indexes('name')`; pinned as `gap` on `Invalid index path segment "knowledgesources(`.
+**Was:** `create_or_update_knowledge_source` fails with `400 InvalidIndexName`: `Invalid index path segment "knowledgesources('…')"; expected indexes('name')`.
 
-**What is required:**
+**What was done:**
 
-- [ ] Define `KnowledgeSource` / `KnowledgeBase` resources (names, references, etags) with service-level storage and `reset()` coverage, mirroring the synonym-map pattern.
-- [ ] Add the CRUD routes to the azure sub-router (`knowledgesources`, `knowledgebases` literal + `('name')` forms); extend `azure_guard` to cover them.
-- [ ] Implement (or explicitly reject with `400`) the retrieval/agentic operations the samples exercise; document the choice in `known_differences.md` (model inference is an initial-design non-goal — retrieval over local indexes may be feasible, agentic generation is not).
-- [ ] Add contract tests (CRUD, validation, auth, reset) and document the surface in `docs/supported_operations.md` / `docs/known_differences.md`.
-- [ ] Remove the `KNOWN_ISSUES` entries.
-- [ ] Run `make test-ms` to confirm.
+- [x] Reused the `NamedResource` store for knowledge sources and knowledge
+      bases (raw body preserved and echoed with `@odata.etag`) with
+      service-level storage and `reset()` coverage, mirroring the synonym-map
+      pattern.
+- [x] Added the CRUD routes to the azure sub-router (`POST/GET
+      /knowledgesources`, `/knowledgebases` literal forms plus `GET/PUT/DELETE
+      /knowledgesources('name')`, `/knowledgebases('name')` via the shared
+      single-segment dispatch); extended `azure_guard` to cover them.
+      Validation: non-empty name, path/body match; sources require a `kind`
+      (searchIndex sources require `searchIndexParameters.searchIndexName`);
+      bases require a non-empty `knowledgeSources` array.
+- [x] Implemented `POST /knowledgebases('{name}')/retrieve` to return an empty
+      retrieval response (`{"response": [], "activity": [], "references": []}`)
+      when the base exists (`404` otherwise). Model inference is an
+      initial-design non-goal; documented in `known_differences.md`.
+- [x] Added contract tests in `source/rust/tests/contract/aliases_knowledge.rs`
+      (CRUD, validation, auth, reset, retrieval empty/404) and documented the
+      surface in `docs/supported_operations.md` / `docs/known_differences.md`.
+- [x] Removed the `KNOWN_ISSUES` entries. Note: `sample_knowledge_source_crud.py`
+      is now `skip` — its create/get/list/delete steps pass, but the update step
+      imports preview-SDK `SearchIndexKnowledgeSourceFilterHint`/`QueryHints`
+      absent from pinned 12.0.0. `sample_agentic_retrieval.py` passes end-to-end.
+- [x] `make test-ms` confirms the new state.
 
-**Notes:** The remaining knowledge samples stay `skip`: the configuration/retrieval-response previews and the Fabric/ontology/file/MCP/WorkIQ source samples import preview-SDK models absent from pinned 12.0.0 (`KnowledgeBaseRetrieveDefaults`, `KnowledgeBaseResponseCompletedEvent`, `FabricDataAgentKnowledgeSource`, `FabricOntologyKnowledgeSource`, `FileUploadMetadata`, `McpServerAutoOutputParsing`, `EntraAppAuthentication`), and the Fabric/ontology/file/freshness/MCP/WorkIQ variants point at live external data in any case.
+**Notes:** The remaining knowledge samples stay `skip`: the configuration/retrieval-response previews and the Fabric/ontology/file/MCP/WorkIQ source samples import preview-SDK models absent from pinned 12.0.0 (`KnowledgeBaseRetrieveDefaults`, `KnowledgeBaseResponseCompletedEvent`, `FabricDataAgentKnowledgeSource`, `FabricOntologyKnowledgeSource`, `FileUploadMetadata`, `McpServerAutoOutputParsing`, `EntraAppAuthentication`), and the Fabric/ontology/file/freshness/MCP/WorkIQ variants point at live external data in any case. `sample_index_crud.py` and `sample_knowledge_source_crud.py` join the preview-SDK skips (`ListingSearchType` and `FilterHint`/`QueryHints` respectively).
 
 ---
 
@@ -541,8 +581,22 @@ lands.
       the 18 Gap-8 samples — removed 3 entries that now pass
       (`sample_query_vector.py`, both `*_custom_request.py`), added 4 `gap`
       pins (Gaps 11–13), rewrote 11 entries as precise `skip` reasons.
+- [x] `azure_guard` middleware: extended to cover `/aliases` / `/aliases(`,
+      `/knowledgesources` / `/knowledgesources(`, `/knowledgebases` /
+      `/knowledgebases(` (done with Gaps 11, 13).
+- [x] `docs/supported_operations.md`: updated for aliases, collection-of-complex
+      field types, knowledge sources/bases, and agentic retrieval (done with
+      Gaps 11, 12, 13).
+- [x] `docs/known_differences.md`: documented CRUD-only aliases (no resolution),
+      collection-of-complex filter semantics, and empty retrieval responses
+      (done with Gaps 11, 12, 13).
+- [x] `source/tests/python/tests/ms_samples/test_ms_samples.py`: removed the
+      4 `gap` pins (Gaps 11–13); `sample_index_alias_crud.py` and
+      `sample_agentic_retrieval.py` now pass; `sample_index_crud.py` and
+      `sample_knowledge_source_crud.py` reclassified as preview-SDK `skip`
+      (`ListingSearchType` and `FilterHint`/`QueryHints` absent from 12.0.0).
 
-### Skipped — needs a newer/preview SDK than the pinned `12.0.0` (11)
+### Skipped — needs a newer/preview SDK than the pinned `12.0.0` (13)
 
 Upstream `main` already targets models that post-date stable `12.0.0` (latest
 on PyPI and the version the emulator is validated against — see
@@ -567,9 +621,16 @@ or SDK internals before emulator behaviour is reached:
   (`EntraAppAuthentication`): each imports a model absent from 12.0.0.
 - `sample_knowledge_base_crud.py` — `KnowledgeBase(...)` rejects the
   sample's `tags` kwarg in 12.0.0 (`TypeError` at construction).
-- `sample_knowledge_source_freshness_preview.py` — fails today on the
-  unimplemented `knowledgebases(...)` path (Gap 13), and points at live
-  external data for its freshness policy in any case, so it stays `skip`.
+- `sample_index_crud.py` — the emulator implements collection-of-complex (the
+  sample's create/get steps pass), but its `list_index_names` step imports
+  preview-SDK `ListingSearchType` absent from 12.0.0.
+- `sample_knowledge_source_crud.py` — the emulator implements knowledge-source
+  CRUD (the sample's create/get/list/delete steps pass), but its update step
+  imports preview-SDK `SearchIndexKnowledgeSourceFilterHint` /
+  `SearchIndexKnowledgeSourceQueryHints` (and `SearchIndexFieldReference`)
+  absent from 12.0.0.
+- `sample_knowledge_source_freshness_preview.py` — points at live external
+  data for its freshness policy, so it stays `skip`.
 
 The Fabric/ontology/file/MCP/WorkIQ variants additionally point at live
 external data and are permanently unrunnable here regardless of SDK version.

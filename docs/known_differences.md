@@ -103,6 +103,23 @@ Differences fall into two categories:
 - Etags are opaque counter strings, not Azure's hex entity tags.
 - **Rationale:** the CRUD surface is implemented so samples and clients that manage maps work unchanged; applying Solr synonym rules to the query pipeline is out of scope for a test double. Test assertions must not expect synonym expansion in search results.
 
+### Index aliases
+
+- Aliases are stored, echoed, and managed (create/update/get/list/delete) but **do not resolve**: search and document routes do not accept an alias name in place of an index name. Azure resolves aliases to their target index; the emulator returns `404` for an alias name on those routes.
+- Etags are opaque counter strings, not Azure's hex entity tags.
+- **Rationale:** the CRUD surface is implemented so samples and clients that manage aliases work unchanged; alias resolution in the query path is out of scope for a test double.
+
+### Collection-of-complex fields
+
+- `Edm.Collection(Edm.ComplexType)` fields accept arrays of objects and full-text index searchable string subfields across all elements. Filters use the same `Address/State` path syntax as single complex types; OData lambda shapes (`Address/any(a: ...)`) are not specially handled for complex collections.
+- **Rationale:** the schema and document surface is implemented so indexes with collection-of-complex fields round-trip; complex-collection lambda evaluation is out of scope.
+
+### Knowledge sources, knowledge bases, and agentic retrieval
+
+- Knowledge sources and bases are stored, echoed, and managed (create/update/get/list/delete) but **inert**: no ingestion, synchronization, or model inference runs. `POST /knowledgebases('{name}')/retrieve` returns an empty response (`{"response": [], "activity": [], "references": []}`) when the base exists.
+- Etags are opaque counter strings, not Azure's hex entity tags.
+- **Rationale:** the CRUD surface is implemented so samples and clients that manage these resources work unchanged; model inference and agentic generation are initial-design non-goals.
+
 ### Service surface
 
 - No indexers, data sources, skillsets, or other admin resources — those routes are not registered (`404`).

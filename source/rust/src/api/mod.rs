@@ -55,6 +55,15 @@ pub fn build_router(state: AppState) -> Router {
             "/synonymmaps",
             post(create_synonym_map).get(list_synonym_maps),
         )
+        .route("/aliases", post(create_alias).get(list_aliases))
+        .route(
+            "/knowledgesources",
+            post(create_knowledge_source).get(list_knowledge_sources),
+        )
+        .route(
+            "/knowledgebases",
+            post(create_knowledge_base).get(list_knowledge_bases),
+        )
         .route(
             "/{index}",
             get(get_index)
@@ -147,6 +156,39 @@ async fn create_or_update_index(
             .create_or_update_synonym_map(&name, format, synonyms)?;
         return Ok((StatusCode::CREATED, Json(map.to_value())));
     }
+    if let Some(raw) = raw_name.strip_prefix("aliases(") {
+        let name = parse_named_segment(raw, "alias", "InvalidAlias")?;
+        let definition = parse_body(&body)?;
+        validate_named_body(&name, &definition, "alias", "InvalidAlias")?;
+        validate_alias(&definition)?;
+        let alias = state.service.create_or_update_alias(&name, &definition);
+        return Ok((StatusCode::CREATED, Json(alias.to_value())));
+    }
+    if let Some(raw) = raw_name.strip_prefix("knowledgesources(") {
+        let name = parse_named_segment(raw, "knowledge source", "InvalidKnowledgeSource")?;
+        let definition = parse_body(&body)?;
+        validate_named_body(
+            &name,
+            &definition,
+            "knowledge source",
+            "InvalidKnowledgeSource",
+        )?;
+        validate_knowledge_source(&definition)?;
+        let source = state
+            .service
+            .create_or_update_knowledge_source(&name, &definition);
+        return Ok((StatusCode::CREATED, Json(source.to_value())));
+    }
+    if let Some(raw) = raw_name.strip_prefix("knowledgebases(") {
+        let name = parse_named_segment(raw, "knowledge base", "InvalidKnowledgeBase")?;
+        let definition = parse_body(&body)?;
+        validate_named_body(&name, &definition, "knowledge base", "InvalidKnowledgeBase")?;
+        validate_knowledge_base(&definition)?;
+        let base = state
+            .service
+            .create_or_update_knowledge_base(&name, &definition);
+        return Ok((StatusCode::CREATED, Json(base.to_value())));
+    }
     let name = parse_index_name(&raw_name)?;
     let definition = parse_body(&body)?;
     let body_name = definition.get("name").and_then(Value::as_str).unwrap_or("");
@@ -177,6 +219,18 @@ async fn get_index(
         let name = parse_synonym_map_name(raw)?;
         return Ok(Json(state.service.get_synonym_map(&name)?.to_value()));
     }
+    if let Some(raw) = raw_name.strip_prefix("aliases(") {
+        let name = parse_named_segment(raw, "alias", "InvalidAlias")?;
+        return Ok(Json(state.service.get_alias(&name)?.to_value()));
+    }
+    if let Some(raw) = raw_name.strip_prefix("knowledgesources(") {
+        let name = parse_named_segment(raw, "knowledge source", "InvalidKnowledgeSource")?;
+        return Ok(Json(state.service.get_knowledge_source(&name)?.to_value()));
+    }
+    if let Some(raw) = raw_name.strip_prefix("knowledgebases(") {
+        let name = parse_named_segment(raw, "knowledge base", "InvalidKnowledgeBase")?;
+        return Ok(Json(state.service.get_knowledge_base(&name)?.to_value()));
+    }
     let name = parse_index_name(&raw_name)?;
     Ok(Json(state.service.get_index(&name)?))
 }
@@ -191,6 +245,21 @@ async fn delete_index(
     if let Some(raw) = raw_name.strip_prefix("synonymmaps(") {
         let name = parse_synonym_map_name(raw)?;
         state.service.delete_synonym_map(&name)?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if let Some(raw) = raw_name.strip_prefix("aliases(") {
+        let name = parse_named_segment(raw, "alias", "InvalidAlias")?;
+        state.service.delete_alias(&name)?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if let Some(raw) = raw_name.strip_prefix("knowledgesources(") {
+        let name = parse_named_segment(raw, "knowledge source", "InvalidKnowledgeSource")?;
+        state.service.delete_knowledge_source(&name)?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if let Some(raw) = raw_name.strip_prefix("knowledgebases(") {
+        let name = parse_named_segment(raw, "knowledge base", "InvalidKnowledgeBase")?;
+        state.service.delete_knowledge_base(&name)?;
         return Ok(StatusCode::NO_CONTENT);
     }
     let name = parse_index_name(&raw_name)?;
@@ -226,6 +295,75 @@ async fn list_synonym_maps(State(state): State<AppState>) -> Json<Value> {
         .map(|map| map.to_value())
         .collect::<Vec<_>>();
     Json(json!({ "value": maps }))
+}
+
+/// `POST /aliases` — Create Alias. The name comes from the body.
+async fn create_alias(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let definition = parse_body(&body)?;
+    let name = body_name(&definition, "alias", "InvalidAlias")?;
+    validate_alias(&definition)?;
+    let alias = state.service.create_alias(&name, &definition)?;
+    Ok((StatusCode::CREATED, Json(alias.to_value())))
+}
+
+/// `GET /aliases` — List Aliases.
+async fn list_aliases(State(state): State<AppState>) -> Json<Value> {
+    let value = state
+        .service
+        .list_aliases()
+        .into_iter()
+        .map(|alias| alias.to_value())
+        .collect::<Vec<_>>();
+    Json(json!({ "value": value }))
+}
+
+/// `POST /knowledgesources` — Create Knowledge Source. The name comes from the body.
+async fn create_knowledge_source(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let definition = parse_body(&body)?;
+    let name = body_name(&definition, "knowledge source", "InvalidKnowledgeSource")?;
+    validate_knowledge_source(&definition)?;
+    let source = state.service.create_knowledge_source(&name, &definition)?;
+    Ok((StatusCode::CREATED, Json(source.to_value())))
+}
+
+/// `GET /knowledgesources` — List Knowledge Sources.
+async fn list_knowledge_sources(State(state): State<AppState>) -> Json<Value> {
+    let value = state
+        .service
+        .list_knowledge_sources()
+        .into_iter()
+        .map(|source| source.to_value())
+        .collect::<Vec<_>>();
+    Json(json!({ "value": value }))
+}
+
+/// `POST /knowledgebases` — Create Knowledge Base. The name comes from the body.
+async fn create_knowledge_base(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let definition = parse_body(&body)?;
+    let name = body_name(&definition, "knowledge base", "InvalidKnowledgeBase")?;
+    validate_knowledge_base(&definition)?;
+    let base = state.service.create_knowledge_base(&name, &definition)?;
+    Ok((StatusCode::CREATED, Json(base.to_value())))
+}
+
+/// `GET /knowledgebases` — List Knowledge Bases.
+async fn list_knowledge_bases(State(state): State<AppState>) -> Json<Value> {
+    let value = state
+        .service
+        .list_knowledge_bases()
+        .into_iter()
+        .map(|base| base.to_value())
+        .collect::<Vec<_>>();
+    Json(json!({ "value": value }))
 }
 
 async fn upload_documents(
@@ -319,6 +457,27 @@ async fn document_by_key(
     method: Method,
     Path((raw_name, raw_key)): Path<(String, String)>,
 ) -> Result<Json<Value>, Response> {
+    // `POST /knowledgebases('{name}')/retrieve` — agentic retrieval. The
+    // emulator performs no model inference (an initial-design non-goal), so it
+    // returns an empty retrieval response; the knowledge base must exist.
+    if method == Method::POST && raw_key == "retrieve" {
+        if let Some(raw) = raw_name.strip_prefix("knowledgebases(") {
+            let name = parse_named_segment(raw, "knowledge base", "InvalidKnowledgeBase")
+                .map_err(IntoResponse::into_response)?;
+            return state
+                .service
+                .get_knowledge_base(&name)
+                .map(|_| {
+                    Json(json!({
+                        "response": [],
+                        "activity": [],
+                        "references": []
+                    }))
+                })
+                .map_err(IntoResponse::into_response);
+        }
+        return Err(StatusCode::NOT_FOUND.into_response());
+    }
     if method != Method::GET {
         return Err(StatusCode::NOT_FOUND.into_response());
     }
@@ -571,6 +730,12 @@ async fn azure_guard(
         && !path.starts_with("/indexes(")
         && path != "/synonymmaps"
         && !path.starts_with("/synonymmaps(")
+        && path != "/aliases"
+        && !path.starts_with("/aliases(")
+        && path != "/knowledgesources"
+        && !path.starts_with("/knowledgesources(")
+        && path != "/knowledgebases"
+        && !path.starts_with("/knowledgebases(")
         && path != "/servicestats"
     {
         return Ok(next.run(request).await);
@@ -672,6 +837,135 @@ fn parse_synonym_map_name(raw: &str) -> Result<String, ApiError> {
         return Err(invalid());
     }
     Ok(name.to_owned())
+}
+
+/// Parses an OData-style named-resource path segment (`aliases('name')`,
+/// `knowledgesources('name')`, `knowledgebases('name')`). Takes the segment
+/// with the resource prefix already stripped (i.e. `'name')`).
+fn parse_named_segment(raw: &str, kind: &str, code: &str) -> Result<String, ApiError> {
+    let invalid = || {
+        ApiError::bad_request(
+            code,
+            format!("Invalid {kind} path segment {raw:?}; expected {kind}('name')."),
+        )
+    };
+    let inner = raw.strip_suffix(')').ok_or_else(invalid)?;
+    let name = inner
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .ok_or_else(invalid)?;
+    if name.is_empty() {
+        return Err(invalid());
+    }
+    Ok(name.to_owned())
+}
+
+/// Extracts a non-empty `name` from a resource body.
+fn body_name(definition: &Value, kind: &str, code: &str) -> Result<String, ApiError> {
+    definition
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| ApiError::bad_request(code, format!("The {kind} name is required.")))
+}
+
+/// Checks that the body's `name` matches the name parsed from the path.
+fn validate_named_body(
+    path_name: &str,
+    definition: &Value,
+    kind: &str,
+    code: &str,
+) -> Result<(), ApiError> {
+    let body_name = definition.get("name").and_then(Value::as_str).unwrap_or("");
+    if body_name.is_empty() || body_name != path_name {
+        return Err(ApiError::bad_request(
+            code,
+            format!("{kind} name in path ({path_name:?}) does not match name in body."),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates an alias body: a non-empty `indexes` array.
+fn validate_alias(definition: &Value) -> Result<(), ApiError> {
+    let indexes = definition
+        .get("indexes")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "InvalidAlias",
+                "An alias must define a non-empty \"indexes\" array.",
+            )
+        })?;
+    for index in indexes {
+        if !index.is_string() || index.as_str().is_some_and(str::is_empty) {
+            return Err(ApiError::bad_request(
+                "InvalidAlias",
+                "Alias \"indexes\" entries must be non-empty index name strings.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates a knowledge source body: a non-empty `kind` discriminator.
+fn validate_knowledge_source(definition: &Value) -> Result<(), ApiError> {
+    let kind = definition
+        .get("kind")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "InvalidKnowledgeSource",
+                "A knowledge source must define a non-empty \"kind\".",
+            )
+        })?;
+    // Other kinds (azureBlob, indexedOneLake, web) are accepted opaquely:
+    // the emulator stores and echoes them without modeling their parameters.
+    if kind == "searchIndex" {
+        let index_name = definition
+            .get("searchIndexParameters")
+            .and_then(|p| p.get("searchIndexName"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
+        if index_name.is_none() {
+            return Err(ApiError::bad_request(
+                "InvalidKnowledgeSource",
+                "A searchIndex knowledge source must define \
+                 \"searchIndexParameters.searchIndexName\".",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates a knowledge base body: a non-empty `knowledgeSources` array.
+fn validate_knowledge_base(definition: &Value) -> Result<(), ApiError> {
+    let sources = definition
+        .get("knowledgeSources")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "InvalidKnowledgeBase",
+                "A knowledge base must define a non-empty \"knowledgeSources\" array.",
+            )
+        })?;
+    for source in sources {
+        if source
+            .get("name")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err(ApiError::bad_request(
+                "InvalidKnowledgeBase",
+                "Each \"knowledgeSources\" entry must have a non-empty \"name\".",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Parses the OData-style document path segment `docs('key')`.
@@ -810,6 +1104,52 @@ fn operation_for(method: &axum::http::Method, path: &str) -> &'static str {
             "GET" => "getSynonymMap",
             "PUT" => "createOrUpdateSynonymMap",
             "DELETE" => "deleteSynonymMap",
+            _ => "unknown",
+        };
+    }
+    if path == "/aliases" {
+        return if method.as_str() == "POST" {
+            "createAlias"
+        } else {
+            "listAliases"
+        };
+    }
+    if path.starts_with("/aliases(") {
+        return match method.as_str() {
+            "GET" => "getAlias",
+            "PUT" => "createOrUpdateAlias",
+            "DELETE" => "deleteAlias",
+            _ => "unknown",
+        };
+    }
+    if path == "/knowledgesources" {
+        return if method.as_str() == "POST" {
+            "createKnowledgeSource"
+        } else {
+            "listKnowledgeSources"
+        };
+    }
+    if path.starts_with("/knowledgesources(") {
+        return match method.as_str() {
+            "GET" => "getKnowledgeSource",
+            "PUT" => "createOrUpdateKnowledgeSource",
+            "DELETE" => "deleteKnowledgeSource",
+            _ => "unknown",
+        };
+    }
+    if path == "/knowledgebases" {
+        return if method.as_str() == "POST" {
+            "createKnowledgeBase"
+        } else {
+            "listKnowledgeBases"
+        };
+    }
+    if path.starts_with("/knowledgebases(") {
+        return match method.as_str() {
+            "GET" => "getKnowledgeBase",
+            "PUT" => "createOrUpdateKnowledgeBase",
+            "POST" => "retrieveKnowledgeBase",
+            "DELETE" => "deleteKnowledgeBase",
             _ => "unknown",
         };
     }

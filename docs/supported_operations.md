@@ -45,8 +45,9 @@ Supported field types:
 - `Edm.String`, `Edm.Int32`, `Edm.Int64`, `Edm.Single`, `Edm.Double`, `Edm.Boolean`, `Edm.DateTimeOffset`, `Edm.Guid`, `Edm.GeographyPoint`
 - `Edm.Collection(...)` of any of the above
 - `Edm.ComplexType` with a non-empty `fields` array of subfields. Subfields must be scalar or collection-of-scalar types (no nested complex types), must have unique names, and cannot be keys. A complex field itself cannot be a key and cannot be marked `searchable`, `sortable`, or `facetable` (set those attributes on its subfields instead).
+- `Edm.Collection(Edm.ComplexType)` (a collection of complex objects) with the same subfield rules as `Edm.ComplexType`. Document values must be JSON arrays of objects; searchable string subfields are full-text indexed across all elements.
 
-Everything else (e.g. `Edm.Vector(...)`, `Edm.Collection(Edm.ComplexType)`, `Edm.Int8`/`Edm.Int16`, `Edm.Time`, `Edm.Duration`, `Edm.Binary`) is rejected explicitly with the list of supported types in the message.
+Everything else (e.g. `Edm.Vector(...)`, `Edm.Int8`/`Edm.Int16`, `Edm.Time`, `Edm.Duration`, `Edm.Binary`) is rejected explicitly with the list of supported types in the message.
 
 Field attributes (`searchable`, `filterable`, `sortable`, `facetable`, `retrievable`) are parsed, stored, and echoed. `searchable` controls full-text indexing; `filterable`, `sortable`, and `facetable` gate the corresponding query options (a field used in `filter`/`orderby`/`facets` must carry the matching attribute, else `400 InvalidQuery`). Collection types may be written with or without the `Edm.` prefix (`Collection(Edm.String)` as sent by the SDK, or `Edm.Collection(Edm.String)`); both are accepted and normalized.
 
@@ -93,6 +94,42 @@ Wire format (as sent by the pinned Python SDK): `{"name": "...", "format": "solr
 
 Validation (rejected with `400 InvalidSynonymMap`): missing/empty `name`, `format` other than `solr` (the only format Azure supports), empty/whitespace-only `synonyms`, and a path/body name mismatch on `PUT`.
 
+## Index aliases
+
+Service-level resource (not scoped to an index). Aliases are stored and echoed but **CRUD-only**: they do not resolve to indexes in search/document routes (see `docs/known_differences.md`).
+
+| Operation | SDK method | HTTP request | Success | Errors | Status |
+|-----------|-----------|--------------|---------|--------|--------|
+| Create alias | `SearchIndexClient.create_alias` | `POST /aliases?api-version=...` | `201` + the alias | `409 AliasAlreadyExists`, `400 InvalidAlias` | Supported |
+| Create or update alias | `SearchIndexClient.create_or_update_alias` | `PUT /aliases('{name}')?api-version=...` | `201` + the alias | `400 InvalidAlias` | Supported |
+| Get alias | `SearchIndexClient.get_alias` | `GET /aliases('{name}')?api-version=...` | `200` + the alias | `404 ResourceNotFound` | Supported |
+| List aliases | `SearchIndexClient.list_aliases` | `GET /aliases?api-version=...` | `200 {"value": [...]}` (sorted by name) | — | Supported |
+| Delete alias | `SearchIndexClient.delete_alias` | `DELETE /aliases('{name}')?api-version=...` | `204` | `404 ResourceNotFound` | Supported |
+
+The request body (`{"name": "...", "indexes": ["..."]}`) is stored and echoed verbatim with an `@odata.etag` added (opaque counter string bumped on every create or update).
+
+Validation (rejected with `400 InvalidAlias`): missing/empty `name`, missing/empty `indexes` array (entries must be non-empty strings), and a path/body name mismatch on `PUT`. Referenced-index existence is not checked.
+
+## Knowledge sources, knowledge bases, and agentic retrieval
+
+Service-level resources. Knowledge sources and bases are stored and echoed (like aliases); the retrieval endpoint returns an empty response because model inference is out of scope (see `docs/known_differences.md`).
+
+| Operation | SDK method | HTTP request | Success | Errors | Status |
+|-----------|-----------|--------------|---------|--------|--------|
+| Create knowledge source | `SearchIndexClient.create_knowledge_source` | `POST /knowledgesources?api-version=...` | `201` + the source | `409 KnowledgeSourceAlreadyExists`, `400 InvalidKnowledgeSource` | Supported |
+| Create or update knowledge source | `SearchIndexClient.create_or_update_knowledge_source` | `PUT /knowledgesources('{name}')?api-version=...` | `201` + the source | `400 InvalidKnowledgeSource` | Supported |
+| Get knowledge source | `SearchIndexClient.get_knowledge_source` | `GET /knowledgesources('{name}')?api-version=...` | `200` + the source | `404 ResourceNotFound` | Supported |
+| List knowledge sources | `SearchIndexClient.list_knowledge_sources` | `GET /knowledgesources?api-version=...` | `200 {"value": [...]}` (sorted by name) | — | Supported |
+| Delete knowledge source | `SearchIndexClient.delete_knowledge_source` | `DELETE /knowledgesources('{name}')?api-version=...` | `204` | `404 ResourceNotFound` | Supported |
+| Create knowledge base | `SearchIndexClient.create_knowledge_base` | `POST /knowledgebases?api-version=...` | `201` + the base | `409 KnowledgeBaseAlreadyExists`, `400 InvalidKnowledgeBase` | Supported |
+| Create or update knowledge base | `SearchIndexClient.create_or_update_knowledge_base` | `PUT /knowledgebases('{name}')?api-version=...` | `201` + the base | `400 InvalidKnowledgeBase` | Supported |
+| Get knowledge base | `SearchIndexClient.get_knowledge_base` | `GET /knowledgebases('{name}')?api-version=...` | `200` + the base | `404 ResourceNotFound` | Supported |
+| List knowledge bases | `SearchIndexClient.list_knowledge_bases` | `GET /knowledgebases?api-version=...` | `200 {"value": [...]}` (sorted by name) | — | Supported |
+| Delete knowledge base | `SearchIndexClient.delete_knowledge_base` | `DELETE /knowledgebases('{name}')?api-version=...` | `204` | `404 ResourceNotFound` | Supported |
+| Retrieve | `KnowledgeBaseRetrievalClient.retrieve` | `POST /knowledgebases('{name}')/retrieve?api-version=...` | `200 {"response": [], "activity": [], "references": []}` | `404 ResourceNotFound` (missing base) | Supported (empty response) |
+
+Request bodies are stored and echoed verbatim with an `@odata.etag` added. Sources require a non-empty `kind` (searchIndex sources additionally require `searchIndexParameters.searchIndexName`); other kinds are accepted opaquely. Bases require a non-empty `knowledgeSources` array (each entry with a non-empty `name`).
+
 ## Document management
 
 All batch operations use one route: `POST /indexes('{name}')/docs/search.index?api-version=...`.
@@ -134,6 +171,7 @@ Response body: `{"value": [{"key", "status", "statusCode", "errorMessage"}, ...]
 - Each value must be compatible with the field type (strings for `Edm.String`/`DateTimeOffset`/`Guid`; integers for `Edm.Int32`/`Int64`; numbers for `Edm.Single`/`Double`; booleans for `Edm.Boolean`; arrays of the inner type for collections).
 - `Edm.GeographyPoint` accepts the `GeoJSON` point object the SDKs send (`{"type": "Point", "coordinates": [lon, lat]}`; a third altitude element is also accepted) or a plain string.
 - `Edm.ComplexType` values must be JSON objects whose members are known subfields with type-compatible values (checked recursively). Unknown subfields are rejected; missing subfields are allowed.
+- `Edm.Collection(Edm.ComplexType)` values must be JSON arrays; each element is validated as an `Edm.ComplexType` value (known subfields, type-compatible values).
 
 ### Single-document lookup
 
@@ -263,11 +301,17 @@ Matching is case-insensitive prefix matching of the search text against the whit
 | `400` | `InvalidDocuments` | Document batch is not an array or `{"value": [...]}` object |
 | `400` | `InvalidQuery` | Search body is not a JSON object; `top`/`skip` not non-negative integers; invalid search text, filter, orderby, select, facets, or searchFields; stale or invalid continuation token; autocomplete/suggest missing `search`/`suggesterName`, empty search text, unknown suggester, or invalid `top` |
 | `400` | `InvalidSynonymMap` | Missing/empty synonym-map name, format other than `solr`, empty synonyms, malformed `synonymmaps('name')` path segment, path/body name mismatch on `PUT` |
+| `400` | `InvalidAlias` | Missing/empty alias name, missing/empty `indexes`, malformed `aliases('name')` path segment, path/body name mismatch on `PUT` |
+| `400` | `InvalidKnowledgeSource` | Missing/empty source name or `kind`, missing `searchIndexParameters.searchIndexName` for searchIndex sources, malformed `knowledgesources('name')` path segment, path/body name mismatch on `PUT` |
+| `400` | `InvalidKnowledgeBase` | Missing/empty base name, missing/empty `knowledgeSources`, malformed `knowledgebases('name')` path segment, path/body name mismatch on `PUT` |
 | `400` | `UnsupportedQuery` | Unsupported search option or `queryType` |
 | `400` | `UnsupportedAction` | Unknown document action (only `upload`, `merge`, `mergeOrUpload`, `delete` are supported) |
-| `404` | `ResourceNotFound` | Get/delete/upload/search/autocomplete/suggest/get-document on a missing index; get-document on a missing document key; get/delete on a missing synonym map |
+| `404` | `ResourceNotFound` | Get/delete/upload/search/autocomplete/suggest/get-document/retrieve on a missing index, document, synonym map, alias, knowledge source, or knowledge base |
 | `409` | `IndexAlreadyExists` | `POST /indexes` with an existing name |
 | `409` | `SynonymMapAlreadyExists` | `POST /synonymmaps` with an existing name |
+| `409` | `AliasAlreadyExists` | `POST /aliases` with an existing name |
+| `409` | `KnowledgeSourceAlreadyExists` | `POST /knowledgesources` with an existing name |
+| `409` | `KnowledgeBaseAlreadyExists` | `POST /knowledgebases` with an existing name |
 | `500` | `InternalError` | Search engine failure |
 
 ## Storage and consistency

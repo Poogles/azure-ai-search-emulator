@@ -3,6 +3,7 @@
 //! api-version, operations on a deleted index).
 
 mod admin;
+mod aliases_knowledge;
 mod common;
 mod complex_fields;
 mod document_management;

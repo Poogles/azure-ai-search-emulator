@@ -222,6 +222,132 @@ impl SynonymMap {
     }
 }
 
+/// A stored named resource (an index alias, knowledge source, or knowledge
+/// base). The raw request body is preserved and echoed back verbatim (with an
+/// `@odata.etag`) so SDK round-trips (`create` -> `get`) agree without the
+/// emulator having to model every resource's full schema.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamedResource {
+    pub name: String,
+    /// Opaque entity tag, bumped on every create or update.
+    pub etag: String,
+    raw: Value,
+}
+
+impl NamedResource {
+    /// The JSON representation returned by the resource routes: the stored
+    /// request body with an `@odata.etag` added.
+    #[must_use]
+    pub fn to_value(&self) -> Value {
+        let mut map = self.raw.as_object().cloned().unwrap_or_default();
+        map.insert("@odata.etag".to_owned(), Value::String(self.etag.clone()));
+        Value::Object(map)
+    }
+}
+
+/// Service-level storage for a collection of named resources, keyed by name
+/// (sorted), with an incrementing etag counter. Mirrors the synonym-map
+/// storage pattern.
+#[derive(Debug, Default)]
+struct ResourceStore {
+    items: std::sync::RwLock<std::collections::BTreeMap<String, NamedResource>>,
+    etags: AtomicU64,
+}
+
+impl ResourceStore {
+    fn lock_write(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, std::collections::BTreeMap<String, NamedResource>> {
+        self.items
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_read(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, std::collections::BTreeMap<String, NamedResource>> {
+        self.items
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Creates a new resource, failing if one with the same name exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::conflict`] if the name is already taken.
+    fn create(&self, name: &str, raw: &Value, code: &str) -> Result<NamedResource, ApiError> {
+        let mut items = self.lock_write();
+        if items.contains_key(name) {
+            return Err(ApiError::conflict(
+                code,
+                format!("A resource with name {name:?} already exists."),
+            ));
+        }
+        Ok(self.insert(&mut items, name, raw))
+    }
+
+    /// Creates or replaces a resource. Replacing issues a new etag.
+    fn create_or_update(&self, name: &str, raw: &Value) -> NamedResource {
+        let mut items = self.lock_write();
+        self.insert(&mut items, name, raw)
+    }
+
+    /// Returns a clone of the resource with the given name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::not_found`] if the resource does not exist.
+    fn get(&self, name: &str, kind: &str) -> Result<NamedResource, ApiError> {
+        self.lock_read()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found(format!("{kind} {name:?} was not found.")))
+    }
+
+    /// Returns clones of all resources, sorted by name.
+    #[must_use]
+    fn list(&self) -> Vec<NamedResource> {
+        self.lock_read().values().cloned().collect()
+    }
+
+    /// Deletes a resource by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::not_found`] if the resource does not exist.
+    fn delete(&self, name: &str, kind: &str) -> Result<(), ApiError> {
+        let mut items = self.lock_write();
+        if items.remove(name).is_some() {
+            Ok(())
+        } else {
+            Err(ApiError::not_found(format!(
+                "{kind} {name:?} was not found."
+            )))
+        }
+    }
+
+    fn clear(&self) {
+        self.lock_write().clear();
+    }
+
+    fn insert(
+        &self,
+        items: &mut std::collections::BTreeMap<String, NamedResource>,
+        name: &str,
+        raw: &Value,
+    ) -> NamedResource {
+        let etag = self.etags.fetch_add(1, Ordering::SeqCst).to_string();
+        let resource = NamedResource {
+            name: name.to_owned(),
+            etag,
+            raw: raw.clone(),
+        };
+        items.insert(name.to_owned(), resource.clone());
+        resource
+    }
+}
+
 /// A continuation token: the opaque `base64(json{filter, orderby, skip,
 /// state_version, vector_query_hash?})` value carried in `@odata.nextLink`
 /// and returned by the client in the `continuation` request parameter.
@@ -277,6 +403,12 @@ pub struct SearchService {
     synonym_maps: std::sync::RwLock<std::collections::BTreeMap<String, SynonymMap>>,
     /// Counter for generated synonym-map etags.
     synonym_map_etags: AtomicU64,
+    /// Service-level index aliases, keyed by name (sorted).
+    aliases: ResourceStore,
+    /// Service-level knowledge sources, keyed by name (sorted).
+    knowledge_sources: ResourceStore,
+    /// Service-level knowledge bases, keyed by name (sorted).
+    knowledge_bases: ResourceStore,
 }
 
 impl SearchService {
@@ -294,6 +426,9 @@ impl SearchService {
             state_version: AtomicU64::new(0),
             synonym_maps: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             synonym_map_etags: AtomicU64::new(0),
+            aliases: ResourceStore::default(),
+            knowledge_sources: ResourceStore::default(),
+            knowledge_bases: ResourceStore::default(),
         }
     }
 
@@ -557,6 +692,142 @@ impl SearchService {
         };
         maps.insert(name.to_owned(), map.clone());
         map
+    }
+
+    // ------------------------------------------------------------------
+    // Index aliases
+    // ------------------------------------------------------------------
+
+    /// Creates a new index alias.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::conflict`] if an alias with the same name exists.
+    pub fn create_alias(&self, name: &str, raw: &Value) -> Result<NamedResource, ApiError> {
+        self.aliases.create(name, raw, "AliasAlreadyExists")
+    }
+
+    /// Creates or replaces an index alias.
+    pub fn create_or_update_alias(&self, name: &str, raw: &Value) -> NamedResource {
+        self.aliases.create_or_update(name, raw)
+    }
+
+    /// Returns a clone of the alias with the given name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::not_found`] if the alias does not exist.
+    pub fn get_alias(&self, name: &str) -> Result<NamedResource, ApiError> {
+        self.aliases.get(name, "Alias")
+    }
+
+    /// Returns clones of all aliases, sorted by name.
+    #[must_use]
+    pub fn list_aliases(&self) -> Vec<NamedResource> {
+        self.aliases.list()
+    }
+
+    /// Deletes an alias by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::not_found`] if the alias does not exist.
+    pub fn delete_alias(&self, name: &str) -> Result<(), ApiError> {
+        self.aliases.delete(name, "Alias")
+    }
+
+    // ------------------------------------------------------------------
+    // Knowledge sources
+    // ------------------------------------------------------------------
+
+    /// Creates a new knowledge source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::conflict`] if a source with the same name exists.
+    pub fn create_knowledge_source(
+        &self,
+        name: &str,
+        raw: &Value,
+    ) -> Result<NamedResource, ApiError> {
+        self.knowledge_sources
+            .create(name, raw, "KnowledgeSourceAlreadyExists")
+    }
+
+    /// Creates or replaces a knowledge source.
+    pub fn create_or_update_knowledge_source(&self, name: &str, raw: &Value) -> NamedResource {
+        self.knowledge_sources.create_or_update(name, raw)
+    }
+
+    /// Returns a clone of the knowledge source with the given name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::not_found`] if the source does not exist.
+    pub fn get_knowledge_source(&self, name: &str) -> Result<NamedResource, ApiError> {
+        self.knowledge_sources.get(name, "Knowledge source")
+    }
+
+    /// Returns clones of all knowledge sources, sorted by name.
+    #[must_use]
+    pub fn list_knowledge_sources(&self) -> Vec<NamedResource> {
+        self.knowledge_sources.list()
+    }
+
+    /// Deletes a knowledge source by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::not_found`] if the source does not exist.
+    pub fn delete_knowledge_source(&self, name: &str) -> Result<(), ApiError> {
+        self.knowledge_sources.delete(name, "Knowledge source")
+    }
+
+    // ------------------------------------------------------------------
+    // Knowledge bases
+    // ------------------------------------------------------------------
+
+    /// Creates a new knowledge base.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::conflict`] if a base with the same name exists.
+    pub fn create_knowledge_base(
+        &self,
+        name: &str,
+        raw: &Value,
+    ) -> Result<NamedResource, ApiError> {
+        self.knowledge_bases
+            .create(name, raw, "KnowledgeBaseAlreadyExists")
+    }
+
+    /// Creates or replaces a knowledge base.
+    pub fn create_or_update_knowledge_base(&self, name: &str, raw: &Value) -> NamedResource {
+        self.knowledge_bases.create_or_update(name, raw)
+    }
+
+    /// Returns a clone of the knowledge base with the given name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::not_found`] if the base does not exist.
+    pub fn get_knowledge_base(&self, name: &str) -> Result<NamedResource, ApiError> {
+        self.knowledge_bases.get(name, "Knowledge base")
+    }
+
+    /// Returns clones of all knowledge bases, sorted by name.
+    #[must_use]
+    pub fn list_knowledge_bases(&self) -> Vec<NamedResource> {
+        self.knowledge_bases.list()
+    }
+
+    /// Deletes a knowledge base by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::not_found`] if the base does not exist.
+    pub fn delete_knowledge_base(&self, name: &str) -> Result<(), ApiError> {
+        self.knowledge_bases.delete(name, "Knowledge base")
     }
 
     /// Returns a single document by key.
@@ -1348,6 +1619,9 @@ impl SearchService {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         maps.clear();
+        self.aliases.clear();
+        self.knowledge_sources.clear();
+        self.knowledge_bases.clear();
         self.bump_state_version();
     }
 
@@ -2151,6 +2425,13 @@ fn parse_index_definition(raw: &Value) -> Result<IndexDefinition, ApiError> {
         .map_err(|message| ApiError::bad_request("InvalidIndex", message))
 }
 
+/// Whether a field type is a complex type: a single `Edm.ComplexType` object
+/// or a collection of them (`Edm.Collection(Edm.ComplexType)`). Both carry
+/// subfields and share the same validation and indexing rules.
+fn is_complex_type(field_type: &str) -> bool {
+    field_type == "Edm.ComplexType" || field_type == "Edm.Collection(Edm.ComplexType)"
+}
+
 fn validate_schema(
     definition: &IndexDefinition,
     max_vector_dimension: usize,
@@ -2166,7 +2447,7 @@ fn validate_schema(
             ));
         }
         if field.is_key {
-            if field.field_type == "Edm.ComplexType" {
+            if is_complex_type(&field.field_type) {
                 return Err(ApiError::bad_request(
                     "InvalidIndex",
                     format!(
@@ -2177,7 +2458,7 @@ fn validate_schema(
             }
             key_count += 1;
         }
-        if field.field_type == "Edm.ComplexType" {
+        if is_complex_type(&field.field_type) {
             if field.searchable || field.sortable || field.facetable {
                 return Err(ApiError::bad_request(
                     "InvalidIndex",
@@ -2514,6 +2795,9 @@ fn check_field_type(field: &FieldDefinition, value: &Value) -> Result<(), String
     if field.field_type == "Edm.ComplexType" {
         return check_complex_value(field, value);
     }
+    if field.field_type == "Edm.Collection(Edm.ComplexType)" {
+        return check_complex_collection_value(field, value);
+    }
     if field.is_vector_field() {
         return check_vector_value(field, value);
     }
@@ -2629,6 +2913,21 @@ fn check_complex_value(field: &FieldDefinition, value: &Value) -> Result<(), Str
                 )
             })?;
         check_field_type(subfield, sub_value)?;
+    }
+    Ok(())
+}
+
+/// Validates a collection-of-complex value: a JSON array whose elements are
+/// each a valid complex-type object (see [`check_complex_value`]).
+fn check_complex_collection_value(field: &FieldDefinition, value: &Value) -> Result<(), String> {
+    let items = value.as_array().ok_or_else(|| {
+        format!(
+            "Value for field {:?} must be a JSON array of objects with the subfields of the complex type.",
+            field.name
+        )
+    })?;
+    for item in items {
+        check_complex_value(field, item)?;
     }
     Ok(())
 }
