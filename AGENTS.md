@@ -12,6 +12,7 @@ Local HTTP-compatible emulator for Azure AI Search (Rust: axum + tantivy + hnsw_
 ## Commands (from repo root)
 
 - `make` / `make test` — Python SDK E2E suite (`tests/e2e` only). Fails fast if the venv is missing — run `make setup` first. The `aisearch-emulator` Docker image is built automatically on first use.
+- `make test-csharp` — C# SDK compatibility suite (xunit, .NET 10, Testcontainers). Builds the image if missing.
 - `make rust` — `cargo fmt --check`, clippy with `-D warnings`, `cargo test --all-targets`.
 - `make docker` — build the image. `make all` — rust + docker + e2e.
 - `make ms-samples` — populate the sparse `Azure/azure-sdk-for-python` submodule (required before `make test-ms`).
@@ -30,7 +31,7 @@ There is no workspace at the repo root; every cargo command needs `--manifest-pa
 - `source/rust/` — the emulator crate: `api/` (axum router), `service/`, `query/`, `filter/`, `storage/` (in-memory only; `file` mode fails fast), `vector/`, `config.rs`, `error.rs`.
 - `source/tests/python/` — e2e harness (official `azure-search-documents==12.0.0` SDK + testcontainers). `conftest.py` builds the image if missing, starts the container, and resets state before each test via `POST /admin/reset`.
 - `source/tests/python/fixtures/` — captured, sanitized SDK HTTP exchanges; the source of truth for endpoint shapes (replayed by the Phase 3 C# harness). Regenerate with `capture_fixtures.py --endpoint http://localhost:8080` against a running emulator.
-- `source/tests/csharp/` — Phase 3, empty.
+- `source/tests/csharp/` — C# xunit suite (official `Azure.Search.Documents==12.0.0` + Testcontainers, .NET 10). Run with `make test-csharp`. Uses an https:// endpoint with a test-only scheme-rewriting transport because the .NET SDK rejects plain-HTTP URLs in the client constructor.
 - `docs/supported_operations.md` — the contract matrix; every entry must be backed by a test. `docs/known_differences.md` — accepted divergences from Azure; anything not listed there that diverges is a defect.
 
 ## Conventions and gotchas

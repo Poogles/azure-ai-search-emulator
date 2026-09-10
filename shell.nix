@@ -36,6 +36,7 @@ in
       pinned.coreutils
       pinned.direnv
       pinned.docker
+      pinned.dotnet-sdk_10
       pinned.git
       pinned.pgcli
       pinned.poetry

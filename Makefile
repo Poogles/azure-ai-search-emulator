@@ -6,6 +6,7 @@
 PYTHON_DIR := source/tests/python
 VENV       := .venv
 RUST_DIR   := source/rust
+CSHARP_DIR := source/tests/csharp
 IMAGE      := aisearch-emulator
 MS_SUBMODULE := source/tests/python/ms_samples/upstream
 MS_SAMPLES_PATH := sdk/search/azure-search-documents/samples
@@ -17,6 +18,7 @@ help:
 	@echo "Azure AI Search emulator — make targets"
 	@echo ""
 	@echo "  test     Run the Python SDK E2E tests (default)"
+	@echo "  test-csharp  Run the C# SDK compatibility suite (.NET 10, xunit)"
 	@echo "  rust     Run Rust fmt, clippy, and unit/contract tests"
 	@echo "  docker   Build the emulator Docker image ($(IMAGE))"
 	@echo "  setup    Create the Python virtualenv and install dependencies"
@@ -34,6 +36,10 @@ setup:
 test:
 	@test -x $(PYTHON_DIR)/$(VENV)/bin/python || (echo "virtualenv missing — run 'make setup' first" && exit 1)
 	cd $(PYTHON_DIR) && ./$(VENV)/bin/python -m pytest tests/e2e -v
+
+.PHONY: test-csharp
+test-csharp:
+	cd $(CSHARP_DIR) && dotnet test
 
 .PHONY: ms-samples
 ms-samples:

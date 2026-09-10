@@ -5,7 +5,7 @@ status_last_reviewed: 2026-09-10
 
 # Supported Operations Matrix
 
-The contract the emulator implements. Every entry is backed by at least one contract test (`source/rust/tests/contract/`), unit test, or Python SDK e2e test (`source/tests/python/tests/e2e/`).
+The contract the emulator implements. Every entry is backed by at least one contract test (`source/rust/tests/contract/`), unit test, Python SDK e2e test (`source/tests/python/tests/e2e/`), or C# SDK test (`source/tests/csharp/`, run with `make test-csharp`).
 
 **Rule:** unsupported operations fail explicitly with a clear Azure-structured error. They are never silently approximated.
 
@@ -247,14 +247,16 @@ When more results exist beyond the returned page, the response includes `@odata.
 {
   "@odata.context": "/$metadata#documents",
   "@odata.count": 2,
-  "@search.facets": null,
+  "@search.facets": {"tags": [{"count": 2, "value": "red"}]},
   "value": [
     {"@search.score": 1.0, "id": "1", "title": "hello world"}
   ]
 }
 ```
 
-`@odata.count` is present only when `count=true`.
+`@odata.count` is present only when `count=true`. `@search.facets` is present
+only when facets were requested; it is omitted (not JSON null) otherwise, since
+an explicit null breaks the .NET SDK's `SearchResults` deserializer.
 
 ### Autocomplete and suggest
 
@@ -324,21 +326,22 @@ Matching is case-insensitive prefix matching of the search text against the whit
 
 ## Test coverage map
 
-| Capability | Contract tests | Unit tests | Python SDK/e2e |
-|------------|----------------|------------|------------|
-| Index create/get/list/update/delete | `tests/contract/index_management.rs` | `service`, `storage` | `test_emulator.py`, `tests/sdk/` |
-| Synonym map create/update/get/list/delete, auth, validation, reset | `tests/contract/synonym_maps.rs` | `service` | `tests/sdk/`, `tests/ms_samples/` (`sample_index_synonym_map_crud.py`) |
-| Document upload/merge/mergeOrUpload/delete, per-document errors, batch shapes, get-document, document count, GeographyPoint values | `tests/contract/document_management.rs` | `service` | `tests/sdk/` |
-| Search shape, count, match-all, boolean operators, empty text, searchFields, facet options (incl. `$count` via raw HTTP), analyze text, service stats, unsupported-option rejection | `tests/contract/search.rs` | `query`, `service` | `tests/sdk/`, `test_emulator.py` (`$count`) |
-| Filters, including nested complex-type paths and collection `any`/`all` | `tests/contract/filtering.rs` | `filter`, `service` | `tests/sdk/` |
-| Complex-type schema, documents, filters, collection-of-complex | `tests/contract/complex_fields.rs` | `service` | `tests/sdk/` |
-| Ordering (multi-field), projection, facets | `tests/contract/search.rs` | `service` | `tests/sdk/` |
-| Continuation tokens (nextLink, staleness) | `tests/contract/pagination.rs` | `service` | `tests/sdk/` (`by_page()`) |
-| Autocomplete, suggest (prefix match, suggester validation, auth) | `tests/contract/suggest_autocomplete.rs` | `service`, `storage` | `tests/sdk/`, `tests/ms_samples/` (`sample_query_autocomplete.py`, `sample_query_suggestions.py`) |
-| Vector search (schema, document validation, vector/hybrid, filter modes, exhaustive, dotProduct/euclidean metrics, non-retrievable, multi-query, vector+orderby) | `tests/contract/vector_search.rs` | `vector`, `service` | `tests/sdk/test_vectors.py`, `test_emulator.py` (RAG flow) |
-| Index aliases (CRUD, validation, auth, reset) | `tests/contract/aliases_knowledge.rs` | `service` | `tests/sdk/`, `tests/ms_samples/` (`sample_index_alias_crud.py`) |
-| Knowledge sources/bases + retrieval (CRUD, validation, auth, reset, empty retrieval) | `tests/contract/aliases_knowledge.rs` | `service` | `tests/sdk/`, `tests/ms_samples/` (`sample_agentic_retrieval.py`) |
-| Auth, API version, 404s, error structure | `tests/contract/errors.rs` | `version` | `test_emulator.py` |
-| Admin reset, health | `tests/contract/admin.rs` | — | `test_emulator.py` |
+| Capability | Contract tests | Unit tests | Python SDK/e2e | C# SDK (`source/tests/csharp/`) |
+|------------|----------------|------------|------------|----------------|
+| Index create/get/list/update/delete | `tests/contract/index_management.rs` | `service`, `storage` | `test_emulator.py`, `tests/sdk/` | `E2ETests`, `SdkTests.IndexCrud` |
+| Synonym map create/update/get/list/delete, auth, validation, reset | `tests/contract/synonym_maps.rs` | `service` | `tests/sdk/`, `tests/ms_samples/` (`sample_index_synonym_map_crud.py`) | `SdkTests.SynonymMapCrud` |
+| Document upload/merge/mergeOrUpload/delete, per-document errors, batch shapes, get-document, document count, GeographyPoint values | `tests/contract/document_management.rs` | `service` | `tests/sdk/` | `SdkTests` (upload/merge/delete/count), `E2ETests.UploadAndSearch` |
+| Search shape, count, match-all, boolean operators, empty text, searchFields, facet options (incl. `$count` via raw HTTP), analyze text, service stats, unsupported-option rejection | `tests/contract/search.rs` | `query`, `service` | `tests/sdk/`, `test_emulator.py` (`$count`) | `SdkTests`, `E2ETests` (incl. `$count` via raw HTTP) |
+| Filters, including nested complex-type paths and collection `any`/`all` | `tests/contract/filtering.rs` | `filter`, `service` | `tests/sdk/` | `SdkTests.SearchFilter`, `SearchCollectionAnyAll` |
+| Complex-type schema, documents, filters, collection-of-complex | `tests/contract/complex_fields.rs` | `service` | `tests/sdk/` | `SdkTests.ComplexTypeFilter`, `CollectionOfComplexType` |
+| Ordering (multi-field), projection, facets | `tests/contract/search.rs` | `service` | `tests/sdk/` | `SdkTests.SearchOrderBy`, `SearchSelect`, `SearchFacets` |
+| Continuation tokens (nextLink, staleness) | `tests/contract/pagination.rs` | `service` | `tests/sdk/` (`by_page()`) | `SdkTests.SearchPaging` (`AsPages()`) |
+| Autocomplete, suggest (prefix match, suggester validation, auth) | `tests/contract/suggest_autocomplete.rs` | `service`, `storage` | `tests/sdk/`, `tests/ms_samples/` (`sample_query_autocomplete.py`, `sample_query_suggestions.py`) | `SdkTests.SuggestAndAutocomplete` |
+| Vector search (schema, document validation, vector/hybrid, filter modes, exhaustive, dotProduct/euclidean metrics, non-retrievable, multi-query, vector+orderby) | `tests/contract/vector_search.rs` | `vector`, `service` | `tests/sdk/test_vectors.py`, `test_emulator.py` (RAG flow) | `VectorSearchTests`, `E2ETests.RagStyleVectorAndHybridFlow` |
+| Index aliases (CRUD, validation, auth, reset) | `tests/contract/aliases_knowledge.rs` | `service` | `tests/sdk/`, `tests/ms_samples/` (`sample_index_alias_crud.py`) | `SdkTests.AliasCrud` |
+| Knowledge sources/bases + retrieval (CRUD, validation, auth, reset, empty retrieval) | `tests/contract/aliases_knowledge.rs` | `service` | `tests/sdk/`, `tests/ms_samples/` (`sample_agentic_retrieval.py`) | `SdkTests.KnowledgeSourceCrud`, `KnowledgeBaseCrud`, `KnowledgeBaseRetrieveReturnsEmpty` |
+| Auth, API version, 404s, error structure | `tests/contract/errors.rs` | `version` | `test_emulator.py` | `E2ETests`, `SdkTests.ErrorBodyIsAzureStructured` |
+| Admin reset, health | `tests/contract/admin.rs` | — | `test_emulator.py` | `E2ETests.HealthEndpoint` (reset runs before each test) |
+| Wire-format compatibility (Python-captured fixtures) | — | — | `fixtures/` (captured) | `FixtureReplayTests` (replays `fixtures/`) |
 | Configuration parsing | — | `config` | — |
 | Concurrency (parallel writes/searches) | — | `service` | — |

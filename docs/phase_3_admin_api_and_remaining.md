@@ -85,11 +85,16 @@ Admin endpoints should be:
 
 ### C# compatibility
 
-- [ ] C# test project (`source/tests/csharp/`) set up and runs against the emulator image.
-- [ ] HTTP fixtures from Phase 1/2 replayed through the C# SDK successfully.
-- [ ] C# suite covers the supported-operations matrix (indexes, documents, search, filters, pagination, errors).
-- [ ] HTTP differences between Python and C# SDKs documented.
-- [ ] Emulator fixes for C#-discovered gaps landed; Python suite still green.
+- [x] C# test project (`source/tests/csharp/`) set up and runs against the emulator image (66 xunit tests, `make test-csharp`).
+- [x] HTTP fixtures from Phase 1/2 replayed through the C# SDK successfully (`FixtureReplayTests`).
+- [x] C# suite covers the supported-operations matrix (indexes, documents, search, filters, pagination, errors, vectors, knowledge).
+- [x] HTTP differences between Python and C# SDKs documented (see below).
+- [x] Emulator fixes for C#-discovered gaps landed; Python suite still green.
+
+C#-discovered HTTP differences (all addressed):
+- `@search.facets: null` (emitted when no facets requested) breaks the .NET SDK's `SearchResults` deserializer, which calls `EnumerateObject` on the value. The emulator now omits the member instead (see `docs/supported_operations.md`).
+- The .NET SDK rejects plain-HTTP endpoints in the client constructor (`AssertHttpsScheme`), unlike the Python SDK for api-key auth. The C# harness passes an https:// URL and transparently downgrades to http via a test-only `HttpPipelineTransport` (`HttpSchemeRewritingTransport`); the wire contract is unchanged.
+- Vector index fields must use the REST names `dimensions` / `vectorSearchProfile` in raw JSON (the SDK property names `vectorSearchDimensions` / `vectorSearchProfileName` are not parsed from raw payloads).
 
 ### Azure comparison
 

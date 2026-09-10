@@ -136,6 +136,6 @@ Differences fall into two categories:
 ## Not differences (deliberately Azure-compatible)
 
 - Error structure: `{"error": {"code", "message"}}` with Azure status codes (`401`, `400`, `404`, `409`, `500`).
-- Response envelopes: `@odata.context`, `@odata.count` (with `count=true`), `@search.facets: null`, `@search.score` per document, `{"value": [...]}` lists, per-document indexing results (`key`/`status`/`statusCode`/`errorMessage`).
+- Response envelopes: `@odata.context`, `@odata.count` (with `count=true`), `@search.facets` (present only when facets requested; omitted, not null, otherwise), `@search.score` per document, `{"value": [...]}` lists, per-document indexing results (`key`/`status`/`statusCode`/`errorMessage`).
 - SDK wire format: routes (`/docs/search.index`, `/docs/search.post.search`), the `{"value": [...]}` batch envelope, and top-level-spread document actions as sent by the pinned Python SDK (fixtures in `source/tests/python/fixtures/`).
 - Index-not-found (`404 ResourceNotFound`) is distinguished from an empty index (successful search with zero results).

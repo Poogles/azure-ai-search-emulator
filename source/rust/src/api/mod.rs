@@ -694,11 +694,12 @@ fn search_response(
     if query.count {
         map.insert("@odata.count".to_owned(), Value::from(outcome.total));
     }
-    let facets_value = match &outcome.facets {
-        Some(facets) => facets.clone(),
-        None => Value::Null,
-    };
-    map.insert("@search.facets".to_owned(), facets_value);
+    // Omit `@search.facets` when no facets were requested. Emitting an explicit
+    // JSON null breaks the .NET SDK's SearchResults deserializer (it calls
+    // EnumerateObject on the value); Azure omits the member.
+    if let Some(facets) = &outcome.facets {
+        map.insert("@search.facets".to_owned(), facets.clone());
+    }
     let value = outcome
         .documents
         .iter()
