@@ -136,3 +136,77 @@ def test_operations_on_deleted_index_fail(index_client, search_client, test_inde
     # search() returns a lazy paged iterator; iterate to trigger the request.
     with pytest.raises(ResourceNotFoundError):
         list(search_client.search(search_text="test", top=1))
+
+
+def test_rag_style_vector_and_hybrid_flow(index_client, search_client):
+    """RAG-style flow: text + vector fields, embedding upload, vector and
+    hybrid retrieval with ordering (never exact scores)."""
+    from azure.search.documents.indexes.models import (
+        HnswAlgorithmConfiguration,
+        HnswParameters,
+        VectorSearch,
+        VectorSearchProfile,
+    )
+    from azure.search.documents.models import VectorizedQuery
+
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchField(name="title", type=SearchFieldDataType.String, searchable=True),
+                SearchField(
+                    name="content_vector",
+                    type="Collection(Edm.Single)",
+                    searchable=True,
+                    vector_search_dimensions=3,
+                    vector_search_profile_name="cos",
+                ),
+            ],
+            vector_search=VectorSearch(
+                algorithms=[
+                    HnswAlgorithmConfiguration(
+                        name="hnsw-1",
+                        kind="hnsw",
+                        parameters=HnswParameters(metric="cosine"),
+                    ),
+                ],
+                profiles=[
+                    VectorSearchProfile(name="cos", algorithm_configuration_name="hnsw-1"),
+                ],
+            ),
+        )
+    )
+    docs = [
+        {"id": "1", "title": "azure search", "content_vector": [1.0, 0.0, 0.0]},
+        {"id": "2", "title": "azure emulators", "content_vector": [0.0, 1.0, 0.0]},
+        {"id": "3", "title": "unrelated", "content_vector": [0.0, 0.0, 1.0]},
+    ]
+    results = search_client.upload_documents(documents=docs)
+    assert all(r.succeeded for r in results)
+
+    # Vector-only retrieval: nearest first.
+    found = list(
+        search_client.search(
+            vector_queries=[
+                VectorizedQuery(
+                    vector=[1.0, 0.0, 0.0], k_nearest_neighbors=2, fields="content_vector"
+                )
+            ]
+        )
+    )
+    assert [doc["id"] for doc in found] == ["1", "2"]
+
+    # Hybrid retrieval: union of the full-text ("azure" → 1, 2) and vector
+    # ([0,0,1] → 3) sides.
+    found = list(
+        search_client.search(
+            search_text="azure",
+            vector_queries=[
+                VectorizedQuery(
+                    vector=[0.0, 0.0, 1.0], k_nearest_neighbors=1, fields="content_vector"
+                )
+            ],
+        )
+    )
+    assert {doc["id"] for doc in found} == {"1", "2", "3"}

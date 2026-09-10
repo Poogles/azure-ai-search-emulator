@@ -13,3 +13,4 @@ mod pagination;
 mod search;
 mod suggest_autocomplete;
 mod synonym_maps;
+mod vector_search;

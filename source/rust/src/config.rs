@@ -6,6 +6,9 @@ use std::fmt;
 pub const DEFAULT_PORT: u16 = 8080;
 pub const DEFAULT_API_VERSION: &str = "2024-07-01";
 pub const DEFAULT_LOG_LEVEL: &str = "info";
+/// Default cap on accepted vector dimensions (matches Azure's limit;
+/// lowerable for memory-constrained CI via `EMULATOR_VECTOR__MAX_DIMENSION`).
+pub const DEFAULT_VECTOR_MAX_DIMENSION: usize = 3072;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageMode {
@@ -30,6 +33,7 @@ pub struct Config {
     pub api_versions: Vec<String>,
     pub log_level: String,
     pub enable_admin: bool,
+    pub max_vector_dimension: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +42,7 @@ pub enum ConfigError {
     InvalidStorageMode(String),
     InvalidApiVersions(String),
     InvalidBool(String),
+    InvalidMaxVectorDimension(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -54,6 +59,9 @@ impl fmt::Display for ConfigError {
                 write!(f, "invalid EMULATOR_API_VERSIONS value: {v:?}")
             }
             ConfigError::InvalidBool(v) => write!(f, "invalid boolean value: {v}"),
+            ConfigError::InvalidMaxVectorDimension(v) => {
+                write!(f, "invalid EMULATOR_VECTOR__MAX_DIMENSION value: {v:?}")
+            }
         }
     }
 }
@@ -126,12 +134,22 @@ impl Config {
             }
         };
 
+        let max_vector_dimension = match get("EMULATOR_VECTOR__MAX_DIMENSION") {
+            None => DEFAULT_VECTOR_MAX_DIMENSION,
+            Some(raw) => raw
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or(ConfigError::InvalidMaxVectorDimension(raw))?,
+        };
+
         Ok(Config {
             port,
             storage_mode,
             api_versions,
             log_level,
             enable_admin,
+            max_vector_dimension,
         })
     }
 
@@ -176,6 +194,7 @@ mod tests {
         assert_eq!(config.api_versions, vec![DEFAULT_API_VERSION.to_owned()]);
         assert_eq!(config.log_level, DEFAULT_LOG_LEVEL);
         assert!(config.enable_admin);
+        assert_eq!(config.max_vector_dimension, DEFAULT_VECTOR_MAX_DIMENSION);
         assert!(config.supports_api_version("2024-07-01"));
         assert!(!config.supports_api_version("1900-01-01"));
     }
@@ -207,6 +226,20 @@ mod tests {
         ]));
         assert_eq!(config.port, DEFAULT_PORT);
         assert!(config.enable_admin);
+    }
+
+    #[test]
+    fn vector_max_dimension_override() {
+        let config = ok(from_pairs(&[("EMULATOR_VECTOR__MAX_DIMENSION", "128")]));
+        assert_eq!(config.max_vector_dimension, 128);
+        assert!(matches!(
+            err(from_pairs(&[("EMULATOR_VECTOR__MAX_DIMENSION", "0")])),
+            ConfigError::InvalidMaxVectorDimension(_)
+        ));
+        assert!(matches!(
+            err(from_pairs(&[("EMULATOR_VECTOR__MAX_DIMENSION", "huge")])),
+            ConfigError::InvalidMaxVectorDimension(_)
+        ));
     }
 
     #[test]

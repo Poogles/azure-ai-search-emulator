@@ -20,6 +20,11 @@ serde_json = "1"
 # (which fails to link in the Nix build environment). Only pure-Rust features
 # needed for the English text analyzer are enabled.
 tantivy = { version = "0.26", default-features = false, features = ["mmap", "stopwords", "stemmer"] }
+# Pure-Rust HNSW approximate-nearest-neighbour index for vector search. The
+# `simdeez_f` feature enables SIMD distance kernels when built with
+# `RUSTFLAGS=-C target-cpu=native`; it is opt-in and not required for
+# correctness (see docs/decisions/0004-vector-index.md).
+hnsw_rs = { version = "0.3", features = ["simdeez_f"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

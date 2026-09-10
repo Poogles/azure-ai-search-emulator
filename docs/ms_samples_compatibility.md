@@ -1,6 +1,6 @@
 ---
 status: complete
-status_last_reviewed: 2026-09-09
+status_last_reviewed: 2026-09-10
 ---
 
 # Microsoft Reference-Samples Compatibility Probe
@@ -350,11 +350,15 @@ both `searchFields` / `sourceFields`.
       REST docs). Expect the currently-passing 10 to wobble; fix regressions
       first (new `KNOWN_ISSUES` `gap` pins only for genuine new divergences).
 - [ ] Triage the newly-runnable samples into new emulator gaps vs new
-      external-service skips. Expected new gaps: index aliases, semantic
-      query, vector query (see `phase_2_1_vector_indexing.md`), knowledge
-      base/source CRUD, agentic retrieval. Expected permanently unrunnable
-      here: the Fabric/ontology/file/freshness/MCP/WorkIQ knowledge-source
-      samples, which point at live external data.
+      external-service skips. Vector search is now implemented (Phase 2.1,
+      see `phase_2_1_vector_indexing.md`), so `sample_query_vector.py` is
+      expected to pass — triage only for genuine divergences (e.g. an
+      unsupported metric or the inert `stored` property). Expected new gaps:
+      index aliases, semantic query (`sample_query_semantic.py` — `semantic`
+      is rejected with `400 UnsupportedQuery`; semantic search is out of
+      scope), knowledge base/source CRUD, agentic retrieval. Expected
+      permanently unrunnable here: the Fabric/ontology/file/freshness/MCP/
+      WorkIQ knowledge-source samples, which point at live external data.
 - [ ] Update `docs/supported_operations.md` (SDK version under test) and this
       document (state table, pinned wire notes).
 - [ ] Run `make test-ms` to confirm.

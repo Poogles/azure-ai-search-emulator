@@ -168,6 +168,78 @@ def main() -> None:
     # Delete index
     index_client.delete_index(INDEX_NAME)
 
+    # Vector flow (Phase 2.1): a second index exercising the vector
+    # wire format for Phase 3 C# replay.
+    from azure.search.documents.indexes.models import (
+        HnswAlgorithmConfiguration,
+        HnswParameters,
+        VectorSearch,
+        VectorSearchProfile,
+    )
+    from azure.search.documents.models import VectorizedQuery
+
+    vector_client = SearchClient(
+        endpoint=args.endpoint,
+        index_name="fixture-vector-index",
+        credential=CREDENTIAL,
+        api_version=API_VERSION,
+        transport=transport,
+    )
+    index_client.create_index(
+        SearchIndex(
+            name="fixture-vector-index",
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchField(name="title", type=SearchFieldDataType.String, searchable=True),
+                SearchField(
+                    name="content_vector",
+                    type="Collection(Edm.Single)",
+                    searchable=True,
+                    vector_search_dimensions=3,
+                    vector_search_profile_name="cos",
+                ),
+            ],
+            vector_search=VectorSearch(
+                algorithms=[
+                    HnswAlgorithmConfiguration(
+                        name="hnsw-1",
+                        kind="hnsw",
+                        parameters=HnswParameters(m=4, metric="cosine"),
+                    ),
+                ],
+                profiles=[
+                    VectorSearchProfile(name="cos", algorithm_configuration_name="hnsw-1"),
+                ],
+            ),
+        )
+    )
+    vector_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "hello world", "content_vector": [1.0, 0.0, 0.0]},
+            {"id": "2", "title": "foo bar", "content_vector": [0.0, 1.0, 0.0]},
+        ]
+    )
+    list(
+        vector_client.search(
+            vector_queries=[
+                VectorizedQuery(
+                    vector=[1.0, 0.0, 0.0], k_nearest_neighbors=1, fields="content_vector"
+                )
+            ]
+        )
+    )
+    list(
+        vector_client.search(
+            search_text="hello",
+            vector_queries=[
+                VectorizedQuery(
+                    vector=[0.0, 1.0, 0.0], k_nearest_neighbors=1, fields="content_vector"
+                )
+            ],
+        )
+    )
+    index_client.delete_index("fixture-vector-index")
+
     transport.close()
 
     # Write sanitized fixtures

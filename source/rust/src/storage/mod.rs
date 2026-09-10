@@ -16,6 +16,15 @@ pub struct FieldDefinition {
     pub sortable: bool,
     pub facetable: bool,
     pub retrievable: bool,
+    /// Declared vector dimensions (`dimensions`, or the SDK alias
+    /// `vector_search_dimensions`). `Some` only when the property is present
+    /// and a positive integer; the service layer validates range and
+    /// consistency (using [`FieldDefinition::raw`] to distinguish "present
+    /// but invalid" from "absent").
+    pub vector_dimensions: Option<usize>,
+    /// The `vectorSearchProfile` name (`vector_search_profile_name` SDK
+    /// alias accepted).
+    pub vector_search_profile: Option<String>,
     /// Subfields of an `Edm.ComplexType` field; empty for all other types.
     pub subfields: Vec<FieldDefinition>,
     /// The raw JSON field definition, preserved for echo in responses.
@@ -49,9 +58,27 @@ impl FieldDefinition {
                 subfields.push(FieldDefinition::from_json(subfield.clone())?);
             }
         }
+        // Vector markers: `dimensions` (SDK alias `vector_search_dimensions`)
+        // and `vectorSearchProfile` (SDK alias `vector_search_profile_name`).
+        // Parsed leniently here; the service layer validates range and
+        // consistency and reports `400 InvalidIndex` diagnostics.
+        let vector_dimensions = obj
+            .get("dimensions")
+            .or_else(|| obj.get("vector_search_dimensions"))
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| *n > 0);
+        let vector_search_profile = obj
+            .get("vectorSearchProfile")
+            .or_else(|| obj.get("vector_search_profile_name"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
         Ok(FieldDefinition {
             name: name.to_owned(),
             field_type: normalize_field_type(field_type),
+            vector_dimensions,
+            vector_search_profile,
             is_key: obj.get("key").and_then(Value::as_bool).unwrap_or(false),
             searchable: obj
                 .get("searchable")
@@ -76,6 +103,26 @@ impl FieldDefinition {
             subfields,
             raw,
         })
+    }
+
+    /// Whether this field is a vector field: `Collection(Edm.Single)` with
+    /// declared `dimensions`. Fields merely *attempting* to be vector fields
+    /// (e.g. `dimensions` present but invalid, or a profile without
+    /// dimensions) are caught by service-level schema validation.
+    #[must_use]
+    pub fn is_vector_field(&self) -> bool {
+        self.field_type == "Edm.Collection(Edm.Single)" && self.vector_dimensions.is_some()
+    }
+
+    /// Whether the raw definition carries a `dimensions` property (under
+    /// either the REST or SDK key), even when its value is invalid. Used by
+    /// schema validation to report precise `400 InvalidIndex` errors.
+    #[must_use]
+    pub fn has_dimensions_property(&self) -> bool {
+        let Some(obj) = self.raw.as_object() else {
+            return false;
+        };
+        obj.contains_key("dimensions") || obj.contains_key("vector_search_dimensions")
     }
 }
 
@@ -156,6 +203,11 @@ pub struct IndexDefinition {
     /// Suggesters declared on the index; used by the autocomplete and suggest
     /// operations.
     pub suggesters: Vec<Suggester>,
+    /// The raw `vectorSearch` object (`vector_search` SDK alias accepted),
+    /// when present. Parsed and validated by the service layer (via the
+    /// `vector` module); preserved here so the vector engine can build its
+    /// per-field indexes from the stored definition.
+    pub vector_search: Option<Value>,
     /// The raw JSON index definition, preserved for echo in responses.
     pub raw: Value,
 }
@@ -193,10 +245,15 @@ impl IndexDefinition {
                 suggesters.push(Suggester::from_json(suggester)?);
             }
         }
+        let vector_search = obj
+            .get("vectorSearch")
+            .or_else(|| obj.get("vector_search"))
+            .cloned();
         Ok(IndexDefinition {
             name: name.to_owned(),
             fields,
             suggesters,
+            vector_search,
             raw,
         })
     }

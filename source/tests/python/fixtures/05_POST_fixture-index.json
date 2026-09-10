@@ -1,0 +1,18 @@
+{
+  "method": "POST",
+  "url": "http://<endpoint>/indexes?api-version=2024-07-01",
+  "headers": {
+    "Content-Type": "application/json",
+    "Content-Length": "497",
+    "api-key": "fixture-key",
+    "Accept": "application/json;odata.metadata=minimal",
+    "User-Agent": "<user-agent>"
+  },
+  "request_body": "{\"name\": \"fixture-vector-index\", \"fields\": [{\"name\": \"id\", \"type\": \"Edm.String\", \"key\": true}, {\"name\": \"title\", \"type\": \"Edm.String\", \"searchable\": true}, {\"name\": \"content_vector\", \"type\": \"Collection(Edm.Single)\", \"searchable\": true, \"dimensions\": 3, \"vectorSearchProfile\": \"cos\"}], \"vectorSearch\": {\"profiles\": [{\"name\": \"cos\", \"algorithm\": \"hnsw-1\"}], \"algorithms\": [{\"name\": \"hnsw-1\", \"kind\": \"hnsw\", \"hnswParameters\": {\"m\": 4, \"efConstruction\": 400, \"efSearch\": 500, \"metric\": \"cosine\"}}]}}",
+  "status_code": 201,
+  "response_headers": {
+    "content-type": "application/json",
+    "content-length": "453"
+  },
+  "response_body": "{\"fields\":[{\"key\":true,\"name\":\"id\",\"type\":\"Edm.String\"},{\"name\":\"title\",\"searchable\":true,\"type\":\"Edm.String\"},{\"dimensions\":3,\"name\":\"content_vector\",\"searchable\":true,\"type\":\"Collection(Edm.Single)\",\"vectorSearchProfile\":\"cos\"}],\"name\":\"fixture-vector-index\",\"vectorSearch\":{\"algorithms\":[{\"hnswParameters\":{\"efConstruction\":400,\"efSearch\":500,\"m\":4,\"metric\":\"cosine\"},\"kind\":\"hnsw\",\"name\":\"hnsw-1\"}],\"profiles\":[{\"algorithm\":\"hnsw-1\",\"name\":\"cos\"}]}}"
+}

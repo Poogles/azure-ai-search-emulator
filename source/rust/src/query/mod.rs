@@ -459,7 +459,9 @@ fn collect_searchable(
         };
         if field.field_type == "Edm.ComplexType" {
             collect_searchable(builder, searchable, &path, &field.subfields);
-        } else if field.searchable {
+        } else if field.searchable && !field.is_vector_field() {
+            // Vector fields require `searchable: true` per Azure but are not
+            // full-text indexed (their values are numeric arrays).
             let tantivy_field = builder.add_text_field(&path, TEXT);
             searchable.push((path, tantivy_field));
         }
@@ -558,6 +560,8 @@ mod tests {
                 sortable: false,
                 facetable: false,
                 retrievable: true,
+                vector_dimensions: None,
+                vector_search_profile: None,
                 subfields: Vec::new(),
                 raw: Value::Null,
             },
@@ -570,6 +574,8 @@ mod tests {
                 sortable: false,
                 facetable: false,
                 retrievable: true,
+                vector_dimensions: None,
+                vector_search_profile: None,
                 subfields: Vec::new(),
                 raw: Value::Null,
             },
@@ -582,6 +588,8 @@ mod tests {
                 sortable: false,
                 facetable: false,
                 retrievable: true,
+                vector_dimensions: None,
+                vector_search_profile: None,
                 subfields: Vec::new(),
                 raw: Value::Null,
             },
@@ -594,6 +602,8 @@ mod tests {
                 sortable: true,
                 facetable: false,
                 retrievable: true,
+                vector_dimensions: None,
+                vector_search_profile: None,
                 subfields: Vec::new(),
                 raw: Value::Null,
             },

@@ -14,6 +14,7 @@ use crate::config::Config;
 use crate::error::ApiError;
 use crate::query::SearchEngine;
 use crate::service::{ActionKind, DocumentAction, SearchOutcome, SearchService};
+use crate::vector::VectorEngine;
 use crate::version::VersionAdapter;
 
 #[derive(Clone)]
@@ -27,9 +28,16 @@ impl AppState {
     #[must_use]
     pub fn new(config: Config, storage: Arc<dyn crate::storage::Storage>) -> Self {
         let engine = Arc::new(SearchEngine::new());
+        let vectors = Arc::new(VectorEngine::new());
         let versions = VersionAdapter::new(config.api_versions.clone());
+        let max_vector_dimension = config.max_vector_dimension;
         Self {
-            service: Arc::new(SearchService::new(storage, engine)),
+            service: Arc::new(SearchService::new(
+                storage,
+                engine,
+                vectors,
+                max_vector_dimension,
+            )),
             config,
             versions,
         }
@@ -497,7 +505,10 @@ fn search_response(
         .iter()
         .map(|doc| {
             let mut entry = Map::new();
-            entry.insert("@search.score".to_owned(), json!(1.0));
+            // Vector and hybrid searches carry per-document scores; plain
+            // full-text searches default to 1.0.
+            let score = outcome.scores.get(&doc.key).copied().unwrap_or(1.0);
+            entry.insert("@search.score".to_owned(), json!(score));
             for (key, value) in &doc.fields {
                 if query.select.is_empty() || query.select.iter().any(|s| s == key) {
                     entry.insert(key.clone(), value.clone());

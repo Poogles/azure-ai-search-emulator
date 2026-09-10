@@ -102,7 +102,7 @@ Everything below implements that matrix. Unsupported operations must fail explic
 - Full admin API surface (Phase 3; `POST /admin/reset` already available from Phase 1).
 - C# SDK compatibility (Phase 3; HTTP fixtures are captured in this phase for C# replay).
 - Azure comparison test suite (Phase 3).
-- Vector/semantic search, suggest, scoring profiles — unless the operations matrix requires them.
+- Semantic search, suggest, scoring profiles — unless the operations matrix requires them. (Vector search was descoped here and is now covered by Phase 2.1, `docs/phase_2_1_vector_indexing.md`.)
 
 ## Deliverables
 

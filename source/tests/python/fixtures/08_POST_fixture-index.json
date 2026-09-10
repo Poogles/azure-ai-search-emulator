@@ -1,0 +1,18 @@
+{
+  "method": "POST",
+  "url": "http://<endpoint>/indexes('fixture-vector-index')/docs/search.post.search?api-version=2024-07-01",
+  "headers": {
+    "Content-Type": "application/json",
+    "Content-Length": "121",
+    "api-key": "fixture-key",
+    "Accept": "application/json;odata.metadata=none",
+    "User-Agent": "<user-agent>"
+  },
+  "request_body": "{\"search\": \"hello\", \"vectorQueries\": [{\"kind\": \"vector\", \"k\": 1, \"fields\": \"content_vector\", \"vector\": [0.0, 1.0, 0.0]}]}",
+  "status_code": 200,
+  "response_headers": {
+    "content-type": "application/json",
+    "content-length": "237"
+  },
+  "response_body": "{\"@odata.context\":\"/$metadata#documents\",\"@search.facets\":null,\"value\":[{\"@search.score\":1.0,\"content_vector\":[1.0,0.0,0.0],\"id\":\"1\",\"title\":\"hello world\"},{\"@search.score\":1.0,\"content_vector\":[0.0,1.0,0.0],\"id\":\"2\",\"title\":\"foo bar\"}]}"
+}

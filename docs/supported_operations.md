@@ -50,6 +50,33 @@ Everything else (e.g. `Edm.Vector(...)`, `Edm.Collection(Edm.ComplexType)`, `Edm
 
 Field attributes (`searchable`, `filterable`, `sortable`, `facetable`, `retrievable`) are parsed, stored, and echoed. `searchable` controls full-text indexing; `filterable`, `sortable`, and `facetable` gate the corresponding query options (a field used in `filter`/`orderby`/`facets` must carry the matching attribute, else `400 InvalidQuery`). Collection types may be written with or without the `Edm.` prefix (`Collection(Edm.String)` as sent by the SDK, or `Edm.Collection(Edm.String)`); both are accepted and normalized.
 
+### Vector fields (Phase 2.1)
+
+Vector fields use the Azure wire format — the dimension is a separate property, not part of the type string:
+
+```json
+{
+  "name": "content_vector",
+  "type": "Collection(Edm.Single)",
+  "searchable": true,
+  "retrievable": true,
+  "dimensions": 1536,
+  "vectorSearchProfile": "my-vector-profile"
+}
+```
+
+Rules (rejected with `400 InvalidIndex`):
+
+- `type` must be `Collection(Edm.Single)` (both SDK and REST spellings accepted). Quantized types (`Collection(Edm.Half)`, `...Int8`, etc.) are rejected.
+- `dimensions` is required: a positive integer, 1–3072 (cap lowerable via `EMULATOR_VECTOR__MAX_DIMENSION`).
+- `vectorSearchProfile` is required and must reference a profile in the index's `vectorSearch.profiles` array.
+- `searchable` must be `true`; the field must not be `key`, `filterable`, `sortable`, or `facetable`.
+- `retrievable` may be `true` or `false` (default `true`); `retrievable: false` vectors are searchable but omitted from search responses unless explicitly selected (same as Azure). `stored` is accepted but inert.
+- Up to 16 vector fields per index.
+- The index must include a `vectorSearch` object with at least one algorithm entry and at least one profile entry when vector fields are present. Supported algorithm `kind`s: `hnsw` (HNSW graph; `hnswParameters`: `m`, `efConstruction`, `efSearch`, `metric`) and `exhaustiveKnn` (brute-force scan; `exhaustiveKnnParameters`: `metric`). Supported `metric`s: `cosine`, `dotProduct`, `euclidean`. A missing kind-specific parameters object falls back to defaults (`m: 4`, `efConstruction: 400`, `efSearch: 500`, `metric: cosine`). `dotProduct` always executes as an exact scan regardless of `kind` (raw inner products cannot back an HNSW graph); small cosine/euclidean indexes scan exactly too, with the graph engaging above the `ef` window (see `docs/decisions/0004-vector-index.md`).
+
+Document validation: a vector field value must be a JSON array of numbers with exactly the declared number of finite values (integers accepted, stored as `f32`); violations produce a per-document `400` in the batch response.
+
 ## Synonym maps
 
 Service-level resource (not scoped to an index). Synonym maps are stored and echoed but **inert**: they do not affect search results (see `docs/known_differences.md`).
@@ -135,16 +162,19 @@ Route: `POST /indexes('{name}')/docs/search.post.search?api-version=...`.
 | Search modes | `search_mode=` | Unsupported (explicit `400 UnsupportedQuery`; AND semantics are fixed) |
 | Highlighting | `highlight_fields=`, pre/post tags | Unsupported (explicit) |
 | Scoring profiles / parameters / statistics | `scoring_profile=`, ... | Unsupported (explicit) |
-| Semantic / vector queries | `semantic=`, `vector_queries=`, ... | Unsupported (explicit) |
+| Semantic queries | `semantic=`, ... | Unsupported (explicit) |
+| Vector queries | `vector_queries=[VectorizedQuery(vector=..., fields=..., k_nearest_neighbors=..., exhaustive=...)]` | Supported (raw-vector kNN; `kind: "text"` vectorizer queries rejected with `400 UnsupportedQuery`) |
+| Vector + full-text hybrid | `search_text=` + `vector_queries=` together | Supported (union of both sides, best score wins; see Known differences) |
+| Vector filter mode | `vector_filter_mode=` (`preFilter`/`postFilter`) + top-level `filter=` | Supported (`postFilter` default; per-query `exhaustive=` supported; `weight=` accepted but inert) |
 | Suggest | `SearchClient.suggest(search_text=..., suggester_name=...)` (`/docs/search.post.suggest`) | Supported (prefix match against the suggester's fields; returns documents + `@search.text`) |
 | Autocomplete | `SearchClient.autocomplete(search_text=..., suggester_name=...)` (`/docs/search.post.autocomplete`) | Supported (prefix match against the suggester's fields; returns `text` + `queryPlusText`) |
 | Analyze text | `SearchIndexClient.analyze_text(...)` (`/search.analyze`) | Supported (Tantivy default analyzer; `analyzerName`/`field` accepted but inert) |
 | Service statistics | `SearchIndexClient.get_service_statistics()` (`/servicestats`) | Supported (static response: zero counters, default limits) |
 | `queryType` other than `simple` | — | Unsupported (explicit) |
 
-The full list of search options rejected with `400 UnsupportedQuery`: `searchMode`, `highlight`, `highlightPreTag`, `highlightPostTag`, `scoringProfile`, `scoringParameters`, `scoringStatistics`, `minimumCoverage`, `answers`, `captions`, `semanticConfiguration`, `semanticQuery`, `semanticErrorHandling`, `semanticMaxWaitInMilliseconds`, `vectorQueries`, `vectorFilterMode`, `debug`.
+The full list of search options rejected with `400 UnsupportedQuery`: `searchMode`, `highlight`, `highlightPreTag`, `highlightPostTag`, `scoringProfile`, `scoringParameters`, `scoringStatistics`, `minimumCoverage`, `answers`, `captions`, `semantic`, `semanticConfiguration`, `semanticQuery`, `semanticErrorHandling`, `semanticMaxWaitInMilliseconds`, `debug`.
 
-Accepted but inert (silently ignored): `sessionId` (the emulator uses deterministic ordering and constant scoring, so session affinity is irrelevant).
+Accepted but inert (silently ignored): `sessionId` (the emulator uses deterministic ordering, so session affinity is irrelevant), per-query `weight` (no weighted fusion; hybrid is union + max-score), and the index-schema `stored` property (no separate stored/retrievable enforcement beyond `retrievable`).
 
 ### Filter
 
@@ -158,7 +188,7 @@ OData `$filter` with `and` / `or` / `not`, parentheses, `eq` / `ne` / `gt` / `ge
 
 ### Continuation tokens
 
-When more results exist beyond the returned page, the response includes `@odata.nextLink` (a URL with a `continuation` parameter) and `@search.nextPageParameters` (the next request: original body plus `continuation`, with `skip` advanced). The token is `base64(json{filter, orderby, skip, state_version})`; `state_version` is incremented on every document mutation, and a stale token (index changed since issuance) returns `400 InvalidQuery`. An invalid token also returns `400 InvalidQuery`. The pinned SDK drops unknown properties when re-POSTing `nextPageParameters`, so paging state is additionally carried in the first-class `skip` property; SDK paging works, but staleness detection applies only when `continuation` is preserved.
+When more results exist beyond the returned page, the response includes `@odata.nextLink` (a URL with a `continuation` parameter) and `@search.nextPageParameters` (the next request: original body plus `continuation`, with `skip` advanced). The token is `base64(json{filter, orderby, skip, state_version, vector_query_hash?})`; `state_version` is incremented on every document mutation, and a stale token (index changed since issuance) returns `400 InvalidQuery`. An invalid token also returns `400 InvalidQuery`. When `vectorQueries` is present, the token additionally binds the `vectorQueries` + `vectorFilterMode` identity; changing them mid-paging returns `400 InvalidQuery`. The pinned SDK drops unknown properties when re-POSTing `nextPageParameters`, so paging state is additionally carried in the first-class `skip` property; SDK paging works, but staleness detection applies only when `continuation` is preserved.
 
 ### Search semantics
 
@@ -167,7 +197,8 @@ When more results exist beyond the returned page, the response includes `@odata.
 - A multi-term search matches a document when **every** required analyzer token matches at least one searchable string field (AND semantics).
 - Simple-query boolean operators: `+term` (required, the default), `-term` (excluded), and `"quoted phrases"` (adjacent tokens). An exclusion-only query matches all documents except the excluded ones.
 - Non-string fields are not full-text indexed; searching for a value that only appears in a numeric/boolean field matches nothing.
-- Results are ordered by key field (deterministic), not by relevance. `@search.score` is `1.0` for all results. See `docs/known_differences.md`.
+- Results are ordered by key field (deterministic), not by relevance. `@search.score` is `1.0` for all full-text results. See `docs/known_differences.md`.
+- When `vectorQueries` is present (and no `orderby`), results are ordered by vector score descending with the key field as tie-breaker. `@search.score` is the similarity score for the query's metric: cosine similarity for `cosine`, the raw inner product for `dotProduct`, `1/(1+l2)` for `euclidean`. Hybrid (vector + full-text) results are the union of both sides, scored by the best (highest) score. `top`/`skip`/`count` apply to the merged set.
 - Newly indexed documents are immediately searchable (synchronous commit + reader reload per batch).
 - Matching is capped at 1,000,000 documents per search (local test-double scale).
 

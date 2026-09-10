@@ -2,6 +2,7 @@
 //! merge-or-upload, delete), and search (full-text, filter, ordering,
 //! projection, facets, paging with continuation tokens).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -15,6 +16,7 @@ use crate::query::{parse_search_text, FullTextQuery, QueryError, SearchEngine};
 use crate::storage::{
     Document, FieldDefinition, IndexDefinition, Storage, StorageError, Suggester,
 };
+use crate::vector::{parse_vector_search, vector_query_hash, VectorEngine};
 
 /// Field types accepted by the schema validator.
 const SUPPORTED_FIELD_TYPES: &[&str] = &[
@@ -101,7 +103,49 @@ pub struct SearchQuery {
     pub facets: Vec<Facet>,
     pub search_fields: Vec<String>,
     pub continuation: Option<String>,
+    /// Parsed `vectorQueries` entries (wire shape; SDK key aliases already
+    /// resolved).
+    pub vector_queries: Vec<VectorQuery>,
+    /// The raw `vectorQueries` array, preserved to bind continuation tokens
+    /// to the vector query identity.
+    pub vector_queries_raw: Option<Value>,
+    pub vector_filter_mode: VectorFilterMode,
 }
+
+/// One parsed `vectorQueries[]` entry: a raw-vector kNN query over one or
+/// more vector fields. `weight` is accepted but inert (no weighted fusion;
+/// see `docs/known_differences.md`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorQuery {
+    pub fields: Vec<String>,
+    pub vector: Vec<f32>,
+    pub k: usize,
+    pub exhaustive: bool,
+}
+
+/// The top-level `vectorFilterMode`: `postFilter` (default) retrieves top-k
+/// by similarity then applies `filter`; `preFilter` constrains candidates to
+/// `filter` matches before top-k.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VectorFilterMode {
+    #[default]
+    PostFilter,
+    PreFilter,
+}
+
+impl VectorFilterMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VectorFilterMode::PostFilter => "postFilter",
+            VectorFilterMode::PreFilter => "preFilter",
+        }
+    }
+}
+
+/// A document-key predicate for `preFilter` vector search: whether the
+/// document with the given key matches the top-level filter.
+type KeyPredicate<'a> = Box<dyn Fn(&str) -> bool + 'a>;
 
 /// One `facets` entry: a field (or the special `$count`) with an optional
 /// limit on the number of returned facet values (`count:N` / `top:N`).
@@ -123,6 +167,9 @@ pub struct OrderBy {
 pub struct SearchOutcome {
     pub total: u64,
     pub documents: Vec<Document>,
+    /// Per-document `@search.score` values keyed by document key. Absent
+    /// keys default to `1.0` (the full-text-only score).
+    pub scores: BTreeMap<String, f32>,
     /// The `@search.facets` object, when facets were requested.
     pub facets: Option<Value>,
     /// Whether more results exist beyond the returned page.
@@ -176,14 +223,18 @@ impl SynonymMap {
 }
 
 /// A continuation token: the opaque `base64(json{filter, orderby, skip,
-/// state_version})` value carried in `@odata.nextLink` and returned by the
-/// client in the `continuation` request parameter.
+/// state_version, vector_query_hash?})` value carried in `@odata.nextLink`
+/// and returned by the client in the `continuation` request parameter.
+/// `vector_query_hash` binds the token to the `vectorQueries` +
+/// `vectorFilterMode` identity when vector search is active.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContinuationToken {
     pub filter: Option<String>,
     pub orderby: Option<String>,
     pub skip: u64,
     pub state_version: u64,
+    #[serde(default)]
+    pub vector_query_hash: Option<u64>,
 }
 
 impl ContinuationToken {
@@ -214,6 +265,10 @@ impl ContinuationToken {
 pub struct SearchService {
     storage: Arc<dyn Storage>,
     engine: Arc<SearchEngine>,
+    vectors: Arc<VectorEngine>,
+    /// Cap on accepted vector dimensions (`EMULATOR_VECTOR__MAX_DIMENSION`,
+    /// default 3072).
+    max_vector_dimension: usize,
     /// Monotonically increasing counter incremented on every document
     /// mutation; embedded in continuation tokens so stale tokens can be
     /// detected.
@@ -225,10 +280,17 @@ pub struct SearchService {
 }
 
 impl SearchService {
-    pub fn new(storage: Arc<dyn Storage>, engine: Arc<SearchEngine>) -> Self {
+    pub fn new(
+        storage: Arc<dyn Storage>,
+        engine: Arc<SearchEngine>,
+        vectors: Arc<VectorEngine>,
+        max_vector_dimension: usize,
+    ) -> Self {
         Self {
             storage,
             engine,
+            vectors,
+            max_vector_dimension,
             state_version: AtomicU64::new(0),
             synonym_maps: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             synonym_map_etags: AtomicU64::new(0),
@@ -259,7 +321,7 @@ impl SearchService {
     /// unsupported field types, or an index with the same name already exists.
     pub fn create_index(&self, raw: &Value) -> Result<Value, ApiError> {
         let definition = parse_index_definition(raw)?;
-        validate_schema(&definition)?;
+        validate_schema(&definition, self.max_vector_dimension)?;
         match self.storage.create_index(&definition) {
             Ok(()) => {
                 if let Err(e) = self
@@ -271,6 +333,11 @@ impl SearchService {
                     // storage/engine divergence.
                     self.storage.delete_index(&definition.name);
                     return Err(engine_error(&definition.name, e));
+                }
+                if let Err(message) = self.create_vector_indexes(&definition) {
+                    self.storage.delete_index(&definition.name);
+                    self.engine.delete_index(&definition.name);
+                    return Err(ApiError::bad_request("InvalidIndex", message));
                 }
                 Ok(definition.raw.clone())
             }
@@ -294,7 +361,7 @@ impl SearchService {
     /// uses unsupported field types.
     pub fn create_or_update_index(&self, raw: &Value) -> Result<Value, ApiError> {
         let definition = parse_index_definition(raw)?;
-        validate_schema(&definition)?;
+        validate_schema(&definition, self.max_vector_dimension)?;
         let replaced = self.storage.get_index(&definition.name).is_some();
         self.storage.upsert_index(&definition);
         // Replacing an index discards its documents, so rebuild the search index.
@@ -307,6 +374,13 @@ impl SearchService {
             // engine stay consistent (both absent). The caller can retry.
             self.storage.delete_index(&definition.name);
             return Err(engine_error(&definition.name, e));
+        }
+        // Replacing an index discards its vectors as well.
+        self.vectors.delete_index(&definition.name);
+        if let Err(message) = self.create_vector_indexes(&definition) {
+            self.storage.delete_index(&definition.name);
+            self.engine.delete_index(&definition.name);
+            return Err(ApiError::bad_request("InvalidIndex", message));
         }
         if replaced {
             self.bump_state_version();
@@ -341,12 +415,36 @@ impl SearchService {
     pub fn delete_index(&self, name: &str) -> Result<(), ApiError> {
         if self.storage.delete_index(name) {
             self.engine.delete_index(name);
+            self.vectors.delete_index(name);
             Ok(())
         } else {
             Err(ApiError::not_found(format!(
                 "Index {name:?} was not found."
             )))
         }
+    }
+
+    /// Builds the per-field vector indexes for a validated definition. The
+    /// schema validator has already checked profiles and dimensions, so a
+    /// failure here is defensive.
+    fn create_vector_indexes(&self, definition: &IndexDefinition) -> Result<(), String> {
+        let fields: Vec<(String, usize, String)> = definition
+            .fields
+            .iter()
+            .filter(|f| f.is_vector_field())
+            .map(|f| {
+                (
+                    f.name.clone(),
+                    f.vector_dimensions.unwrap_or(0),
+                    f.vector_search_profile.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        if fields.is_empty() && definition.vector_search.is_none() {
+            return Ok(());
+        }
+        self.vectors
+            .create_index(&definition.name, definition.vector_search.as_ref(), &fields)
     }
 
     /// Creates a new synonym map.
@@ -587,6 +685,11 @@ impl SearchService {
             if let Err(e) = self.apply_engine_changes(index, &upserts, &deletes) {
                 return Err(engine_error(index, e));
             }
+            if let Err(message) = self.apply_vector_changes(&definition, &upserts, &deletes) {
+                return Err(ApiError::internal(format!(
+                    "Vector indexing failed for index {index:?}: {message}"
+                )));
+            }
             if !upserts.is_empty() {
                 self.storage
                     .put_documents(index, upserts)
@@ -619,6 +722,68 @@ impl SearchService {
         if !upserts.is_empty() {
             self.engine.index_documents(index, upserts)?;
         }
+        Ok(())
+    }
+
+    /// Applies validated upserts/deletes to the vector indexes. Vectors are
+    /// validated before this point, so a failure here is an internal error.
+    /// A vector field absent from an upserted document drops any previously
+    /// indexed vector for that (key, field) pair (full-replace semantics).
+    fn apply_vector_changes(
+        &self,
+        definition: &IndexDefinition,
+        upserts: &[Document],
+        deletes: &[String],
+    ) -> Result<(), String> {
+        let vector_fields: Vec<&FieldDefinition> = definition
+            .fields
+            .iter()
+            .filter(|f| f.is_vector_field())
+            .collect();
+        if vector_fields.is_empty() {
+            return Ok(());
+        }
+        if !deletes.is_empty() {
+            self.vectors.delete_documents(&definition.name, deletes);
+        }
+        if upserts.is_empty() {
+            return Ok(());
+        }
+        let mut entries = Vec::new();
+        let mut removals = Vec::new();
+        for document in upserts {
+            for field in &vector_fields {
+                match document.fields.get(&field.name) {
+                    Some(value) => {
+                        let Some(items) = value.as_array() else {
+                            return Err(format!(
+                                "Field {:?} must be an array of numbers.",
+                                field.name
+                            ));
+                        };
+                        let mut vector = Vec::with_capacity(items.len());
+                        for item in items {
+                            match item.as_f64().and_then(finite_f32) {
+                                Some(narrowed) => vector.push(narrowed),
+                                None => {
+                                    return Err(format!(
+                                        "Field {:?} must contain only finite numeric values.",
+                                        field.name
+                                    ));
+                                }
+                            }
+                        }
+                        entries.push((document.key.clone(), field.name.clone(), vector));
+                    }
+                    None => {
+                        removals.push((document.key.clone(), field.name.clone()));
+                    }
+                }
+            }
+        }
+        // Removals first so a re-uploaded key ends up indexed.
+        self.vectors.remove_entries(&definition.name, &removals);
+        self.vectors.upsert_documents(&definition.name, &entries)?;
         Ok(())
     }
 
@@ -690,19 +855,7 @@ impl SearchService {
                 ApiError::bad_request("InvalidQuery", format!("Invalid search text: {e}"))
             })?;
         }
-        let count = obj.get("count").and_then(Value::as_bool).unwrap_or(false);
-        let top = match obj.get("top") {
-            None => None,
-            Some(value) => Some(value.as_u64().ok_or_else(|| {
-                ApiError::bad_request("InvalidQuery", "\"top\" must be a non-negative integer.")
-            })?),
-        };
-        let skip = match obj.get("skip") {
-            None => 0,
-            Some(value) => value.as_u64().ok_or_else(|| {
-                ApiError::bad_request("InvalidQuery", "\"skip\" must be a non-negative integer.")
-            })?,
-        };
+        let (count, top, skip) = parse_paging_options(obj)?;
 
         let filter_raw = obj.get("filter").and_then(Value::as_str).map(str::to_owned);
         let filter = match &filter_raw {
@@ -738,6 +891,9 @@ impl SearchService {
             None => Vec::new(),
         };
 
+        let (vector_queries, vector_queries_raw, vector_filter_mode) =
+            parse_vector_options(obj, &definition)?;
+
         let continuation = obj
             .get("continuation")
             .and_then(Value::as_str)
@@ -756,55 +912,32 @@ impl SearchService {
             facets,
             search_fields,
             continuation,
+            vector_queries,
+            vector_queries_raw,
+            vector_filter_mode,
         })
     }
 
-    /// Runs a search over an index: full-text match, filter, ordering,
-    /// facets, and paging.
+    /// Runs a search over an index: full-text match, vector similarity,
+    /// hybrid union merge, filter, ordering, facets, and paging.
     ///
     /// # Errors
     ///
-    /// Returns an [`ApiError`] if the index does not exist or a continuation
-    /// token is invalid or stale.
+    /// Returns an [`ApiError`] if the index does not exist, a continuation
+    /// token is invalid or stale, or the vector queries changed mid-paging.
     pub fn search(&self, index: &str, query: &SearchQuery) -> Result<SearchOutcome, ApiError> {
         let definition = self.require_index(index)?;
 
+        // The request's vector-query identity, bound into continuation tokens.
+        let current_vector_hash: Option<u64> = query
+            .vector_queries_raw
+            .as_ref()
+            .map(|raw| vector_query_hash(raw, query.vector_filter_mode.as_str()));
+
         // A continuation token is authoritative for skip/filter/orderby and
         // must reference the current document state.
-        let (skip, filter, orderby) = match &query.continuation {
-            Some(raw) => {
-                let token = ContinuationToken::decode(raw).map_err(|e| {
-                    ApiError::bad_request(
-                        "InvalidQuery",
-                        format!("Invalid continuation token: {e}"),
-                    )
-                })?;
-                if token.state_version != self.state_version() {
-                    return Err(ApiError::bad_request(
-                        "InvalidQuery",
-                        "Stale continuation token: the index changed since the token was issued. \
-                         Restart the search.",
-                    ));
-                }
-                let filter = match &query.filter {
-                    Some(expr) => Some(expr.clone()),
-                    None => match &token.filter {
-                        Some(raw) => Some(parse_filter_option(raw)?),
-                        None => None,
-                    },
-                };
-                let orderby = if query.orderby.is_empty() {
-                    match &token.orderby {
-                        Some(raw) => parse_orderby(&Value::String(raw.clone()), &definition)?.0,
-                        None => Vec::new(),
-                    }
-                } else {
-                    query.orderby.clone()
-                };
-                (token.skip, filter, orderby)
-            }
-            None => (query.skip, query.filter.clone(), query.orderby.clone()),
-        };
+        let (skip, filter, orderby) =
+            self.resolve_paging(query, &definition, current_vector_hash)?;
 
         let mut full_text = match &query.search {
             Some(text) => parse_search_text(text).map_err(|e| {
@@ -815,27 +948,53 @@ impl SearchService {
         if !query.search_fields.is_empty() {
             full_text.fields = Some(query.search_fields.clone());
         }
+        let vector_active = !query.vector_queries.is_empty();
+        let full_text_active = !full_text.is_match_all();
 
-        let matched_keys = self
-            .engine
-            .search(index, &full_text)
-            .map_err(|e| engine_error(index, e))?;
         let documents = self
             .storage
             .get_documents(index)
             .map_err(|e| ApiError::not_found(e.to_string()))?;
-        let mut matched: Vec<Document> = documents
-            .into_iter()
-            .filter(|doc| matched_keys.contains(&doc.key))
+        let doc_fields: BTreeMap<&str, &Map<String, Value>> = documents
+            .iter()
+            .map(|doc| (doc.key.as_str(), &doc.fields))
             .collect();
-        if let Some(expr) = &filter {
-            matched.retain(|doc| expr.matches(&doc.fields));
-        }
-        if !orderby.is_empty() {
-            sort_documents(&mut matched, &orderby);
-        }
 
-        let total = u64::try_from(matched.len()).unwrap_or(u64::MAX);
+        let vector_scores = if vector_active {
+            self.vector_side_scores(&definition.name, query, filter.as_ref(), &doc_fields)
+        } else {
+            BTreeMap::new()
+        };
+
+        // Full-text side: skipped only for vector-only searches (a match-all
+        // query would otherwise drag every document into the union with
+        // score 1.0). The top-level filter always applies here.
+        let full_text_keys = if full_text_active || !vector_active {
+            self.full_text_side_keys(index, &full_text, filter.as_ref(), &doc_fields)?
+        } else {
+            BTreeSet::new()
+        };
+
+        // Hybrid merge: union, best score wins (full-text contributes 1.0).
+        let mut merged: BTreeMap<String, f32> = vector_scores;
+        for key in full_text_keys {
+            merged
+                .entry(key)
+                .and_modify(|score| *score = score.max(1.0))
+                .or_insert(1.0);
+        }
+        let doc_map: BTreeMap<&str, &Document> = documents
+            .iter()
+            .map(|doc| (doc.key.as_str(), doc))
+            .collect();
+        let mut scored: Vec<(Document, f32)> = merged
+            .into_iter()
+            .filter_map(|(key, score)| doc_map.get(key.as_str()).map(|doc| ((*doc).clone(), score)))
+            .collect();
+        order_scored(&mut scored, &orderby, vector_active);
+
+        let total = u64::try_from(scored.len()).unwrap_or(u64::MAX);
+        let matched: Vec<Document> = scored.iter().map(|(doc, _)| doc.clone()).collect();
         let facets = if query.facets.is_empty() {
             None
         } else {
@@ -847,17 +1006,178 @@ impl SearchService {
             .top
             .and_then(|t| usize::try_from(t).ok())
             .unwrap_or(usize::MAX);
-        let page: Vec<Document> = matched.into_iter().skip(skip_usize).take(take).collect();
+        let page: Vec<(Document, f32)> = scored.into_iter().skip(skip_usize).take(take).collect();
         let has_more =
             u64::try_from(skip_usize.saturating_add(page.len())).unwrap_or(u64::MAX) < total;
         let next_skip = u64::try_from(skip_usize.saturating_add(page.len())).unwrap_or(u64::MAX);
+        let page_scores: BTreeMap<String, f32> = page
+            .iter()
+            .map(|(doc, score)| (doc.key.clone(), *score))
+            .collect();
+        // Vectors with `retrievable: false` are searchable but omitted from
+        // the response unless explicitly selected (same as Azure).
+        let hidden: BTreeSet<&str> = definition
+            .fields
+            .iter()
+            .filter(|f| f.is_vector_field() && !f.retrievable)
+            .map(|f| f.name.as_str())
+            .collect();
+        let documents: Vec<Document> = page
+            .into_iter()
+            .map(|(mut doc, _)| {
+                if !hidden.is_empty() {
+                    doc.fields.retain(|name, _| {
+                        !hidden.contains(name.as_str()) || query.select.iter().any(|s| s == name)
+                    });
+                }
+                doc
+            })
+            .collect();
         Ok(SearchOutcome {
             total,
-            documents: page,
+            documents,
+            scores: page_scores,
             facets,
             has_more,
             next_skip,
         })
+    }
+
+    /// Resolves the effective `(skip, filter, orderby)` for a search: a
+    /// continuation token is authoritative and must reference the current
+    /// document state as well as the request's vector-query identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] (`400 InvalidQuery`) when the token is
+    /// invalid or stale, or the vector queries changed mid-paging.
+    fn resolve_paging(
+        &self,
+        query: &SearchQuery,
+        definition: &IndexDefinition,
+        current_vector_hash: Option<u64>,
+    ) -> Result<(u64, Option<FilterExpr>, Vec<OrderBy>), ApiError> {
+        let Some(raw) = &query.continuation else {
+            return Ok((query.skip, query.filter.clone(), query.orderby.clone()));
+        };
+        let token = ContinuationToken::decode(raw).map_err(|e| {
+            ApiError::bad_request("InvalidQuery", format!("Invalid continuation token: {e}"))
+        })?;
+        if token.state_version != self.state_version() {
+            return Err(ApiError::bad_request(
+                "InvalidQuery",
+                "Stale continuation token: the index changed since the token was issued. \
+                 Restart the search.",
+            ));
+        }
+        if (current_vector_hash.is_some() || token.vector_query_hash.is_some())
+            && current_vector_hash != token.vector_query_hash
+        {
+            return Err(ApiError::bad_request(
+                "InvalidQuery",
+                "Vector query changed during paging; restart the search.",
+            ));
+        }
+        let filter = match &query.filter {
+            Some(expr) => Some(expr.clone()),
+            None => match &token.filter {
+                Some(raw) => Some(parse_filter_option(raw)?),
+                None => None,
+            },
+        };
+        let orderby = if query.orderby.is_empty() {
+            match &token.orderby {
+                Some(raw) => parse_orderby(&Value::String(raw.clone()), definition)?.0,
+                None => Vec::new(),
+            }
+        } else {
+            query.orderby.clone()
+        };
+        Ok((token.skip, filter, orderby))
+    }
+
+    /// Vector side of [`SearchService::search`]: the union of every
+    /// (query × field) hit with the best score per document key.
+    /// `preFilter` constrains candidates inside the scan; `postFilter` trims
+    /// the retrieved top-k afterwards.
+    fn vector_side_scores(
+        &self,
+        definition_name: &str,
+        query: &SearchQuery,
+        filter: Option<&FilterExpr>,
+        doc_fields: &BTreeMap<&str, &Map<String, Value>>,
+    ) -> BTreeMap<String, f32> {
+        let pre_filter: Option<KeyPredicate<'_>> = match (&query.vector_filter_mode, filter) {
+            (VectorFilterMode::PreFilter, Some(expr)) => Some(Box::new(|key: &str| {
+                doc_fields
+                    .get(key)
+                    .is_some_and(|fields| expr.matches(fields))
+            })),
+            _ => None,
+        };
+        let mut scores: BTreeMap<String, f32> = BTreeMap::new();
+        for vector_query in &query.vector_queries {
+            for field in &vector_query.fields {
+                let hits = self.vectors.search(
+                    definition_name,
+                    field,
+                    &vector_query.vector,
+                    vector_query.k,
+                    vector_query.exhaustive,
+                    pre_filter.as_deref(),
+                );
+                for (key, score) in hits {
+                    scores
+                        .entry(key)
+                        .and_modify(|best| *best = best.max(score))
+                        .or_insert(score);
+                }
+            }
+        }
+        if matches!(
+            (&query.vector_filter_mode, filter),
+            (VectorFilterMode::PostFilter, Some(_))
+        ) {
+            if let Some(expr) = filter {
+                scores.retain(|key, _| {
+                    doc_fields
+                        .get(key.as_str())
+                        .is_some_and(|fields| expr.matches(fields))
+                });
+            }
+        }
+        scores
+    }
+
+    /// Full-text side of [`SearchService::search`]: matching keys with the
+    /// top-level filter applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] when the query engine fails.
+    fn full_text_side_keys(
+        &self,
+        index: &str,
+        full_text: &FullTextQuery,
+        filter: Option<&FilterExpr>,
+        doc_fields: &BTreeMap<&str, &Map<String, Value>>,
+    ) -> Result<BTreeSet<String>, ApiError> {
+        let matched_keys = self
+            .engine
+            .search(index, full_text)
+            .map_err(|e| engine_error(index, e))?;
+        let mut keys = BTreeSet::new();
+        for key in matched_keys {
+            let passes = filter.is_none_or(|expr| {
+                doc_fields
+                    .get(key.as_str())
+                    .is_some_and(|fields| expr.matches(fields))
+            });
+            if passes {
+                keys.insert(key);
+            }
+        }
+        Ok(keys)
     }
 
     /// Builds the continuation token for the next page, if one exists.
@@ -870,12 +1190,17 @@ impl SearchService {
         if !outcome.has_more {
             return None;
         }
+        let vector_query_hash = query
+            .vector_queries_raw
+            .as_ref()
+            .map(|raw| vector_query_hash(raw, query.vector_filter_mode.as_str()));
         Some(
             ContinuationToken {
                 filter: query.filter_raw.clone(),
                 orderby: query.orderby_raw.clone(),
                 skip: outcome.next_skip,
                 state_version: self.state_version(),
+                vector_query_hash,
             }
             .encode(),
         )
@@ -1017,6 +1342,7 @@ impl SearchService {
     pub fn reset(&self) {
         self.storage.reset();
         self.engine.reset();
+        self.vectors.reset();
         let mut maps = self
             .synonym_maps
             .write()
@@ -1077,24 +1403,42 @@ fn merge_fields(existing: &Document, update: &Value) -> Option<Value> {
     Some(Value::Object(merged))
 }
 
-/// Sorts documents by the `orderby` clauses, with the key field as the final
-/// tie-breaker so ordering is deterministic. Missing values sort last
-/// regardless of direction.
-fn sort_documents(documents: &mut [Document], orderby: &[OrderBy]) {
-    documents.sort_by(|a, b| {
-        for clause in orderby {
-            let ordering = compare_field(a, b, &clause.field);
-            let ordering = if clause.descending {
-                ordering.reverse()
-            } else {
-                ordering
-            };
-            if ordering != std::cmp::Ordering::Equal {
-                return ordering;
-            }
+/// Orders scored `(document, score)` pairs: by `orderby` when given,
+/// otherwise by score descending with the key field as tie-breaker when
+/// vector search is active. Without either, the input (key) order is
+/// preserved, matching the historical full-text-only behaviour.
+fn order_scored(scored: &mut [(Document, f32)], orderby: &[OrderBy], vector_active: bool) {
+    if !orderby.is_empty() {
+        scored.sort_by(|a, b| compare_scored(a, b, orderby));
+    } else if vector_active {
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.key.cmp(&b.0.key))
+        });
+    }
+}
+
+/// Compares two scored `(document, score)` pairs by the `orderby` clauses,
+/// with the key field as the final tie-breaker so ordering is deterministic.
+/// Missing values sort last regardless of direction.
+fn compare_scored(
+    a: &(Document, f32),
+    b: &(Document, f32),
+    orderby: &[OrderBy],
+) -> std::cmp::Ordering {
+    for clause in orderby {
+        let ordering = compare_field(&a.0, &b.0, &clause.field);
+        let ordering = if clause.descending {
+            ordering.reverse()
+        } else {
+            ordering
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
         }
-        a.key.cmp(&b.key)
-    });
+    }
+    a.0.key.cmp(&b.0.key)
 }
 
 fn compare_field(a: &Document, b: &Document, field: &str) -> std::cmp::Ordering {
@@ -1429,6 +1773,284 @@ fn parse_facets(value: &Value, definition: &IndexDefinition) -> Result<Vec<Facet
     Ok(facets)
 }
 
+/// Parses the `count`/`top`/`skip` paging options: `top`/`skip` must be
+/// non-negative integers when present.
+///
+/// # Errors
+///
+/// Returns an [`ApiError`] (`400 InvalidQuery`) when `top`/`skip` is
+/// present but not a non-negative integer.
+fn parse_paging_options(obj: &Map<String, Value>) -> Result<(bool, Option<u64>, u64), ApiError> {
+    let count = obj.get("count").and_then(Value::as_bool).unwrap_or(false);
+    let top = match obj.get("top") {
+        None => None,
+        Some(value) => Some(value.as_u64().ok_or_else(|| {
+            ApiError::bad_request("InvalidQuery", "\"top\" must be a non-negative integer.")
+        })?),
+    };
+    let skip = match obj.get("skip") {
+        None => 0,
+        Some(value) => value.as_u64().ok_or_else(|| {
+            ApiError::bad_request("InvalidQuery", "\"skip\" must be a non-negative integer.")
+        })?,
+    };
+    Ok((count, top, skip))
+}
+
+/// Parses the top-level vector options: `vectorQueries`
+/// (`vector_queries` SDK alias accepted) plus `vectorFilterMode`
+/// (`vector_filter_mode` SDK alias accepted).
+///
+/// # Errors
+///
+/// Returns an [`ApiError`] when the filter mode or any vector query is
+/// malformed (see [`parse_vector_filter_mode`], [`parse_vector_queries`]).
+fn parse_vector_options(
+    obj: &Map<String, Value>,
+    definition: &IndexDefinition,
+) -> Result<(Vec<VectorQuery>, Option<Value>, VectorFilterMode), ApiError> {
+    let vector_filter_mode = parse_vector_filter_mode(
+        obj.get("vectorFilterMode")
+            .or_else(|| obj.get("vector_filter_mode")),
+    )?;
+    let (vector_queries, vector_queries_raw) = parse_vector_queries(
+        obj.get("vectorQueries")
+            .or_else(|| obj.get("vector_queries")),
+        definition,
+    )?;
+    Ok((vector_queries, vector_queries_raw, vector_filter_mode))
+}
+
+/// Maximum `vectorQueries` entries per search (matches Azure).
+const MAX_VECTOR_QUERIES: usize = 5;
+/// Maximum `k` per vector query (matches Azure).
+const MAX_VECTOR_K: usize = 1000;
+/// Default `k` when omitted (matches the SDK default).
+const DEFAULT_VECTOR_K: usize = 3;
+
+/// Parses the top-level `vectorFilterMode` (`vector_filter_mode` SDK alias
+/// accepted): `postFilter` (default) or `preFilter`.
+///
+/// # Errors
+///
+/// Returns an [`ApiError`] (`400 InvalidQuery`) when the value is present
+/// but not one of the two supported modes.
+fn parse_vector_filter_mode(value: Option<&Value>) -> Result<VectorFilterMode, ApiError> {
+    match value {
+        None | Some(Value::Null) => Ok(VectorFilterMode::PostFilter),
+        Some(Value::String(mode)) => match mode.as_str() {
+            "postFilter" => Ok(VectorFilterMode::PostFilter),
+            "preFilter" => Ok(VectorFilterMode::PreFilter),
+            other => Err(ApiError::bad_request(
+                "InvalidQuery",
+                format!(
+                    "Invalid vectorFilterMode {other:?}; supported values: 'preFilter', 'postFilter'."
+                ),
+            )),
+        },
+        Some(_) => Err(ApiError::bad_request(
+            "InvalidQuery",
+            "vectorFilterMode must be 'preFilter' or 'postFilter'.",
+        )),
+    }
+}
+
+/// Parses the top-level `vectorQueries` array against the index schema,
+/// returning the parsed queries plus the raw array (bound into continuation
+/// tokens). SDK key aliases (`k_nearest_neighbors`, `vector_queries`) are
+/// accepted; the service layer otherwise sees the wire shape only.
+///
+/// # Errors
+///
+/// Returns an [`ApiError`] (`400 InvalidQuery`, or `400 UnsupportedQuery`
+/// for `kind: "text"` vectorizer queries) when the array or any entry is
+/// malformed.
+fn parse_vector_queries(
+    value: Option<&Value>,
+    definition: &IndexDefinition,
+) -> Result<(Vec<VectorQuery>, Option<Value>), ApiError> {
+    let Some(raw) = value else {
+        return Ok((Vec::new(), None));
+    };
+    if raw.is_null() {
+        return Ok((Vec::new(), None));
+    }
+    let entries = raw
+        .as_array()
+        .ok_or_else(|| ApiError::bad_request("InvalidQuery", "vectorQueries must be an array."))?;
+    if entries.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+    if entries.len() > MAX_VECTOR_QUERIES {
+        return Err(ApiError::bad_request(
+            "InvalidQuery",
+            format!("At most {MAX_VECTOR_QUERIES} vector queries are supported."),
+        ));
+    }
+    let mut queries = Vec::with_capacity(entries.len());
+    for entry in entries {
+        queries.push(parse_vector_query(entry, definition)?);
+    }
+    Ok((queries, Some(raw.clone())))
+}
+
+/// Parses one `vectorQueries[]` entry: `kind`, `vector`, `fields` (string or
+/// array), `k` (`k_nearest_neighbors` SDK alias accepted), `exhaustive`.
+/// `weight` is accepted but inert. A missing `kind` defaults to `"vector"`
+/// (emulator-only leniency, documented in `known_differences.md`).
+fn parse_vector_query(
+    entry: &Value,
+    definition: &IndexDefinition,
+) -> Result<VectorQuery, ApiError> {
+    let obj = entry.as_object().ok_or_else(|| {
+        ApiError::bad_request(
+            "InvalidQuery",
+            "Each vectorQueries entry must be a JSON object.",
+        )
+    })?;
+    match obj.get("kind").and_then(Value::as_str) {
+        None | Some("vector") => {}
+        Some("text") => {
+            return Err(ApiError::unsupported(
+                "UnsupportedQuery",
+                "Vectorizer queries (kind 'text') are not supported; supply raw vectors with kind 'vector'.",
+            ));
+        }
+        Some(other) => {
+            return Err(ApiError::bad_request(
+                "InvalidQuery",
+                format!("Invalid vector query kind {other:?}; supported kinds: 'vector'."),
+            ));
+        }
+    }
+    let (fields, expected) = parse_vector_query_fields(obj, definition)?;
+    let vector = parse_vector_query_vector(obj, &fields, expected)?;
+    let k = match obj
+        .get("k")
+        .or_else(|| obj.get("k_nearest_neighbors"))
+        .or_else(|| obj.get("kNearestNeighbors"))
+    {
+        None | Some(Value::Null) => DEFAULT_VECTOR_K,
+        Some(value) => value
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| *n >= 1 && *n <= MAX_VECTOR_K)
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    "InvalidQuery",
+                    "Vector query 'k' must be a positive integer (max 1000).",
+                )
+            })?,
+    };
+    let exhaustive = obj
+        .get("exhaustive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // `weight` is accepted but inert (no weighted fusion in the emulator).
+    Ok(VectorQuery {
+        fields,
+        vector,
+        k,
+        exhaustive,
+    })
+}
+
+/// Parses a vector query's `fields`: every entry must be a vector field in
+/// the schema. Returns the field names plus the shared dimension the query
+/// vector must match (fields with different dimensions cannot share one
+/// query vector).
+fn parse_vector_query_fields(
+    obj: &Map<String, Value>,
+    definition: &IndexDefinition,
+) -> Result<(Vec<String>, usize), ApiError> {
+    let fields_value = obj.get("fields").ok_or_else(|| {
+        ApiError::bad_request("InvalidQuery", "Each vector query must define \"fields\".")
+    })?;
+    let fields = string_items(fields_value, "vector query fields")?;
+    if fields.is_empty() {
+        return Err(ApiError::bad_request(
+            "InvalidQuery",
+            "Vector query \"fields\" is empty.",
+        ));
+    }
+    let mut expected: Option<usize> = None;
+    for name in &fields {
+        let field_def = definition
+            .field(name)
+            .filter(|f| f.is_vector_field())
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    "InvalidQuery",
+                    format!(
+                        "Vector query field {name:?} is not a vector field in index {:?}.",
+                        definition.name
+                    ),
+                )
+            })?;
+        let dimensions = field_def.vector_dimensions.unwrap_or(0);
+        match expected {
+            None => expected = Some(dimensions),
+            Some(d) if d == dimensions => {}
+            Some(d) => {
+                return Err(ApiError::bad_request(
+                    "InvalidQuery",
+                    format!(
+                        "Vector query targets fields with different dimensions ({d} vs {dimensions})."
+                    ),
+                ));
+            }
+        }
+    }
+    Ok((fields, expected.unwrap_or(0)))
+}
+
+/// Parses a vector query's `vector`: an array of finite numbers whose length
+/// matches every listed field's dimensions.
+fn parse_vector_query_vector(
+    obj: &Map<String, Value>,
+    fields: &[String],
+    expected: usize,
+) -> Result<Vec<f32>, ApiError> {
+    let raw_vector = obj.get("vector").ok_or_else(|| {
+        ApiError::bad_request("InvalidQuery", "Each vector query must define \"vector\".")
+    })?;
+    let items = raw_vector.as_array().ok_or_else(|| {
+        ApiError::bad_request(
+            "InvalidQuery",
+            "Vector query \"vector\" must be an array of numbers.",
+        )
+    })?;
+    let first_field = fields.first().map_or("", String::as_str);
+    if items.len() != expected {
+        return Err(ApiError::bad_request(
+            "InvalidQuery",
+            format!(
+                "Vector query for {first_field:?} has dimension {}, expected {expected}.",
+                items.len()
+            ),
+        ));
+    }
+    let mut vector = Vec::with_capacity(items.len());
+    for item in items {
+        match item.as_f64().and_then(finite_f32) {
+            Some(narrowed) => vector.push(narrowed),
+            None if item.is_number() => {
+                return Err(ApiError::bad_request(
+                    "InvalidQuery",
+                    format!("Vector query for {first_field:?} contains non-finite values."),
+                ));
+            }
+            None => {
+                return Err(ApiError::bad_request(
+                    "InvalidQuery",
+                    format!("Vector query for {first_field:?} must contain only numeric values."),
+                ));
+            }
+        }
+    }
+    Ok(vector)
+}
+
 /// Parses a `searchFields` value: comma-separated field names (or a JSON
 /// array), optionally weighted (`field^2`). Fields must exist and be marked
 /// `searchable`. Weights are accepted but inert (scoring is a constant
@@ -1452,6 +2074,12 @@ fn parse_search_fields(
                 format!(
                     "Field {name:?} is not searchable; mark it \"searchable\": true in the index schema."
                 ),
+            ));
+        }
+        if field_def.is_vector_field() {
+            return Err(ApiError::bad_request(
+                "InvalidQuery",
+                format!("Field {name:?} is a vector field and cannot be used in searchFields."),
             ));
         }
         fields.push(name.to_owned());
@@ -1523,10 +2151,14 @@ fn parse_index_definition(raw: &Value) -> Result<IndexDefinition, ApiError> {
         .map_err(|message| ApiError::bad_request("InvalidIndex", message))
 }
 
-fn validate_schema(definition: &IndexDefinition) -> Result<(), ApiError> {
+fn validate_schema(
+    definition: &IndexDefinition,
+    max_vector_dimension: usize,
+) -> Result<(), ApiError> {
     let mut key_count = 0;
     let mut seen = std::collections::BTreeSet::new();
     for field in &definition.fields {
+        validate_vector_field(field, max_vector_dimension)?;
         if !seen.insert(field.name.as_str()) {
             return Err(ApiError::bad_request(
                 "InvalidIndex",
@@ -1576,6 +2208,144 @@ fn validate_schema(definition: &IndexDefinition) -> Result<(), ApiError> {
         ));
     }
     validate_suggesters(definition)?;
+    validate_vector_search_config(definition)?;
+    Ok(())
+}
+
+/// Validates a single field's vector markers. A field is *attempting* to be
+/// a vector field when it carries a `dimensions` property or a
+/// `vectorSearchProfile`; such fields must be `Collection(Edm.Single)` with
+/// valid dimensions, a profile, `searchable: true`, and none of
+/// key/filterable/sortable/facetable. Plain `Collection(Edm.Single)` fields
+/// without vector markers are ordinary collections and pass through.
+fn validate_vector_field(field: &FieldDefinition, max_dimension: usize) -> Result<(), ApiError> {
+    let attempts_vector = field.has_dimensions_property() || field.vector_search_profile.is_some();
+    if !attempts_vector {
+        return Ok(());
+    }
+    if field.field_type != "Edm.Collection(Edm.Single)" {
+        return Err(ApiError::bad_request(
+            "InvalidIndex",
+            format!(
+                "Unsupported vector field type {:?} for field {:?}; only 'Collection(Edm.Single)' is supported.",
+                field.field_type, field.name
+            ),
+        ));
+    }
+    match field.vector_dimensions {
+        Some(dimensions) if dimensions <= max_dimension => {}
+        _ => {
+            let raw = field
+                .raw
+                .get("dimensions")
+                .or_else(|| field.raw.get("vector_search_dimensions"))
+                .map_or("missing".to_owned(), Value::to_string);
+            return Err(ApiError::bad_request(
+                "InvalidIndex",
+                format!(
+                    "Vector field {:?} has invalid dimensions {raw}; must be 1-{max_dimension}.",
+                    field.name
+                ),
+            ));
+        }
+    }
+    if field
+        .vector_search_profile
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        return Err(ApiError::bad_request(
+            "InvalidIndex",
+            format!(
+                "Vector field {:?} is missing required \"vectorSearchProfile\".",
+                field.name
+            ),
+        ));
+    }
+    if !field.searchable {
+        return Err(ApiError::bad_request(
+            "InvalidIndex",
+            format!(
+                "Vector field {:?} must be searchable; set \"searchable\": true.",
+                field.name
+            ),
+        ));
+    }
+    if field.is_key {
+        return Err(ApiError::bad_request(
+            "InvalidIndex",
+            format!("Vector field {:?} cannot be the key.", field.name),
+        ));
+    }
+    for (attribute, set) in [
+        ("filterable", field.filterable),
+        ("sortable", field.sortable),
+        ("facetable", field.facetable),
+    ] {
+        if set {
+            return Err(ApiError::bad_request(
+                "InvalidIndex",
+                format!("Vector field {:?} cannot be {attribute}.", field.name),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates the index-level `vectorSearch` configuration against the
+/// vector fields: required when vector fields are present (with at least one
+/// profile), profiles must reference known algorithms, and every vector
+/// field's profile must exist. At most 16 vector fields per index.
+fn validate_vector_search_config(definition: &IndexDefinition) -> Result<(), ApiError> {
+    let vector_fields: Vec<&FieldDefinition> = definition
+        .fields
+        .iter()
+        .filter(|f| f.is_vector_field())
+        .collect();
+    if vector_fields.len() > crate::vector::MAX_VECTOR_FIELDS {
+        return Err(ApiError::bad_request(
+            "InvalidIndex",
+            format!(
+                "Index {:?} has {} vector fields; at most {} are supported.",
+                definition.name,
+                vector_fields.len(),
+                crate::vector::MAX_VECTOR_FIELDS
+            ),
+        ));
+    }
+    if vector_fields.is_empty() {
+        return Ok(());
+    }
+    let has_profiles = definition
+        .vector_search
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|obj| obj.get("profiles").or_else(|| obj.get("profile")))
+        .and_then(Value::as_array)
+        .is_some_and(|profiles| !profiles.is_empty());
+    if !has_profiles {
+        return Err(ApiError::bad_request(
+            "InvalidIndex",
+            format!(
+                "Index {:?} has vector fields but no vectorSearch configuration.",
+                definition.name
+            ),
+        ));
+    }
+    let config = parse_vector_search(definition.vector_search.as_ref())
+        .map_err(|message| ApiError::bad_request("InvalidIndex", message))?;
+    for field in vector_fields {
+        let profile = field.vector_search_profile.clone().unwrap_or_default();
+        if !config.profiles.contains_key(&profile) {
+            return Err(ApiError::bad_request(
+                "InvalidIndex",
+                format!(
+                    "Vector field {:?} references unknown vector search profile {profile:?}.",
+                    field.name
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1629,7 +2399,8 @@ fn validate_suggesters(definition: &IndexDefinition) -> Result<(), ApiError> {
 }
 
 /// Validates the subfields of an `Edm.ComplexType` field: non-empty, unique
-/// names, supported scalar (or collection-of-scalar) types, and no keys.
+/// names, supported scalar (or collection-of-scalar) types, no keys, and no
+/// vector markers (vector fields cannot be complex-type subfields).
 fn validate_subfields(field: &FieldDefinition) -> Result<(), ApiError> {
     if field.subfields.is_empty() {
         return Err(ApiError::bad_request(
@@ -1656,6 +2427,15 @@ fn validate_subfields(field: &FieldDefinition) -> Result<(), ApiError> {
                 "InvalidIndex",
                 format!(
                     "Subfield {:?} of complex type field {:?} cannot be a key.",
+                    subfield.name, field.name
+                ),
+            ));
+        }
+        if subfield.has_dimensions_property() || subfield.vector_search_profile.is_some() {
+            return Err(ApiError::bad_request(
+                "InvalidIndex",
+                format!(
+                    "Subfield {:?} of complex type field {:?} cannot be a vector field.",
                     subfield.name, field.name
                 ),
             ));
@@ -1734,6 +2514,9 @@ fn check_field_type(field: &FieldDefinition, value: &Value) -> Result<(), String
     if field.field_type == "Edm.ComplexType" {
         return check_complex_value(field, value);
     }
+    if field.is_vector_field() {
+        return check_vector_value(field, value);
+    }
     let name = &field.name;
     let field_type = &field.field_type;
     let ok = if let Some(inner) = field_type
@@ -1766,6 +2549,56 @@ fn check_field_type(field: &FieldDefinition, value: &Value) -> Result<(), String
             "Value for field {name:?} is not compatible with type {field_type:?}.{hint}"
         ))
     }
+}
+
+/// Narrows an `f64` JSON number to `f32` (`Edm.Single`). Returns `None` for
+/// non-finite values and for `f64` magnitudes that overflow `f32` (which
+/// would poison distance math).
+fn finite_f32(n: f64) -> Option<f32> {
+    #[allow(clippy::cast_possible_truncation)]
+    let narrowed = n as f32;
+    (n.is_finite() && narrowed.is_finite()).then_some(narrowed)
+}
+
+/// Validates a vector field value: a JSON array of exactly the declared
+/// number of finite numbers. Integers are accepted (widened to `f32` at
+/// index time).
+fn check_vector_value(field: &FieldDefinition, value: &Value) -> Result<(), String> {
+    let dimensions = field.vector_dimensions.unwrap_or(0);
+    let Some(items) = value.as_array() else {
+        return Err(format!(
+            "Field {:?} must be an array of numbers (vector of dimension {dimensions}).",
+            field.name
+        ));
+    };
+    if items.len() != dimensions {
+        return Err(format!(
+            "Field {:?} expects a vector of dimension {dimensions}, got {}.",
+            field.name,
+            items.len()
+        ));
+    }
+    for item in items {
+        match item.as_f64() {
+            // The vector index stores `f32` (`Edm.Single`); wider `f64`
+            // values that overflow `f32` would poison distance math, so they
+            // are rejected here.
+            Some(n) if finite_f32(n).is_some() => {}
+            Some(_) => {
+                return Err(format!(
+                    "Field {:?} must contain only finite numeric values.",
+                    field.name
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "Field {:?} must contain only numeric values.",
+                    field.name
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Validates a complex-type value: a JSON object whose members are known
@@ -1843,12 +2676,11 @@ const UNSUPPORTED_SEARCH_OPTIONS: &[&str] = &[
     "minimumCoverage",
     "answers",
     "captions",
+    "semantic",
     "semanticConfiguration",
     "semanticQuery",
     "semanticErrorHandling",
     "semanticMaxWaitInMilliseconds",
-    "vectorQueries",
-    "vectorFilterMode",
     "debug",
     "searchMode",
 ];
@@ -1877,6 +2709,8 @@ mod tests {
         SearchService::new(
             Arc::new(InMemoryStorage::new()),
             Arc::new(SearchEngine::new()),
+            Arc::new(VectorEngine::new()),
+            3072,
         )
     }
 

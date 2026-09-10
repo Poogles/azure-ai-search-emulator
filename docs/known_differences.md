@@ -19,17 +19,29 @@ Differences fall into two categories:
 | `searchMode` (`any` vs `all`) | Rejected | Search always uses AND semantics; `searchMode` is rejected explicitly rather than silently ignored. |
 | Highlighting (`highlight`, pre/post tags) | Rejected | No highlight fragments are produced. |
 | Scoring profiles, parameters, statistics | Rejected | Scoring is a constant placeholder (see below). |
-| Semantic and vector queries | Rejected | Out of scope for the emulator (initial design non-goal). |
+| Semantic queries | Rejected | No model inference in the emulator (initial design non-goal). |
+| Vectorizer (`kind: "text"`) queries | Rejected (`400 UnsupportedQuery`) | No vectorizer in the emulator; callers must supply raw vectors. |
+| Quantized vector types (`Collection(Edm.Half)`, etc.) | Rejected (`400 InvalidIndex`) | Quantization is an optimisation not needed for a test double. |
 | `queryType` other than `simple` (e.g. `full`/Lucene) | Rejected | Only simple-query semantics are implemented. |
 
 ## Silently different (operation succeeds, result may differ from Azure)
 
 ### Relevance and scoring
 
-- `@search.score` is `1.0` for every result. Azure computes a relevance score.
-- Results are ordered by the index key field, not by relevance. Azure orders by score (then by its own tie-breaks).
+- `@search.score` is `1.0` for every full-text result. Azure computes a relevance score.
+- Full-text results are ordered by the index key field, not by relevance. Azure orders by score (then by its own tie-breaks).
 - `sessionId` is accepted but inert: Azure uses it to maintain consistent scoring across a user session; the emulator's deterministic ordering and constant scoring make it irrelevant.
 - **Rationale:** deterministic ordering makes tests stable and independent of index contents; real relevance ranking is not needed for a test double. Test assertions must not assume relevance ordering or score values.
+
+### Vector search scoring and ranking (Phase 2.1)
+
+- `@search.score` for vector results uses emulator-defined formulas: cosine similarity for `cosine`, the raw inner product for `dotProduct`, `1/(1+l2)` for `euclidean`. Same direction as Azure (higher = more similar) and, for cosine, the same [0,1] range — but exact values differ from Azure's internal scoring. Test assertions must check ordering and recall, not exact score equality.
+- The HNSW path (cosine/euclidean on indexes larger than the `ef` window) is approximate; recall may differ slightly from Azure. Everything else is exact: the brute-force path (`exhaustiveKnn` profiles, per-query `exhaustive: true`, `preFilter`, small indexes) and `dotProduct`, which always scans (raw inner products cannot back an HNSW graph — see `docs/decisions/0004-vector-index.md`).
+- Hybrid (vector + full-text) ranking is union + max-score (deterministic): documents matching either side are returned, ordered by the best score. Azure fuses with RRF/a ranking model, so recall matches but ordering may differ.
+- Per-query `weight`, the index-schema `stored` property, and `sessionId` are accepted but inert. A missing vector-query `kind` defaults to `"vector"` (emulator-only leniency).
+- Algorithm-config leniencies (emulator-only): a missing algorithm `kind` defaults to `"hnsw"`; a top-level `parameters` object is accepted as an alias for the kind-specific parameters object; `m` is validated as 1-256 (Azure restricts it to 4-100).
+- Paging with vectors binds `vectorQueries` + `vectorFilterMode` into the continuation token; changing them mid-paging is `400` (Azure tokens tolerate broader reuse). Fail-fast beats silently shifted pages.
+- At most 5 vector queries per search and at most 16 vector fields per index (both match Azure); max dimension 3072 (or `EMULATOR_VECTOR__MAX_DIMENSION`).
 
 ### Query matching
 

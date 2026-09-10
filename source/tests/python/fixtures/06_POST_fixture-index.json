@@ -1,0 +1,18 @@
+{
+  "method": "POST",
+  "url": "http://<endpoint>/indexes('fixture-vector-index')/docs/search.index?api-version=2024-07-01",
+  "headers": {
+    "Content-Type": "application/json",
+    "Content-Length": "207",
+    "api-key": "fixture-key",
+    "Accept": "application/json;odata.metadata=none",
+    "User-Agent": "<user-agent>"
+  },
+  "request_body": "{\"value\": [{\"id\": \"1\", \"title\": \"hello world\", \"content_vector\": [1.0, 0.0, 0.0], \"@search.action\": \"upload\"}, {\"id\": \"2\", \"title\": \"foo bar\", \"content_vector\": [0.0, 1.0, 0.0], \"@search.action\": \"upload\"}]}",
+  "status_code": 200,
+  "response_headers": {
+    "content-type": "application/json",
+    "content-length": "137"
+  },
+  "response_body": "{\"value\":[{\"errorMessage\":null,\"key\":\"1\",\"status\":true,\"statusCode\":201},{\"errorMessage\":null,\"key\":\"2\",\"status\":true,\"statusCode\":201}]}"
+}

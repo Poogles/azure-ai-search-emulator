@@ -29,6 +29,7 @@ pub fn app_with_admin(enable_admin: bool) -> axum::Router {
         api_versions: vec![API_VERSION.to_owned()],
         log_level: "off".to_owned(),
         enable_admin,
+        max_vector_dimension: 3072,
     };
     let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
     build_router(AppState::new(config, storage))
