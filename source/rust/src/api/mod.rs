@@ -486,7 +486,7 @@ async fn document_by_key(
     State(state): State<AppState>,
     method: Method,
     Path((raw_name, raw_key)): Path<(String, String)>,
-) -> Result<Json<Value>, Response> {
+) -> Response {
     // `POST /knowledgebases('{name}')/retrieve` — agentic retrieval. The
     // emulator performs no model inference (an initial-design non-goal), so it
     // returns an empty retrieval response; the knowledge base must exist.
@@ -494,40 +494,45 @@ async fn document_by_key(
     // on a knowledge base is not an Azure route (404).
     if raw_name.starts_with("knowledgebases(") {
         if raw_key != "retrieve" {
-            return Err(StatusCode::NOT_FOUND.into_response());
+            return StatusCode::NOT_FOUND.into_response();
         }
         if method != Method::POST {
-            return Err(StatusCode::METHOD_NOT_ALLOWED.into_response());
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
         }
-        let name = parse_named_segment(
+        let name = match parse_named_segment(
             &raw_name,
             "knowledgebases(",
             "knowledge base",
             "InvalidKnowledgeBase",
-        )
-        .map_err(IntoResponse::into_response)?;
-        return state
-            .service
-            .get_knowledge_base(&name)
-            .map(|_| {
-                Json(json!({
-                    "response": [],
-                    "activity": [],
-                    "references": []
-                }))
-            })
-            .map_err(IntoResponse::into_response);
+        ) {
+            Ok(name) => name,
+            Err(error) => return error.into_response(),
+        };
+        return match state.service.get_knowledge_base(&name) {
+            Ok(_) => Json(json!({
+                "response": [],
+                "activity": [],
+                "references": []
+            }))
+            .into_response(),
+            Err(error) => error.into_response(),
+        };
     }
     if method != Method::GET {
-        return Err(StatusCode::NOT_FOUND.into_response());
+        return StatusCode::NOT_FOUND.into_response();
     }
-    let name = parse_index_name(&raw_name).map_err(IntoResponse::into_response)?;
-    let key = parse_document_key(&raw_key).map_err(IntoResponse::into_response)?;
-    state
-        .service
-        .get_document(&name, &key)
-        .map(Json)
-        .map_err(IntoResponse::into_response)
+    let name = match parse_index_name(&raw_name) {
+        Ok(name) => name,
+        Err(error) => return error.into_response(),
+    };
+    let key = match parse_document_key(&raw_key) {
+        Ok(key) => key,
+        Err(error) => return error.into_response(),
+    };
+    match state.service.get_document(&name, &key) {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
 async fn search_documents(
