@@ -308,7 +308,15 @@ impl SearchEngine {
             tantivy_doc.add_text(engine.key_field, &document.key);
             for (field_name, field) in &engine.searchable {
                 for value in resolve_doc_paths(&document.fields, field_name) {
-                    if let Some(text) = value.as_str() {
+                    // A plain collection field (e.g. `Edm.Collection(Edm.String)`)
+                    // resolves to a single JSON array; index each string element.
+                    if let Value::Array(items) = value {
+                        for item in items {
+                            if let Some(text) = item.as_str() {
+                                tantivy_doc.add_text(*field, text);
+                            }
+                        }
+                    } else if let Some(text) = value.as_str() {
                         tantivy_doc.add_text(*field, text);
                     }
                 }

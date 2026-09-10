@@ -285,6 +285,59 @@ async fn collection_of_complex_rejects_non_array_value() {
 }
 
 #[tokio::test]
+async fn upload_and_search_scalar_collection_field() {
+    // A searchable `Edm.Collection(Edm.String)` field indexes every element,
+    // so a search for one tag matches the document.
+    let app = app();
+    let uri = format!("/indexes?api-version={API_VERSION}");
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            &uri,
+            Some(API_KEY),
+            Some(json!({
+                "name": "hotels",
+                "fields": [
+                    {"name": "HotelId", "type": "Edm.String", "key": true},
+                    {"name": "Tags", "type": "Edm.Collection(Edm.String)", "searchable": true}
+                ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = call(
+        app.clone(),
+        upload_request(
+            "hotels",
+            json!([
+                {
+                    "@search.action": "upload",
+                    "document": {"HotelId": "1", "Tags": ["pool", "spa"]}
+                },
+                {
+                    "@search.action": "upload",
+                    "document": {"HotelId": "2", "Tags": ["gym"]}
+                }
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    for item in body["value"].as_array().cloned().unwrap_or_default() {
+        assert_eq!(item["status"], true, "upload failed: {item}");
+    }
+
+    let (status, body) = call(app, search_request("hotels", json!({"search": "spa"}))).await;
+    assert_eq!(status, StatusCode::OK, "search rejected: {body}");
+    let value = &body["value"];
+    assert_eq!(value.as_array().map(Vec::len), Some(1));
+    assert_eq!(value[0]["HotelId"], "1");
+}
+
+#[tokio::test]
 async fn collection_of_complex_rejects_unknown_subfield() {
     let app = app();
     let uri = format!("/indexes?api-version={API_VERSION}");

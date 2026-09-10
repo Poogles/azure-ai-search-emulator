@@ -156,16 +156,21 @@ async fn create_or_update_index(
             .create_or_update_synonym_map(&name, format, synonyms)?;
         return Ok((StatusCode::CREATED, Json(map.to_value())));
     }
-    if let Some(raw) = raw_name.strip_prefix("aliases(") {
-        let name = parse_named_segment(raw, "alias", "InvalidAlias")?;
+    if raw_name.starts_with("aliases(") {
+        let name = parse_named_segment(&raw_name, "aliases(", "alias", "InvalidAlias")?;
         let definition = parse_body(&body)?;
         validate_named_body(&name, &definition, "alias", "InvalidAlias")?;
         validate_alias(&definition)?;
         let alias = state.service.create_or_update_alias(&name, &definition);
         return Ok((StatusCode::CREATED, Json(alias.to_value())));
     }
-    if let Some(raw) = raw_name.strip_prefix("knowledgesources(") {
-        let name = parse_named_segment(raw, "knowledge source", "InvalidKnowledgeSource")?;
+    if raw_name.starts_with("knowledgesources(") {
+        let name = parse_named_segment(
+            &raw_name,
+            "knowledgesources(",
+            "knowledge source",
+            "InvalidKnowledgeSource",
+        )?;
         let definition = parse_body(&body)?;
         validate_named_body(
             &name,
@@ -179,8 +184,13 @@ async fn create_or_update_index(
             .create_or_update_knowledge_source(&name, &definition);
         return Ok((StatusCode::CREATED, Json(source.to_value())));
     }
-    if let Some(raw) = raw_name.strip_prefix("knowledgebases(") {
-        let name = parse_named_segment(raw, "knowledge base", "InvalidKnowledgeBase")?;
+    if raw_name.starts_with("knowledgebases(") {
+        let name = parse_named_segment(
+            &raw_name,
+            "knowledgebases(",
+            "knowledge base",
+            "InvalidKnowledgeBase",
+        )?;
         let definition = parse_body(&body)?;
         validate_named_body(&name, &definition, "knowledge base", "InvalidKnowledgeBase")?;
         validate_knowledge_base(&definition)?;
@@ -219,16 +229,26 @@ async fn get_index(
         let name = parse_synonym_map_name(raw)?;
         return Ok(Json(state.service.get_synonym_map(&name)?.to_value()));
     }
-    if let Some(raw) = raw_name.strip_prefix("aliases(") {
-        let name = parse_named_segment(raw, "alias", "InvalidAlias")?;
+    if raw_name.starts_with("aliases(") {
+        let name = parse_named_segment(&raw_name, "aliases(", "alias", "InvalidAlias")?;
         return Ok(Json(state.service.get_alias(&name)?.to_value()));
     }
-    if let Some(raw) = raw_name.strip_prefix("knowledgesources(") {
-        let name = parse_named_segment(raw, "knowledge source", "InvalidKnowledgeSource")?;
+    if raw_name.starts_with("knowledgesources(") {
+        let name = parse_named_segment(
+            &raw_name,
+            "knowledgesources(",
+            "knowledge source",
+            "InvalidKnowledgeSource",
+        )?;
         return Ok(Json(state.service.get_knowledge_source(&name)?.to_value()));
     }
-    if let Some(raw) = raw_name.strip_prefix("knowledgebases(") {
-        let name = parse_named_segment(raw, "knowledge base", "InvalidKnowledgeBase")?;
+    if raw_name.starts_with("knowledgebases(") {
+        let name = parse_named_segment(
+            &raw_name,
+            "knowledgebases(",
+            "knowledge base",
+            "InvalidKnowledgeBase",
+        )?;
         return Ok(Json(state.service.get_knowledge_base(&name)?.to_value()));
     }
     let name = parse_index_name(&raw_name)?;
@@ -247,18 +267,28 @@ async fn delete_index(
         state.service.delete_synonym_map(&name)?;
         return Ok(StatusCode::NO_CONTENT);
     }
-    if let Some(raw) = raw_name.strip_prefix("aliases(") {
-        let name = parse_named_segment(raw, "alias", "InvalidAlias")?;
+    if raw_name.starts_with("aliases(") {
+        let name = parse_named_segment(&raw_name, "aliases(", "alias", "InvalidAlias")?;
         state.service.delete_alias(&name)?;
         return Ok(StatusCode::NO_CONTENT);
     }
-    if let Some(raw) = raw_name.strip_prefix("knowledgesources(") {
-        let name = parse_named_segment(raw, "knowledge source", "InvalidKnowledgeSource")?;
+    if raw_name.starts_with("knowledgesources(") {
+        let name = parse_named_segment(
+            &raw_name,
+            "knowledgesources(",
+            "knowledge source",
+            "InvalidKnowledgeSource",
+        )?;
         state.service.delete_knowledge_source(&name)?;
         return Ok(StatusCode::NO_CONTENT);
     }
-    if let Some(raw) = raw_name.strip_prefix("knowledgebases(") {
-        let name = parse_named_segment(raw, "knowledge base", "InvalidKnowledgeBase")?;
+    if raw_name.starts_with("knowledgebases(") {
+        let name = parse_named_segment(
+            &raw_name,
+            "knowledgebases(",
+            "knowledge base",
+            "InvalidKnowledgeBase",
+        )?;
         state.service.delete_knowledge_base(&name)?;
         return Ok(StatusCode::NO_CONTENT);
     }
@@ -460,23 +490,33 @@ async fn document_by_key(
     // `POST /knowledgebases('{name}')/retrieve` — agentic retrieval. The
     // emulator performs no model inference (an initial-design non-goal), so it
     // returns an empty retrieval response; the knowledge base must exist.
-    if method == Method::POST && raw_key == "retrieve" {
-        if let Some(raw) = raw_name.strip_prefix("knowledgebases(") {
-            let name = parse_named_segment(raw, "knowledge base", "InvalidKnowledgeBase")
-                .map_err(IntoResponse::into_response)?;
-            return state
-                .service
-                .get_knowledge_base(&name)
-                .map(|_| {
-                    Json(json!({
-                        "response": [],
-                        "activity": [],
-                        "references": []
-                    }))
-                })
-                .map_err(IntoResponse::into_response);
+    // Other methods on the retrieve route are 405; any other second segment
+    // on a knowledge base is not an Azure route (404).
+    if raw_name.starts_with("knowledgebases(") {
+        if raw_key != "retrieve" {
+            return Err(StatusCode::NOT_FOUND.into_response());
         }
-        return Err(StatusCode::NOT_FOUND.into_response());
+        if method != Method::POST {
+            return Err(StatusCode::METHOD_NOT_ALLOWED.into_response());
+        }
+        let name = parse_named_segment(
+            &raw_name,
+            "knowledgebases(",
+            "knowledge base",
+            "InvalidKnowledgeBase",
+        )
+        .map_err(IntoResponse::into_response)?;
+        return state
+            .service
+            .get_knowledge_base(&name)
+            .map(|_| {
+                Json(json!({
+                    "response": [],
+                    "activity": [],
+                    "references": []
+                }))
+            })
+            .map_err(IntoResponse::into_response);
     }
     if method != Method::GET {
         return Err(StatusCode::NOT_FOUND.into_response());
@@ -712,6 +752,24 @@ fn search_response(
 // Middleware
 // ---------------------------------------------------------------------------
 
+/// Whether a request path is on the Azure-compatible surface that requires
+/// an API key and a supported `api-version`: the collection and named
+/// (`resource('name')`) routes for indexes, synonym maps, aliases, knowledge
+/// sources, and knowledge bases, plus `/servicestats`.
+fn is_azure_surface_path(path: &str) -> bool {
+    const COLLECTIONS: [(&str, &str); 5] = [
+        ("/indexes", "/indexes("),
+        ("/synonymmaps", "/synonymmaps("),
+        ("/aliases", "/aliases("),
+        ("/knowledgesources", "/knowledgesources("),
+        ("/knowledgebases", "/knowledgebases("),
+    ];
+    path == "/servicestats"
+        || COLLECTIONS
+            .iter()
+            .any(|(collection, named)| path == *collection || path.starts_with(named))
+}
+
 /// Authentication and API-version guard for the Azure-compatible surface.
 ///
 /// - Any non-empty `api-key` header is accepted; missing/empty returns 401.
@@ -721,23 +779,9 @@ async fn azure_guard(
     request: Request,
     next: middleware::Next,
 ) -> Result<Response, ApiError> {
-    // Only enforce Azure auth/version on the index operation surface
-    // (`/indexes`, `/indexes('name')...`, `/synonymmaps`,
-    // `/synonymmaps('name')...`, and `/servicestats`); let everything else
-    // fall through to routing.
-    let path = request.uri().path();
-    if path != "/indexes"
-        && !path.starts_with("/indexes(")
-        && path != "/synonymmaps"
-        && !path.starts_with("/synonymmaps(")
-        && path != "/aliases"
-        && !path.starts_with("/aliases(")
-        && path != "/knowledgesources"
-        && !path.starts_with("/knowledgesources(")
-        && path != "/knowledgebases"
-        && !path.starts_with("/knowledgebases(")
-        && path != "/servicestats"
-    {
+    // Only enforce Azure auth/version on the index operation surface; let
+    // everything else fall through to routing.
+    if !is_azure_surface_path(request.uri().path()) {
         return Ok(next.run(request).await);
     }
     let api_key = request
@@ -839,17 +883,26 @@ fn parse_synonym_map_name(raw: &str) -> Result<String, ApiError> {
     Ok(name.to_owned())
 }
 
-/// Parses an OData-style named-resource path segment (`aliases('name')`,
-/// `knowledgesources('name')`, `knowledgebases('name')`). Takes the segment
-/// with the resource prefix already stripped (i.e. `'name')`).
-fn parse_named_segment(raw: &str, kind: &str, code: &str) -> Result<String, ApiError> {
+/// Parses an OData-style named path segment: `docs('key')`,
+/// `aliases('name')`, `knowledgesources('name')`, `knowledgebases('name')`.
+/// `raw` is the full path segment; `prefix` is its resource prefix
+/// (e.g. `aliases(`).
+fn parse_named_segment(
+    raw: &str,
+    prefix: &str,
+    kind: &str,
+    code: &str,
+) -> Result<String, ApiError> {
     let invalid = || {
         ApiError::bad_request(
             code,
-            format!("Invalid {kind} path segment {raw:?}; expected {kind}('name')."),
+            format!("Invalid {kind} path segment {raw:?}; expected {prefix}'name')."),
         )
     };
-    let inner = raw.strip_suffix(')').ok_or_else(invalid)?;
+    let inner = raw
+        .strip_prefix(prefix)
+        .and_then(|s| s.strip_suffix(')'))
+        .ok_or_else(invalid)?;
     let name = inner
         .strip_prefix('\'')
         .and_then(|s| s.strip_suffix('\''))
@@ -970,24 +1023,7 @@ fn validate_knowledge_base(definition: &Value) -> Result<(), ApiError> {
 
 /// Parses the OData-style document path segment `docs('key')`.
 fn parse_document_key(raw: &str) -> Result<String, ApiError> {
-    let invalid = || {
-        ApiError::bad_request(
-            "InvalidRequest",
-            format!("Invalid document path segment {raw:?}; expected docs('key')."),
-        )
-    };
-    let inner = raw
-        .strip_prefix("docs(")
-        .and_then(|s| s.strip_suffix(')'))
-        .ok_or_else(invalid)?;
-    let key = inner
-        .strip_prefix('\'')
-        .and_then(|s| s.strip_suffix('\''))
-        .ok_or_else(invalid)?;
-    if key.is_empty() {
-        return Err(invalid());
-    }
-    Ok(key.to_owned())
+    parse_named_segment(raw, "docs(", "document", "InvalidRequest")
 }
 
 fn parse_body(body: &axum::body::Bytes) -> Result<Value, ApiError> {

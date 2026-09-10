@@ -41,7 +41,12 @@ async fn create_alias_returns_201_with_etag() {
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["name"], "alias1");
     assert_eq!(body["indexes"][0], "hotels");
-    assert!(body["@odata.etag"].is_string());
+    // Etags follow the Azure shape: a quoted hex string (`"0x..."`).
+    let etag = body["@odata.etag"].as_str().unwrap_or("");
+    assert!(
+        etag.starts_with("\"0x") && etag.ends_with('"') && etag.len() > 5,
+        "unexpected etag format: {etag}"
+    );
 }
 
 #[tokio::test]
@@ -291,6 +296,23 @@ async fn create_search_index_source_rejects_missing_index_name() {
 }
 
 #[tokio::test]
+async fn create_search_index_source_accepts_missing_index() {
+    // The emulator stores knowledge sources opaquely and does not check that
+    // the referenced index exists; pin that decision.
+    let app = app();
+    let (status, body) = call(app, create_source_request("src1", "no-such-index")).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "opaque source rejected: {body}"
+    );
+    assert_eq!(
+        body["searchIndexParameters"]["searchIndexName"],
+        "no-such-index"
+    );
+}
+
+#[tokio::test]
 async fn list_knowledge_sources_returns_value_array_sorted_by_name() {
     let app = app();
     let (status, _) = call(app.clone(), create_source_request("zeta", "i1")).await;
@@ -346,6 +368,26 @@ async fn update_knowledge_source_replaces_and_bumps_etag() {
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["description"], "updated");
     assert_ne!(body["@odata.etag"], created["@odata.etag"]);
+}
+
+#[tokio::test]
+async fn update_knowledge_source_name_mismatch_returns_400() {
+    let app = app();
+    let (status, body) = call(
+        app,
+        source_request(
+            "PUT",
+            "src1",
+            Some(json!({
+                "name": "other",
+                "kind": "searchIndex",
+                "searchIndexParameters": {"searchIndexName": "hotels"}
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "InvalidKnowledgeSource");
 }
 
 #[tokio::test]
@@ -494,6 +536,22 @@ async fn get_missing_knowledge_base_returns_404() {
 }
 
 #[tokio::test]
+async fn update_knowledge_base_name_mismatch_returns_400() {
+    let app = app();
+    let (status, body) = call(
+        app,
+        base_request(
+            "PUT",
+            "base1",
+            Some(json!({"name": "other", "knowledgeSources": [{"name": "src1"}]})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "InvalidKnowledgeBase");
+}
+
+#[tokio::test]
 async fn delete_knowledge_base_returns_204_then_404() {
     let app = app();
     let (status, _) = call(app.clone(), create_base_request("base1", "src1")).await;
@@ -551,4 +609,24 @@ async fn retrieve_missing_knowledge_base_returns_404() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"]["code"], "ResourceNotFound");
+}
+
+#[tokio::test]
+async fn retrieve_knowledge_base_non_post_returns_405() {
+    let app = app();
+    let (status, _) = call(app.clone(), create_base_request("base1", "src1")).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let uri = format!("/knowledgebases('base1')/retrieve?api-version={API_VERSION}");
+    let (status, _) = call(app, request("GET", &uri, Some(API_KEY), None)).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn knowledge_base_unknown_subroute_returns_404() {
+    let app = app();
+    let (status, _) = call(app.clone(), create_base_request("base1", "src1")).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let uri = format!("/knowledgebases('base1')/nope?api-version={API_VERSION}");
+    let (status, _) = call(app, request("GET", &uri, Some(API_KEY), None)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

@@ -337,7 +337,13 @@ impl ResourceStore {
         name: &str,
         raw: &Value,
     ) -> NamedResource {
-        let etag = self.etags.fetch_add(1, Ordering::SeqCst).to_string();
+        // Azure etags are quoted hex strings (e.g. `"0x8D..."`); SDKs echo
+        // them back in `If-Match`, so match the shape, not just uniqueness.
+        // +1 so the first etag is non-zero, as Azure's (timestamp-derived) are.
+        let etag = format!(
+            "\"0x{:08X}\"",
+            self.etags.fetch_add(1, Ordering::SeqCst) + 1
+        );
         let resource = NamedResource {
             name: name.to_owned(),
             etag,
