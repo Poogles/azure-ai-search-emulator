@@ -95,13 +95,13 @@ Supported:
 
 SDK ↔ REST key mapping (handled in `source/rust/src/storage/mod.rs` for field definitions and `source/rust/src/vector/mod.rs` for the `vectorSearch` config):
 
-| SDK (`azure-search-documents`) | REST / emulator storage |
-|-------------------------------|-------------------------|
-| `SearchField(type=Collection(Single), vector_search_dimensions=N)` | `dimensions: N` |
-| `SearchField(vector_search_profile_name="p")` | `vectorSearchProfile: "p"` |
-| `HnswAlgorithmConfiguration(name, kind="hnsw", parameters=...)` | `vectorSearch.algorithms[]` with `hnswParameters` |
-| `ExhaustiveKnnAlgorithmConfiguration(...)` | `vectorSearch.algorithms[]` with `kind: "exhaustiveKnn"` |
-| `VectorSearchProfile(name, algorithm_configuration_name=...)` | `vectorSearch.profiles[]` with `algorithmConfigurationName` |
+| SDK (`azure-search-documents`)                                     | REST / emulator storage                                     |
+|:-------------------------------------------------------------------|:------------------------------------------------------------|
+| `SearchField(type=Collection(Single), vector_search_dimensions=N)` | `dimensions: N`                                             |
+| `SearchField(vector_search_profile_name="p")`                      | `vectorSearchProfile: "p"`                                  |
+| `HnswAlgorithmConfiguration(name, kind="hnsw", parameters=...)`    | `vectorSearch.algorithms[]` with `hnswParameters`           |
+| `ExhaustiveKnnAlgorithmConfiguration(...)`                         | `vectorSearch.algorithms[]` with `kind: "exhaustiveKnn"`    |
+| `VectorSearchProfile(name, algorithm_configuration_name=...)`      | `vectorSearch.profiles[]` with `algorithmConfigurationName` |
 
 ### Document validation: vector fields
 
@@ -166,11 +166,11 @@ Field semantics (wire names; SDK names in parentheses):
 
 SDK ↔ wire mapping for search (the service layer accepts both SDK and REST keys; see `parse_vector_options` in `source/rust/src/service/mod.rs`):
 
-| SDK (`SearchClient.search`) | Wire body |
-|-----------------------------|-----------|
+| SDK (`SearchClient.search`)                                                                         | Wire body                                                          |
+|:----------------------------------------------------------------------------------------------------|:-------------------------------------------------------------------|
 | `vector_queries=[VectorizedQuery(vector=..., fields=..., k_nearest_neighbors=..., exhaustive=...)]` | `vectorQueries: [{kind: "vector", vector, fields, k, exhaustive}]` |
-| `vector_filter_mode="preFilter"` / `"postFilter"` | `vectorFilterMode` (same strings) |
-| `filter="category eq 'tech'"` | `filter` (top-level; shared by full-text and vector paths) |
+| `vector_filter_mode="preFilter"` / `"postFilter"`                                                   | `vectorFilterMode` (same strings)                                  |
+| `filter="category eq 'tech'"`                                                                       | `filter` (top-level; shared by full-text and vector paths)         |
 
 #### `vectorFilterMode`
 

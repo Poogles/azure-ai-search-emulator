@@ -1000,7 +1000,14 @@ The implementation is split into independently reviewable phases, each with its 
    * Contract and SDK compatibility tests.
    * `docs/known_differences.md` (created as gaps are discovered).
 
-4. **Phase 3 — Admin API and remaining elements** (`docs/phase_3_admin_api_and_remaining.md`)
+4. **Phase 2.1 — Vector indexing and vector search** (`docs/phase_2_1_vector_indexing.md`)
+
+   * Vector field schema and validation.
+   * Vector similarity search (HNSW + exact brute-force) and hybrid (vector + full-text) search.
+   * `vectorFilterMode` (pre/post) and per-query `exhaustive`.
+   * Vector contract, unit, and SDK compatibility tests.
+
+5. **Phase 3 — Admin API and remaining elements** (`docs/phase_3_admin_api_and_remaining.md`)
 
    * Admin API.
    * C# SDK compatibility (fixture replay + live tests).

@@ -334,6 +334,9 @@ Matching is case-insensitive prefix matching of the search text against the whit
 | Ordering, projection, facets | `tests/contract/search.rs` | `service` | `tests/sdk/` |
 | Continuation tokens (nextLink, staleness) | `tests/contract/pagination.rs` | `service` | `tests/sdk/` (`by_page()`) |
 | Autocomplete, suggest (prefix match, suggester validation, auth) | `tests/contract/suggest_autocomplete.rs` | `service`, `storage` | `tests/ms_samples/` (`sample_query_autocomplete.py`, `sample_query_suggestions.py`) |
+| Vector search (schema, document validation, vector/hybrid, filter modes, exhaustive) | `tests/contract/vector_search.rs` | `vector`, `service` | `tests/sdk/test_vectors.py`, `test_emulator.py` (RAG flow) |
+| Index aliases (CRUD, validation, auth, reset) | `tests/contract/aliases_knowledge.rs` | `service` | `tests/ms_samples/` (`sample_index_alias_crud.py`) |
+| Knowledge sources/bases + retrieval (CRUD, validation, auth, reset, empty retrieval) | `tests/contract/aliases_knowledge.rs` | `service` | `tests/ms_samples/` (`sample_agentic_retrieval.py`) |
 | Auth, API version, 404s, error structure | `tests/contract/errors.rs` | `version` | `test_emulator.py` |
 | Admin reset, health | `tests/contract/admin.rs` | — | `test_emulator.py` |
 | Configuration parsing | — | `config` | — |

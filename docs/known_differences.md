@@ -14,15 +14,15 @@ Differences fall into two categories:
 
 ## Explicitly rejected (fail with `400 UnsupportedQuery` / `400 UnsupportedAction`)
 
-| Azure behaviour | Emulator behaviour | Rationale |
-|-----------------|--------------------|-----------|
-| `searchMode` (`any` vs `all`) | Rejected | Search always uses AND semantics; `searchMode` is rejected explicitly rather than silently ignored. |
-| Highlighting (`highlight`, pre/post tags) | Rejected | No highlight fragments are produced. |
-| Scoring profiles, parameters, statistics | Rejected | Scoring is a constant placeholder (see below). |
-| Semantic queries | Rejected | No model inference in the emulator (initial design non-goal). |
-| Vectorizer (`kind: "text"`) queries | Rejected (`400 UnsupportedQuery`) | No vectorizer in the emulator; callers must supply raw vectors. |
-| Quantized vector types (`Collection(Edm.Half)`, etc.) | Rejected (`400 InvalidIndex`) | Quantization is an optimisation not needed for a test double. |
-| `queryType` other than `simple` (e.g. `full`/Lucene) | Rejected | Only simple-query semantics are implemented. |
+| Azure behaviour                                       | Emulator behaviour                | Rationale                                                                                           |
+|:------------------------------------------------------|:----------------------------------|:----------------------------------------------------------------------------------------------------|
+| `searchMode` (`any` vs `all`)                         | Rejected                          | Search always uses AND semantics; `searchMode` is rejected explicitly rather than silently ignored. |
+| Highlighting (`highlight`, pre/post tags)             | Rejected                          | No highlight fragments are produced.                                                                |
+| Scoring profiles, parameters, statistics              | Rejected                          | Scoring is a constant placeholder (see below).                                                      |
+| Semantic queries                                      | Rejected                          | No model inference in the emulator (initial design non-goal).                                       |
+| Vectorizer (`kind: "text"`) queries                   | Rejected (`400 UnsupportedQuery`) | No vectorizer in the emulator; callers must supply raw vectors.                                     |
+| Quantized vector types (`Collection(Edm.Half)`, etc.) | Rejected (`400 InvalidIndex`)     | Quantization is an optimisation not needed for a test double.                                       |
+| `queryType` other than `simple` (e.g. `full`/Lucene)  | Rejected                          | Only simple-query semantics are implemented.                                                        |
 
 ## Silently different (operation succeeds, result may differ from Azure)
 

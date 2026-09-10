@@ -59,11 +59,12 @@ fn print_usage() {
 aisearch-emulator              Start the HTTP service\n  \
 aisearch-emulator healthcheck  Check GET /health against EMULATOR_PORT (for Docker HEALTHCHECK)\n\n\
          CONFIGURATION (environment variables):\n  \
-EMULATOR_PORT            Listen port (default 8080)\n  \
-EMULATOR_STORAGE__MODE   memory | file (default memory; file fails fast)\n  \
-EMULATOR_API_VERSIONS    Comma-separated API versions (default 2024-07-01)\n  \
-EMULATOR_LOG_LEVEL       Log level (default info)\n  \
-EMULATOR_ENABLE_ADMIN    Enable POST /admin/reset (default true)"
+EMULATOR_PORT                   Listen port (default 8080)\n  \
+EMULATOR_STORAGE__MODE          memory | file (default memory; file fails fast)\n  \
+EMULATOR_API_VERSIONS           Comma-separated API versions (default 2024-07-01)\n  \
+EMULATOR_LOG_LEVEL              Log level (default info)\n  \
+EMULATOR_ENABLE_ADMIN           Enable POST /admin/reset (default true)\n  \
+EMULATOR_VECTOR__MAX_DIMENSION  Max accepted vector field dimension (default 3072)"
     );
 }
 

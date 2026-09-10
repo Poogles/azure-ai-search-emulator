@@ -50,12 +50,12 @@ make ms-samples-update  # bump the submodule to latest upstream main (see below)
 
 Each sample is classified in `KNOWN_ISSUES` (`test_ms_samples.py`):
 
-| Category | Meaning | Suite behaviour |
-|----------|---------|-----------------|
-| *(absent)* | Expected to pass | Fails if the sample errors (new upstream sample needing triage) |
-| `gap` | Emulator does not implement the feature; pinned to the Azure error signature | Fails if the sample starts passing (gap closed — remove from registry) or the signature changes |
-| `falsepass` | Exits 0 but the operation silently did not take effect | Fails if the side-effect starts happening |
-| `skip` | Cannot run here for non-emulator reasons (SDK version, external service) | Skipped with the reason |
+| Category    | Meaning                                                                      | Suite behaviour                                                                                 |
+|:------------|:-----------------------------------------------------------------------------|:------------------------------------------------------------------------------------------------|
+| *(absent)*  | Expected to pass                                                             | Fails if the sample errors (new upstream sample needing triage)                                 |
+| `gap`       | Emulator does not implement the feature; pinned to the Azure error signature | Fails if the sample starts passing (gap closed — remove from registry) or the signature changes |
+| `falsepass` | Exits 0 but the operation silently did not take effect                       | Fails if the side-effect starts happening                                                       |
+| `skip`      | Cannot run here for non-emulator reasons (SDK version, external service)     | Skipped with the reason                                                                         |
 
 ## Current state
 
@@ -64,23 +64,23 @@ Each sample is classified in `KNOWN_ISSUES` (`test_ms_samples.py`):
 
 ### Passes (15)
 
-| Sample | Notes |
-|--------|-------|
-| `sample_query_simple.py` | Genuine pass: simple text search returns the seeded hotel. |
-| `sample_documents_buffered_sender.py` | Genuine pass since the GeographyPoint fix: the `HotelId: 100` document is stored (previously a `falsepass` — the emulator rejected the SDK's `{"type": "Point", "coordinates": [...]}` shape while `SearchIndexingBufferedSender` swallowed the per-document error). |
-| `sample_documents_crud.py` | Genuine pass since the GeographyPoint fix (upload/merge of doc 100) plus the new `GET /indexes('{name}')/docs('{key}')` endpoint (get/delete of doc 100). |
-| `sample_query_facets.py` | Genuine pass since the facet-options fix (`Category,count:3`). |
-| `sample_query_filter.py` | Genuine pass since the complex-type fix (`Address/StateProvince` filter against the `Address` complex field in the seeded hotels index). |
-| `sample_index_analyze_text.py` | Genuine pass since the `POST /search.analyze` fix: tokenizes text and returns tokens with offsets. |
-| `sample_query_session.py` | Genuine pass since the `sessionId` fix: the option is accepted and silently ignored (deterministic ordering makes session affinity irrelevant). |
-| `sample_index_synonym_map_crud.py` | Genuine pass since the synonym-map CRUD fix: create (incl. from file), list, get, and delete of Solr-format maps all round-trip. Maps are stored but inert (see `known_differences.md`). |
-| `sample_query_autocomplete.py` | Genuine pass since the autocomplete fix: `POST /docs/search.post.autocomplete` returns prefix-matched completions (`text` + `queryPlusText`). The seeded hotels yield no match for `"bo"`, so the sample passes on the empty `value` array. |
-| `sample_query_suggestions.py` | Genuine pass since the suggest fix: `POST /docs/search.post.suggest` returns matching documents plus `@search.text`. The seeded hotels yield no match for `"coffee"`, so the sample passes on the empty `value` array. |
-| `sample_query_vector.py` | Genuine pass since the SDK 12 bump plus the OData lambda-filter fix: the sample creates a vector index (`Collection(Edm.Single)` + `vectorSearch` profiles), uploads 7 pre-embedded hotel docs, and runs single-vector, filtered-vector (`Tags/any(tag: tag eq 'free wifi')`), and hybrid searches. |
-| `sample_index_client_custom_request.py` | Genuine pass since the SDK 12 bump: `SearchIndexClient.send_request` GETs the seeded hotels index and prints the echoed definition. |
-| `sample_search_client_custom_request.py` | Genuine pass since the SDK 12 bump: `SearchClient.send_request` GETs `/docs/$count` and prints the document count (4). |
-| `sample_index_alias_crud.py` | Genuine pass since the alias CRUD fix: create, get, update (re-point to the v2 index, which exercises collection-of-complex), and delete of the `hotels-sample-alias` all round-trip. |
-| `sample_agentic_retrieval.py` | Genuine pass since the knowledge CRUD + retrieval fix: creates a knowledge source and knowledge base over the seeded hotels index, `POST /knowledgebases('{name}')/retrieve` returns an empty response (no model inference — see `known_differences.md`), and cleanup deletes both. Passes on the empty `response` array. |
+| Sample                                   | Notes                                                                                                                                                                                                                                                                                                                     |
+|:-----------------------------------------|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `sample_query_simple.py`                 | Genuine pass: simple text search returns the seeded hotel.                                                                                                                                                                                                                                                                |
+| `sample_documents_buffered_sender.py`    | Genuine pass since the GeographyPoint fix: the `HotelId: 100` document is stored (previously a `falsepass` — the emulator rejected the SDK's `{"type": "Point", "coordinates": [...]}` shape while `SearchIndexingBufferedSender` swallowed the per-document error).                                                      |
+| `sample_documents_crud.py`               | Genuine pass since the GeographyPoint fix (upload/merge of doc 100) plus the new `GET /indexes('{name}')/docs('{key}')` endpoint (get/delete of doc 100).                                                                                                                                                                 |
+| `sample_query_facets.py`                 | Genuine pass since the facet-options fix (`Category,count:3`).                                                                                                                                                                                                                                                            |
+| `sample_query_filter.py`                 | Genuine pass since the complex-type fix (`Address/StateProvince` filter against the `Address` complex field in the seeded hotels index).                                                                                                                                                                                  |
+| `sample_index_analyze_text.py`           | Genuine pass since the `POST /search.analyze` fix: tokenizes text and returns tokens with offsets.                                                                                                                                                                                                                        |
+| `sample_query_session.py`                | Genuine pass since the `sessionId` fix: the option is accepted and silently ignored (deterministic ordering makes session affinity irrelevant).                                                                                                                                                                           |
+| `sample_index_synonym_map_crud.py`       | Genuine pass since the synonym-map CRUD fix: create (incl. from file), list, get, and delete of Solr-format maps all round-trip. Maps are stored but inert (see `known_differences.md`).                                                                                                                                  |
+| `sample_query_autocomplete.py`           | Genuine pass since the autocomplete fix: `POST /docs/search.post.autocomplete` returns prefix-matched completions (`text` + `queryPlusText`). The seeded hotels yield no match for `"bo"`, so the sample passes on the empty `value` array.                                                                               |
+| `sample_query_suggestions.py`            | Genuine pass since the suggest fix: `POST /docs/search.post.suggest` returns matching documents plus `@search.text`. The seeded hotels yield no match for `"coffee"`, so the sample passes on the empty `value` array.                                                                                                    |
+| `sample_query_vector.py`                 | Genuine pass since the SDK 12 bump plus the OData lambda-filter fix: the sample creates a vector index (`Collection(Edm.Single)` + `vectorSearch` profiles), uploads 7 pre-embedded hotel docs, and runs single-vector, filtered-vector (`Tags/any(tag: tag eq 'free wifi')`), and hybrid searches.                       |
+| `sample_index_client_custom_request.py`  | Genuine pass since the SDK 12 bump: `SearchIndexClient.send_request` GETs the seeded hotels index and prints the echoed definition.                                                                                                                                                                                       |
+| `sample_search_client_custom_request.py` | Genuine pass since the SDK 12 bump: `SearchClient.send_request` GETs `/docs/$count` and prints the document count (4).                                                                                                                                                                                                    |
+| `sample_index_alias_crud.py`             | Genuine pass since the alias CRUD fix: create, get, update (re-point to the v2 index, which exercises collection-of-complex), and delete of the `hotels-sample-alias` all round-trip.                                                                                                                                     |
+| `sample_agentic_retrieval.py`            | Genuine pass since the knowledge CRUD + retrieval fix: creates a knowledge source and knowledge base over the seeded hotels index, `POST /knowledgebases('{name}')/retrieve` returns an empty response (no model inference — see `known_differences.md`), and cleanup deletes both. Passes on the empty `response` array. |
 
 ### Documented emulator gaps (0)
 
@@ -95,21 +95,21 @@ order (each builds on prior auth-guard / route changes).
 
 #### Completion tracker
 
-| # | Gap | Status | PR / commit |
-|---|-----|--------|-------------|
-| 6 | `sessionId` | ☑ done | |
-| 1 | Document count (`$count`) | ☑ done | |
-| 7 | Service stats (`/servicestats`) | ☑ done | |
-| 2 | Analyze text (`/search.analyze`) | ☑ done | |
-| 3 | Synonym maps CRUD | ☑ done | |
-| 4 | Autocomplete | ☑ done | |
-| 5 | Suggest | ☑ done | |
-| 8 | SDK 12 harness bump (18 samples) | ☑ done | |
-| 9 | Indexers + data sources (3 samples) | ☐ not started | |
-| 10 | AAD bearer auth (1 sample half) | ☐ not started | |
-| 11 | Index aliases (1 sample) | ☑ done | |
-| 12 | Collection-of-complex field types (1 sample) | ☑ done | |
-| 13 | Knowledge sources/bases + agentic retrieval (2 samples) | ☑ done | |
+| #  | Gap                                                     | Status        |
+|:---|:--------------------------------------------------------|:--------------|
+| 6  | `sessionId`                                             | ☑ done        |
+| 1  | Document count (`$count`)                               | ☑ done        |
+| 7  | Service stats (`/servicestats`)                         | ☑ done        |
+| 2  | Analyze text (`/search.analyze`)                        | ☑ done        |
+| 3  | Synonym maps CRUD                                       | ☑ done        |
+| 4  | Autocomplete                                            | ☑ done        |
+| 5  | Suggest                                                 | ☑ done        |
+| 8  | SDK 12 harness bump (18 samples)                        | ☑ done        |
+| 9  | Indexers + data sources (3 samples)                     | ☐ not started |
+| 10 | AAD bearer auth (1 sample half)                         | ☐ not started |
+| 11 | Index aliases (1 sample)                                | ☑ done        |
+| 12 | Collection-of-complex field types (1 sample)            | ☑ done        |
+| 13 | Knowledge sources/bases + agentic retrieval (2 samples) | ☑ done        |
 
 ---
 

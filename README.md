@@ -8,14 +8,15 @@ The emulator is a **compatible test double with a persistent search implementati
 
 ## Status
 
-The project is in **Phase 1 — Application Scaffold and E2E Test**. A runnable HTTP service with Azure-compatible endpoints is implemented, containerised, and exercised by the official Python SDK through testcontainers. See [docs/](docs/) for details.
+The project has completed **Phases 0–2.1**: a runnable, containerised HTTP service implementing the full Phase 2 API surface plus vector indexing and vector/hybrid search (Phase 2.1), exercised by the official Python SDK through testcontainers and probed against Microsoft's reference samples. **Phase 3** (admin API, C# compatibility, Azure comparison, release packaging) is in progress. See [docs/](docs/) for details.
 
-| Phase | Description | Doc |
-|-------|-------------|-----|
-| 0 | Repository setup, tooling, scaffolding | [phase_0_repository_setup.md](docs/phase_0_repository_setup.md) |
-| 1 | Runnable HTTP service, Docker image, Python SDK e2e tests | [phase_1_scaffold_and_e2e.md](docs/phase_1_scaffold_and_e2e.md) |
-| 2 | Full API surface, query engine, storage, contract tests | [phase_2_production_api.md](docs/phase_2_production_api.md) |
-| 3 | Admin API, C# compatibility, Azure comparison, release | [phase_3_admin_api_and_remaining.md](docs/phase_3_admin_api_and_remaining.md) |
+| Phase | Description                                               | Doc                                                                           |
+|:------|:----------------------------------------------------------|:------------------------------------------------------------------------------|
+| 0     | Repository setup, tooling, scaffolding                    | [phase_0_repository_setup.md](docs/phase_0_repository_setup.md)               |
+| 1     | Runnable HTTP service, Docker image, Python SDK e2e tests | [phase_1_scaffold_and_e2e.md](docs/phase_1_scaffold_and_e2e.md)               |
+| 2     | Full API surface, query engine, storage, contract tests   | [phase_2_production_api.md](docs/phase_2_production_api.md)                   |
+| 2.1   | Vector indexing and vector/hybrid search                  | [phase_2_1_vector_indexing.md](docs/phase_2_1_vector_indexing.md)             |
+| 3     | Admin API, C# compatibility, Azure comparison, release    | [phase_3_admin_api_and_remaining.md](docs/phase_3_admin_api_and_remaining.md) |
 
 The overall design, goals, non-goals, and architecture are described in [docs/initial_design.md](docs/initial_design.md).
 
@@ -61,13 +62,14 @@ cargo run --manifest-path source/rust/Cargo.toml
 
 Serves on `http://localhost:8080` by default. Configure via environment variables:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `EMULATOR_PORT` | `8080` | Listen port |
-| `EMULATOR_STORAGE__MODE` | `memory` | `memory` or `file` (file not yet implemented) |
-| `EMULATOR_API_VERSIONS` | `2024-07-01` | Comma-separated supported API versions |
-| `EMULATOR_LOG_LEVEL` | `info` | Log level |
-| `EMULATOR_ENABLE_ADMIN` | `true` | Enable `/admin/reset` |
+| Variable                         | Default      | Description                                   |
+|:---------------------------------|:-------------|:----------------------------------------------|
+| `EMULATOR_PORT`                  | `8080`       | Listen port                                   |
+| `EMULATOR_STORAGE__MODE`         | `memory`     | `memory` or `file` (file not yet implemented) |
+| `EMULATOR_API_VERSIONS`          | `2024-07-01` | Comma-separated supported API versions        |
+| `EMULATOR_LOG_LEVEL`             | `info`       | Log level                                     |
+| `EMULATOR_ENABLE_ADMIN`          | `true`       | Enable `/admin/reset`                         |
+| `EMULATOR_VECTOR__MAX_DIMENSION` | `3072`       | Max accepted vector field dimension           |
 
 ### Docker
 
@@ -93,7 +95,7 @@ poetry install
 poetry run pytest tests/e2e -v
 ```
 
-The E2E suite starts the container via testcontainers and exercises the official `azure-search-documents` SDK: create index, upload documents, search, delete index.
+The E2E suite starts the container via testcontainers and exercises the official `azure-search-documents` SDK: index CRUD, upload, full-text and match-all search, deleted-index error handling, and a RAG-style vector + hybrid search flow.
 
 ## Repository layout
 
