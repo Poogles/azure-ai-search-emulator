@@ -17,6 +17,7 @@ Two differences from the parent e2e harness:
 """
 
 import os
+from collections.abc import Iterator
 
 import pytest
 from testcontainers.core.container import DockerContainer
@@ -35,7 +36,7 @@ os.environ.setdefault("TESTCONTAINERS_RYUK_DISABLED", "true")
 
 
 @pytest.fixture(scope="session")
-def ms_emulator_endpoint():
+def ms_emulator_endpoint() -> Iterator[str]:
     """Start the emulator accepting both API versions and yield its base URL."""
     if not image_exists(IMAGE_NAME):
         import subprocess
@@ -44,6 +45,7 @@ def ms_emulator_endpoint():
             ["docker", "build", "-t", IMAGE_NAME, str(BUILD_CONTEXT)],
             capture_output=True,
             text=True,
+            check=False,
         )
         if result.returncode != 0:
             raise RuntimeError(f"docker build failed:\n{result.stderr}")
@@ -61,7 +63,7 @@ def ms_emulator_endpoint():
 
 
 @pytest.fixture()
-def ms_clean_emulator(ms_emulator_endpoint):
+def ms_clean_emulator(ms_emulator_endpoint: str) -> Iterator[str]:
     """Reset emulator state before each sample run."""
     reset(ms_emulator_endpoint)
     yield ms_emulator_endpoint

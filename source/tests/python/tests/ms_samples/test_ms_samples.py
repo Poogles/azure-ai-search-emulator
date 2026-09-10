@@ -20,11 +20,12 @@ Each discovered sync sample is classified:
 
 import pytest
 from azure.core.credentials import AzureKeyCredential
+from azure.core.exceptions import ResourceNotFoundError
 from azure.search.documents import SearchClient
 
 from ._helpers import (
-    HOTELS_INDEX,
     API_KEY,
+    HOTELS_INDEX,
     discover_samples,
     run_sample,
     seed_hotels,
@@ -66,8 +67,8 @@ KNOWN_ISSUES = {
 
 @pytest.mark.skipif(not SAMPLES, reason=_MISSING or "no samples discovered")
 @pytest.mark.parametrize("sample", SAMPLES)
-def test_ms_sample(ms_clean_emulator, sample):
-    category, detail = KNOWN_ISSUES.get(sample, ("pass", None))
+def test_ms_sample(ms_clean_emulator: str, sample: str) -> None:
+    category, detail = KNOWN_ISSUES.get(sample, ("pass", ""))
 
     if category == "skip":
         pytest.skip(detail)
@@ -95,5 +96,5 @@ def test_ms_sample(ms_clean_emulator, sample):
             index_name=HOTELS_INDEX,
             credential=AzureKeyCredential(API_KEY),
         )
-        with pytest.raises(Exception):
+        with pytest.raises(ResourceNotFoundError):
             client.get_document(key="100")

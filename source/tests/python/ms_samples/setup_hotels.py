@@ -24,7 +24,9 @@ index = SearchIndex(
         SearchField(name="Description", type=S, searchable=True),
         SearchField(name="Description_fr", type=S, searchable=True),
         SearchField(name="Category", type=S, searchable=True, filterable=True, facetable=True),
-        SearchField(name="Tags", type=SearchFieldDataType.Collection(S), searchable=True, filterable=True, facetable=True),
+        SearchField(
+            name="Tags", type="Collection(Edm.String)", searchable=True, filterable=True, facetable=True
+        ),
         SearchField(name="ParkingIncluded", type=SearchFieldDataType.Boolean, filterable=True, facetable=True),
         SearchField(name="IsDeleted", type=SearchFieldDataType.Boolean, filterable=True),
         SearchField(name="LastRenovationDate", type=SearchFieldDataType.DateTimeOffset, filterable=True, sortable=True),
@@ -83,7 +85,7 @@ docs = [
 cred = AzureKeyCredential(key)
 idx = SearchIndexClient(endpoint, cred)
 idx.create_or_update_index(index)
-print(f"created index {index_name}")
+print(f"created index {index_name}")  # noqa: T201 - CLI script, stdout is the interface
 sc = SearchClient(endpoint, index_name, cred)
 res = sc.upload_documents(docs)
-print(f"uploaded {sum(1 for r in res if r.succeeded)}/{len(res)} docs")
+print(f"uploaded {sum(1 for r in res if r.succeeded)}/{len(res)} docs")  # noqa: T201

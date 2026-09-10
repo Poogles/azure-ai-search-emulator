@@ -14,3 +14,35 @@ package-mode = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# The Microsoft samples submodule is upstream code, not ours.
+extend-exclude = ["ms_samples/upstream"]
+
+[tool.ruff.lint]
+extend-select = [
+    "T20", # no print() statements
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+# The harness monkeypatches private SDK modules that import names without
+# re-exporting them; keep implicit reexport allowed so the patches typecheck.
+no_implicit_reexport = false
+exclude = ["ms_samples/upstream"]
+
+[[tool.mypy.overrides]]
+# The knowledge-base APIs are not in the pinned azure-search-documents==12.0.0;
+# tests/sdk/test_sdk.py exercises them ahead of the next SDK bump.
+module = "azure.search.documents.knowledgebases.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# tests/sdk/test_sdk.py targets the next SDK bump (knowledge-base and alias
+# APIs, typed suggest()/autocomplete() results) and does not run against the
+# pinned azure-search-documents==12.0.0; re-enable checking when the SDK is bumped.
+module = "sdk.test_sdk"
+ignore_errors = true

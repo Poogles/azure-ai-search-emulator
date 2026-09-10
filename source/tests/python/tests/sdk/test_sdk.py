@@ -1,11 +1,16 @@
 """SDK compatibility tests: every supported operation through the official SDK."""
 
+import json
+
 import pytest
 from azure.core.credentials import AzureKeyCredential
 from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
 from azure.search.documents import SearchClient
 from azure.search.documents.indexes import SearchIndexClient
-from azure.search.documents.indexes.models import (
+
+# KnowledgeBase/SearchAlias/SearchIndexKnowledgeSource are not in the pinned
+# azure-search-documents==12.0.0; they are exercised ahead of the next SDK bump.
+from azure.search.documents.indexes.models import (  # type: ignore[attr-defined]
     AnalyzeTextOptions,
     KnowledgeBase,
     SearchableField,
@@ -31,14 +36,14 @@ CREDENTIAL = AzureKeyCredential(API_KEY)
 
 
 @pytest.fixture()
-def index_client(clean_emulator) -> SearchIndexClient:
+def index_client(clean_emulator: str) -> SearchIndexClient:
     return SearchIndexClient(
         endpoint=clean_emulator, credential=CREDENTIAL, api_version=API_VERSION
     )
 
 
 @pytest.fixture()
-def search_client(clean_emulator) -> SearchClient:
+def search_client(clean_emulator: str) -> SearchClient:
     return SearchClient(
         endpoint=clean_emulator,
         index_name=INDEX_NAME,
@@ -66,11 +71,11 @@ def full_index() -> SearchIndex:
 
 
 @pytest.fixture()
-def created_index(index_client, full_index):
+def created_index(index_client: SearchIndexClient, full_index: SearchIndex) -> SearchIndex:
     return index_client.create_index(full_index)
 
 
-def test_index_crud(index_client, full_index):
+def test_index_crud(index_client: SearchIndexClient, full_index: SearchIndex) -> None:
     created = index_client.create_index(full_index)
     assert created.name == INDEX_NAME
     fetched = index_client.get_index(INDEX_NAME)
@@ -82,7 +87,9 @@ def test_index_crud(index_client, full_index):
         index_client.get_index(INDEX_NAME)
 
 
-def test_upload_merge_delete(index_client, search_client, full_index):
+def test_upload_merge_delete(
+    index_client: SearchIndexClient, search_client: SearchClient, full_index: SearchIndex
+) -> None:
     index_client.create_index(full_index)
     results = search_client.upload_documents(
         documents=[
@@ -105,7 +112,9 @@ def test_upload_merge_delete(index_client, search_client, full_index):
     assert len(list(search_client.search(search_text="*"))) == 1
 
 
-def test_merge_or_upload(index_client, search_client, full_index):
+def test_merge_or_upload(
+    index_client: SearchIndexClient, search_client: SearchClient, full_index: SearchIndex
+) -> None:
     index_client.create_index(full_index)
     search_client.upload_documents(documents=[{"id": "1", "title": "one", "price": 1.0}])
 
@@ -123,12 +132,12 @@ def test_merge_or_upload(index_client, search_client, full_index):
 
 
 @pytest.fixture()
-def created_full_index(index_client, full_index):
+def created_full_index(index_client: SearchIndexClient, full_index: SearchIndex) -> SearchIndex:
     return index_client.create_index(full_index)
 
 
 @pytest.fixture()
-def priced_docs(search_client, created_full_index):
+def priced_docs(search_client: SearchClient, created_full_index: SearchIndex) -> SearchClient:
     search_client.upload_documents(
         documents=[
             {"id": "1", "title": "cheap red", "price": 5.0, "tags": ["red"]},
@@ -139,7 +148,7 @@ def priced_docs(search_client, created_full_index):
     return search_client
 
 
-def test_search_filter(priced_docs):
+def test_search_filter(priced_docs: SearchClient) -> None:
     found = list(priced_docs.search(search_text="*", filter="price ge 50"))
     assert {doc["id"] for doc in found} == {"2", "3"}
     found = list(priced_docs.search(search_text="*", filter="price lt 10 or price gt 100"))
@@ -148,14 +157,14 @@ def test_search_filter(priced_docs):
     assert [doc["id"] for doc in found] == ["2"]
 
 
-def test_search_order_by(priced_docs):
+def test_search_order_by(priced_docs: SearchClient) -> None:
     found = list(priced_docs.search(search_text="*", order_by="price desc"))
     assert [doc["id"] for doc in found] == ["3", "2", "1"]
     found = list(priced_docs.search(search_text="*", order_by="price asc"))
     assert [doc["id"] for doc in found] == ["1", "2", "3"]
 
 
-def test_search_select(priced_docs):
+def test_search_select(priced_docs: SearchClient) -> None:
     found = list(priced_docs.search(search_text="*", select=["id", "price"]))
     assert len(found) == 3
     for doc in found:
@@ -165,7 +174,7 @@ def test_search_select(priced_docs):
         assert "tags" not in doc
 
 
-def test_search_facets(priced_docs):
+def test_search_facets(priced_docs: SearchClient) -> None:
     results = priced_docs.search(search_text="*", facets=["tags"])
     facets = results.get_facets()
     assert facets is not None
@@ -173,24 +182,26 @@ def test_search_facets(priced_docs):
     assert values == {"red": 2, "blue": 1, "green": 1}
 
 
-def test_search_fields(priced_docs):
+def test_search_fields(priced_docs: SearchClient) -> None:
     found = list(priced_docs.search(search_text="red", search_fields=["title"]))
     assert {doc["id"] for doc in found} == {"1"}
 
 
-def test_search_paging(priced_docs):
+def test_search_paging(priced_docs: SearchClient) -> None:
     pages = list(priced_docs.search(search_text="*", top=2).by_page())
     assert len(pages) == 2
     assert [doc["id"] for doc in pages[0]] == ["1", "2"]
     assert [doc["id"] for doc in pages[1]] == ["3"]
 
 
-def test_search_count(priced_docs):
+def test_search_count(priced_docs: SearchClient) -> None:
     results = priced_docs.search(search_text="*", include_total_count=True)
     assert results.get_count() == 3
 
 
-def test_get_document(index_client, search_client, full_index):
+def test_get_document(
+    index_client: SearchIndexClient, search_client: SearchClient, full_index: SearchIndex
+) -> None:
     index_client.create_index(full_index)
     search_client.upload_documents(documents=[{"id": "1", "title": "one", "price": 1.0}])
     doc = search_client.get_document(key="1")
@@ -201,7 +212,7 @@ def test_get_document(index_client, search_client, full_index):
         search_client.get_document(key="missing")
 
 
-def test_search_facet_options(priced_docs):
+def test_search_facet_options(priced_docs: SearchClient) -> None:
     results = priced_docs.search(search_text="*", facets=["tags,count:1"])
     facets = results.get_facets()
     assert facets is not None
@@ -210,7 +221,7 @@ def test_search_facet_options(priced_docs):
     assert facets["tags"][0]["count"] == 2
 
 
-def test_geography_point_upload(index_client, search_client):
+def test_geography_point_upload(index_client: SearchIndexClient, search_client: SearchClient) -> None:
     index_client.create_index(
         SearchIndex(
             name=INDEX_NAME,
@@ -230,7 +241,7 @@ def test_geography_point_upload(index_client, search_client):
     assert doc["location"] == {"type": "Point", "coordinates": [-122.13, 47.67]}
 
 
-def test_complex_type_filter(index_client, search_client):
+def test_complex_type_filter(index_client: SearchIndexClient, search_client: SearchClient) -> None:
     index_client.create_index(
         SearchIndex(
             name=INDEX_NAME,
@@ -264,7 +275,9 @@ def test_complex_type_filter(index_client, search_client):
     assert found[0]["address"] == {"city": "Miami", "state": "FL"}
 
 
-def test_collection_of_complex_type(index_client, search_client):
+def test_collection_of_complex_type(
+    index_client: SearchIndexClient, search_client: SearchClient
+) -> None:
     index_client.create_index(
         SearchIndex(
             name=INDEX_NAME,
@@ -307,16 +320,18 @@ def test_collection_of_complex_type(index_client, search_client):
     ]
 
 
-def test_count_documents(priced_docs):
+def test_count_documents(priced_docs: SearchClient) -> None:
     assert priced_docs.get_document_count() == 3
 
 
-def test_count_documents_empty(index_client, search_client, full_index):
+def test_count_documents_empty(
+    index_client: SearchIndexClient, search_client: SearchClient, full_index: SearchIndex
+) -> None:
     index_client.create_index(full_index)
     assert search_client.get_document_count() == 0
 
 
-def test_count_documents_missing_index(clean_emulator):
+def test_count_documents_missing_index(clean_emulator: str) -> None:
     client = SearchClient(
         endpoint=clean_emulator,
         index_name="missing",
@@ -327,20 +342,22 @@ def test_count_documents_missing_index(clean_emulator):
         client.get_document_count()
 
 
-def test_service_statistics(index_client):
+def test_service_statistics(index_client: SearchIndexClient) -> None:
     stats = index_client.get_service_statistics()
     assert stats.counters is not None
     assert stats.limits is not None
 
 
-def test_analyze_text(index_client, created_index):
+def test_analyze_text(index_client: SearchIndexClient, created_index: SearchIndex) -> None:
     result = index_client.analyze_text(INDEX_NAME, AnalyzeTextOptions(text="Hello, World!"))
     tokens = [token.token for token in result.tokens]
     assert "hello" in tokens
     assert "world" in tokens
 
 
-def test_search_boolean_operators(index_client, search_client):
+def test_search_boolean_operators(
+    index_client: SearchIndexClient, search_client: SearchClient
+) -> None:
     index_client.create_index(
         SearchIndex(
             name=INDEX_NAME,
@@ -370,12 +387,12 @@ def test_search_boolean_operators(index_client, search_client):
     assert [doc["id"] for doc in found] == ["4"]
 
 
-def test_search_empty_text_matches_all(priced_docs):
+def test_search_empty_text_matches_all(priced_docs: SearchClient) -> None:
     found = list(priced_docs.search(search_text=""))
     assert len(found) == 3
 
 
-def test_search_collection_any_all(priced_docs):
+def test_search_collection_any_all(priced_docs: SearchClient) -> None:
     found = list(priced_docs.search(search_text="*", filter="tags any t eq 'red'"))
     assert {doc["id"] for doc in found} == {"1", "2"}
 
@@ -386,7 +403,7 @@ def test_search_collection_any_all(priced_docs):
     assert {doc["id"] for doc in found} == {"1", "2"}
 
 
-def test_search_facet_top_option(priced_docs):
+def test_search_facet_top_option(priced_docs: SearchClient) -> None:
     results = priced_docs.search(search_text="*", facets=["tags,top:1"])
     facets = results.get_facets()
     assert len(facets["tags"]) == 1
@@ -394,13 +411,15 @@ def test_search_facet_top_option(priced_docs):
     assert facets["tags"][0]["count"] == 2
 
 
-def test_search_facet_star_expands_all_facetable(priced_docs):
+def test_search_facet_star_expands_all_facetable(priced_docs: SearchClient) -> None:
     results = priced_docs.search(search_text="*", facets=["*"])
     facets = results.get_facets()
     assert "tags" in facets
 
 
-def test_search_order_by_multiple_fields(index_client, search_client):
+def test_search_order_by_multiple_fields(
+    index_client: SearchIndexClient, search_client: SearchClient
+) -> None:
     index_client.create_index(
         SearchIndex(
             name=INDEX_NAME,
@@ -422,7 +441,9 @@ def test_search_order_by_multiple_fields(index_client, search_client):
     assert [doc["id"] for doc in found] == ["3", "1", "2"]
 
 
-def test_create_or_update_index_discards_documents(index_client, search_client, full_index):
+def test_create_or_update_index_discards_documents(
+    index_client: SearchIndexClient, search_client: SearchClient, full_index: SearchIndex
+) -> None:
     index_client.create_index(full_index)
     search_client.upload_documents(documents=[{"id": "1", "title": "one"}])
     assert search_client.get_document_count() == 1
@@ -431,14 +452,18 @@ def test_create_or_update_index_discards_documents(index_client, search_client, 
     assert search_client.get_document_count() == 0
 
 
-def test_merge_missing_document_reports_404(index_client, search_client, full_index):
+def test_merge_missing_document_reports_404(
+    index_client: SearchIndexClient, search_client: SearchClient, full_index: SearchIndex
+) -> None:
     index_client.create_index(full_index)
     results = search_client.merge_documents(documents=[{"id": "missing", "price": 1.0}])
     assert results[0].succeeded is False
     assert results[0].status_code == 404
 
 
-def test_delete_missing_document_reports_404(index_client, search_client, full_index):
+def test_delete_missing_document_reports_404(
+    index_client: SearchIndexClient, search_client: SearchClient, full_index: SearchIndex
+) -> None:
     index_client.create_index(full_index)
     results = search_client.delete_documents(documents=[{"id": "missing"}])
     assert results[0].succeeded is False
@@ -446,8 +471,8 @@ def test_delete_missing_document_reports_404(index_client, search_client, full_i
 
 
 def test_upload_invalid_document_reports_per_document_error(
-    index_client, search_client, full_index
-):
+    index_client: SearchIndexClient, search_client: SearchClient, full_index: SearchIndex
+) -> None:
     index_client.create_index(full_index)
     results = search_client.upload_documents(
         documents=[
@@ -462,7 +487,7 @@ def test_upload_invalid_document_reports_per_document_error(
     assert search_client.get_document_count() == 1
 
 
-def test_upload_to_missing_index_returns_404(clean_emulator):
+def test_upload_to_missing_index_returns_404(clean_emulator: str) -> None:
     client = SearchClient(
         endpoint=clean_emulator,
         index_name="missing",
@@ -473,7 +498,7 @@ def test_upload_to_missing_index_returns_404(clean_emulator):
         client.upload_documents(documents=[{"id": "1"}])
 
 
-def test_unsupported_query_options_rejected(priced_docs):
+def test_unsupported_query_options_rejected(priced_docs: SearchClient) -> None:
     cases = [
         {"search_mode": "exact"},
         {"highlight_fields": "title"},
@@ -485,19 +510,25 @@ def test_unsupported_query_options_rejected(priced_docs):
         with pytest.raises(HttpResponseError) as exc_info:
             list(priced_docs.search(search_text="*", **options))
         assert exc_info.value.status_code == 400
-        assert exc_info.value.response.json()["error"]["code"] == "UnsupportedQuery"
+        response = exc_info.value.response
+        assert response is not None
+        assert json.loads(response.text())["error"]["code"] == "UnsupportedQuery"
 
 
-def test_error_body_is_azure_structured(index_client):
+def test_error_body_is_azure_structured(index_client: SearchIndexClient) -> None:
     with pytest.raises(HttpResponseError) as exc_info:
         index_client.get_index("missing")
-    body = exc_info.value.response.json()
+    response = exc_info.value.response
+    assert response is not None
+    body = json.loads(response.text())
     assert set(body) == {"error"}
     assert set(body["error"]) == {"code", "message"}
     assert body["error"]["code"] == "ResourceNotFound"
 
 
-def test_suggest_and_autocomplete(index_client, search_client):
+def test_suggest_and_autocomplete(
+    index_client: SearchIndexClient, search_client: SearchClient
+) -> None:
     index_client.create_index(
         SearchIndex(
             name=INDEX_NAME,
@@ -524,7 +555,7 @@ def test_suggest_and_autocomplete(index_client, search_client):
     assert completions[0].query_plus_text == "bos Boston"
 
 
-def test_synonym_map_crud(index_client):
+def test_synonym_map_crud(index_client: SearchIndexClient) -> None:
     created = index_client.create_synonym_map(SynonymMap(name="sm", synonyms=["a", "b"]))
     assert created.name == "sm"
 
@@ -544,7 +575,7 @@ def test_synonym_map_crud(index_client):
         index_client.get_synonym_map("sm")
 
 
-def test_alias_crud(index_client):
+def test_alias_crud(index_client: SearchIndexClient) -> None:
     created = index_client.create_alias(SearchAlias(name="al", indexes=["i1"]))
     assert created.name == "al"
 
@@ -562,7 +593,7 @@ def test_alias_crud(index_client):
         index_client.get_alias("al")
 
 
-def test_knowledge_source_crud(index_client):
+def test_knowledge_source_crud(index_client: SearchIndexClient) -> None:
     created = index_client.create_knowledge_source(
         SearchIndexKnowledgeSource(
             name="src1",
@@ -593,7 +624,7 @@ def test_knowledge_source_crud(index_client):
         index_client.get_knowledge_source("src1")
 
 
-def test_knowledge_base_crud(clean_emulator, index_client):
+def test_knowledge_base_crud(clean_emulator: str, index_client: SearchIndexClient) -> None:
     index_client.create_knowledge_source(
         SearchIndexKnowledgeSource(
             name="src1",
@@ -617,7 +648,9 @@ def test_knowledge_base_crud(clean_emulator, index_client):
         index_client.get_knowledge_base("kb1")
 
 
-def test_knowledge_base_retrieve_returns_empty(clean_emulator, index_client):
+def test_knowledge_base_retrieve_returns_empty(
+    clean_emulator: str, index_client: SearchIndexClient
+) -> None:
     index_client.create_knowledge_source(
         SearchIndexKnowledgeSource(
             name="src1",

@@ -7,11 +7,11 @@
 # (_enforce_https); the samples use api-key auth, but the shim is kept so a
 # bearer-token sample would still reach the emulator.
 try:
-    import azure.core.pipeline.policies._authentication as _auth
+    from azure.core.pipeline.policies import _authentication as _auth
 
-    def _no_op_enforce_https(request):
+    def _no_op_enforce_https(request: object) -> None:
         return None
 
     _auth._enforce_https = _no_op_enforce_https
-except Exception:
+except Exception:  # noqa: BLE001, S110 - the shim must never break sample startup
     pass

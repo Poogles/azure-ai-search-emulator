@@ -3,6 +3,7 @@
 import json
 import urllib.error
 import urllib.request
+from typing import Any
 
 import pytest
 from azure.core.credentials import AzureKeyCredential
@@ -26,14 +27,14 @@ CREDENTIAL = AzureKeyCredential(API_KEY)
 
 
 @pytest.fixture()
-def index_client(clean_emulator) -> SearchIndexClient:
+def index_client(clean_emulator: str) -> SearchIndexClient:
     return SearchIndexClient(
         endpoint=clean_emulator, credential=CREDENTIAL, api_version=API_VERSION
     )
 
 
 @pytest.fixture()
-def search_client(clean_emulator) -> SearchClient:
+def search_client(clean_emulator: str) -> SearchClient:
     return SearchClient(
         endpoint=clean_emulator,
         index_name=INDEX_NAME,
@@ -54,18 +55,18 @@ def test_index() -> SearchIndex:
 
 
 @pytest.fixture()
-def created_index(index_client, test_index) -> SearchIndex:
+def created_index(index_client: SearchIndexClient, test_index: SearchIndex) -> SearchIndex:
     return index_client.create_index(test_index)
 
 
-def test_health_endpoint(clean_emulator):
+def test_health_endpoint(clean_emulator: str) -> None:
     with urllib.request.urlopen(f"{clean_emulator}/health", timeout=5) as resp:
         assert resp.status == 200
         body = resp.read().decode()
         assert "ok" in body
 
 
-def _raw_get(url, api_key=None):
+def _raw_get(url: str, api_key: str | None = None) -> tuple[int, Any]:
     """Issue a GET and return (status, parsed JSON body) without raising on 4xx/5xx."""
     headers = {"Accept": "application/json"}
     if api_key is not None:
@@ -78,37 +79,39 @@ def _raw_get(url, api_key=None):
         return exc.code, json.loads(exc.read().decode())
 
 
-def test_missing_api_key_returns_401(clean_emulator):
+def test_missing_api_key_returns_401(clean_emulator: str) -> None:
     url = f"{clean_emulator}/indexes?api-version={API_VERSION}"
     status, body = _raw_get(url, api_key=None)
     assert status == 401
     assert body["error"]["code"] == "AuthenticationFailed"
 
 
-def test_empty_api_key_returns_401(clean_emulator):
+def test_empty_api_key_returns_401(clean_emulator: str) -> None:
     url = f"{clean_emulator}/indexes?api-version={API_VERSION}"
     status, body = _raw_get(url, api_key="")
     assert status == 401
     assert body["error"]["code"] == "AuthenticationFailed"
 
 
-def test_missing_api_version_returns_400(clean_emulator):
+def test_missing_api_version_returns_400(clean_emulator: str) -> None:
     status, body = _raw_get(f"{clean_emulator}/indexes", api_key=API_KEY)
     assert status == 400
     assert body["error"]["code"] == "ApiVersionMissing"
 
 
-def test_unsupported_api_version_returns_400(clean_emulator):
+def test_unsupported_api_version_returns_400(clean_emulator: str) -> None:
     client = SearchIndexClient(
         endpoint=clean_emulator, credential=CREDENTIAL, api_version="1900-01-01"
     )
     with pytest.raises(HttpResponseError) as exc_info:
         list(client.list_indexes())
     assert exc_info.value.status_code == 400
-    assert exc_info.value.response.json()["error"]["code"] == "ApiVersionUnsupported"
+    response = exc_info.value.response
+    assert response is not None
+    assert json.loads(response.text())["error"]["code"] == "ApiVersionUnsupported"
 
 
-def test_error_body_is_azure_structured(clean_emulator):
+def test_error_body_is_azure_structured(clean_emulator: str) -> None:
     url = f"{clean_emulator}/indexes?api-version={API_VERSION}"
     status, body = _raw_get(url, api_key=None)
     assert status == 401
@@ -117,7 +120,7 @@ def test_error_body_is_azure_structured(clean_emulator):
     assert isinstance(body["error"]["message"], str)
 
 
-def _raw_post(url, payload, api_key=API_KEY):
+def _raw_post(url: str, payload: dict[str, Any], api_key: str = API_KEY) -> tuple[int, Any]:
     """Issue a JSON POST and return (status, parsed JSON body) without raising."""
     req = urllib.request.Request(
         url,
@@ -132,7 +135,12 @@ def _raw_post(url, payload, api_key=API_KEY):
         return exc.code, json.loads(exc.read().decode())
 
 
-def test_search_facet_count(clean_emulator, index_client, search_client, test_index):
+def test_search_facet_count(
+    clean_emulator: str,
+    index_client: SearchIndexClient,
+    search_client: SearchClient,
+    test_index: SearchIndex,
+) -> None:
     """The ``$count`` facet reports the result-set size as a bare number.
 
     Exercised over raw HTTP because the pinned SDK types
@@ -154,25 +162,25 @@ def test_search_facet_count(clean_emulator, index_client, search_client, test_in
     assert body["@search.facets"]["$count"] == 3
 
 
-def test_create_index(created_index):
+def test_create_index(created_index: SearchIndex) -> None:
     assert created_index.name == INDEX_NAME
     assert len(created_index.fields) == 2
 
 
-def test_create_duplicate_index_fails(index_client, test_index):
+def test_create_duplicate_index_fails(index_client: SearchIndexClient, test_index: SearchIndex) -> None:
     index_client.create_index(test_index)
     with pytest.raises(HttpResponseError) as exc_info:
         index_client.create_index(test_index)
     assert exc_info.value.status_code == 409
 
 
-def test_list_indexes(index_client, test_index):
+def test_list_indexes(index_client: SearchIndexClient, test_index: SearchIndex) -> None:
     index_client.create_index(test_index)
     names = [index.name for index in index_client.list_indexes()]
     assert names == [INDEX_NAME]
 
 
-def test_update_index(index_client, test_index):
+def test_update_index(index_client: SearchIndexClient, test_index: SearchIndex) -> None:
     index_client.create_index(test_index)
     updated = test_index
     updated.fields[1].searchable = False
@@ -181,14 +189,16 @@ def test_update_index(index_client, test_index):
     assert fetched.fields[1].searchable is False
 
 
-def test_delete_index(index_client, test_index):
+def test_delete_index(index_client: SearchIndexClient, test_index: SearchIndex) -> None:
     index_client.create_index(test_index)
     index_client.delete_index(INDEX_NAME)
     with pytest.raises(ResourceNotFoundError):
         index_client.get_index(INDEX_NAME)
 
 
-def test_upload_and_search(index_client, search_client, test_index):
+def test_upload_and_search(
+    index_client: SearchIndexClient, search_client: SearchClient, test_index: SearchIndex
+) -> None:
     index_client.create_index(test_index)
 
     docs = [
@@ -207,7 +217,9 @@ def test_upload_and_search(index_client, search_client, test_index):
     assert ids == {"1", "3"}
 
 
-def test_search_match_all(index_client, search_client, test_index):
+def test_search_match_all(
+    index_client: SearchIndexClient, search_client: SearchClient, test_index: SearchIndex
+) -> None:
     index_client.create_index(test_index)
     search_client.upload_documents(
         documents=[
@@ -220,7 +232,9 @@ def test_search_match_all(index_client, search_client, test_index):
     assert len(results) == 2
 
 
-def test_operations_on_deleted_index_fail(index_client, search_client, test_index):
+def test_operations_on_deleted_index_fail(
+    index_client: SearchIndexClient, search_client: SearchClient, test_index: SearchIndex
+) -> None:
     index_client.create_index(test_index)
     index_client.delete_index(INDEX_NAME)
 
@@ -229,7 +243,9 @@ def test_operations_on_deleted_index_fail(index_client, search_client, test_inde
         list(search_client.search(search_text="test", top=1))
 
 
-def test_rag_style_vector_and_hybrid_flow(index_client, search_client):
+def test_rag_style_vector_and_hybrid_flow(
+    index_client: SearchIndexClient, search_client: SearchClient
+) -> None:
     """RAG-style flow: text + vector fields, embedding upload, vector and
     hybrid retrieval with ordering (never exact scores)."""
     from azure.search.documents.indexes.models import (
@@ -258,7 +274,6 @@ def test_rag_style_vector_and_hybrid_flow(index_client, search_client):
                 algorithms=[
                     HnswAlgorithmConfiguration(
                         name="hnsw-1",
-                        kind="hnsw",
                         parameters=HnswParameters(metric="cosine"),
                     ),
                 ],

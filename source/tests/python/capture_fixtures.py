@@ -10,6 +10,7 @@ import argparse
 import json
 import re
 from pathlib import Path
+from typing import Any, Self
 
 from azure.core.credentials import AzureKeyCredential
 from azure.core.pipeline.transport import (
@@ -18,7 +19,6 @@ from azure.core.pipeline.transport import (
     HttpTransport,
     RequestsTransport,
 )
-import azure.search.documents.indexes._search_index_client as _search_index_client
 from azure.search.documents import SearchClient
 from azure.search.documents.indexes import SearchIndexClient
 from azure.search.documents.indexes.models import (
@@ -33,26 +33,19 @@ INDEX_NAME = "fixture-index"
 # The emulator's default supported API version (see EMULATOR_API_VERSIONS).
 API_VERSION = "2024-07-01"
 
-
-def _allow_http_endpoint(endpoint: str) -> str:
-    if not endpoint.lower().startswith("http"):
-        return "https://" + endpoint
-    return endpoint
-
-
-# The pinned SDK's SearchIndexClient rejects non-TLS endpoints via
-# normalize_endpoint. The emulator is a local plain-HTTP service, so allow http.
-_search_index_client.normalize_endpoint = _allow_http_endpoint
+# The pinned SDK (azure-search-documents==12.0.0) uses the endpoint URL verbatim,
+# so the plain-HTTP local emulator needs no endpoint shim.
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
-class RecordingTransport(HttpTransport):
+class RecordingTransport(HttpTransport[HttpRequest, HttpResponse]):
     """Delegates to the default transport and records every exchange."""
 
     def __init__(self) -> None:
         super().__init__()
         self._inner: RequestsTransport | None = None
-        self.records: list[dict] = []
+        # TODO: replace Any with a TypedDict describing the recorded exchange shape.
+        self.records: list[Any] = []
 
     def open(self) -> None:
         self._inner = RequestsTransport()
@@ -63,16 +56,18 @@ class RecordingTransport(HttpTransport):
             self._inner.close()
             self._inner = None
 
-    def __enter__(self) -> "RecordingTransport":
+    def __enter__(self) -> Self:
         self.open()
         return self
 
     def __exit__(self, *args: object) -> None:
         self.close()
 
-    def send(self, request: HttpRequest, **kwargs) -> HttpResponse:
+    def send(self, request: HttpRequest, **kwargs: Any) -> HttpResponse:
         assert self._inner is not None
-        response = self._inner.send(request, **kwargs)
+        # RequestsTransport subclasses the unparameterised HttpTransport, so its
+        # inherited send() is typed to return Any; the runtime type is HttpResponse.
+        response: HttpResponse = self._inner.send(request, **kwargs)
         request_body = request.data
         if isinstance(request_body, bytes):
             request_body = request_body.decode("utf-8", errors="replace")
@@ -91,7 +86,7 @@ class RecordingTransport(HttpTransport):
         return response
 
 
-def _strip_dynamic_headers(headers: dict) -> dict:
+def _strip_dynamic_headers(headers: dict[str, str]) -> dict[str, str]:
     """Drop per-request dynamic headers (request IDs, timestamps)."""
     return {
         k: v
@@ -100,7 +95,7 @@ def _strip_dynamic_headers(headers: dict) -> dict:
     }
 
 
-def sanitize(record: dict) -> dict:
+def sanitize(record: dict[str, Any]) -> dict[str, Any]:
     """Strip dynamic values from a recorded exchange.
 
     Removes per-request values (client request IDs, timestamps, UUIDs) and
@@ -203,7 +198,6 @@ def main() -> None:
                 algorithms=[
                     HnswAlgorithmConfiguration(
                         name="hnsw-1",
-                        kind="hnsw",
                         parameters=HnswParameters(m=4, metric="cosine"),
                     ),
                 ],
@@ -249,9 +243,9 @@ def main() -> None:
         sanitized = sanitize(record)
         path = out_dir / f"{i:02d}_{record['method']}_{INDEX_NAME}.json"
         path.write_text(json.dumps(sanitized, indent=2))
-        print(f"  {path}")
+        print(f"  {path}")  # noqa: T201 - CLI script, stdout is the interface
 
-    print(f"\nCaptured {len(transport.records)} exchanges -> {out_dir}/")
+    print(f"\nCaptured {len(transport.records)} exchanges -> {out_dir}/")  # noqa: T201
 
 
 if __name__ == "__main__":

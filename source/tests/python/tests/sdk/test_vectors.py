@@ -10,13 +10,12 @@ from azure.search.documents.indexes.models import (
     HnswAlgorithmConfiguration,
     HnswParameters,
     SearchField,
-    SearchFieldDataType,
     SearchIndex,
     SimpleField,
     VectorSearch,
     VectorSearchProfile,
 )
-from azure.search.documents.models import VectorizedQuery
+from azure.search.documents.models import VectorizedQuery, VectorQuery
 
 API_KEY = "test-key"
 INDEX_NAME = "vector-index"
@@ -25,14 +24,14 @@ CREDENTIAL = AzureKeyCredential(API_KEY)
 
 
 @pytest.fixture()
-def index_client(clean_emulator) -> SearchIndexClient:
+def index_client(clean_emulator: str) -> SearchIndexClient:
     return SearchIndexClient(
         endpoint=clean_emulator, credential=CREDENTIAL, api_version=API_VERSION
     )
 
 
 @pytest.fixture()
-def search_client(clean_emulator) -> SearchClient:
+def search_client(clean_emulator: str) -> SearchClient:
     return SearchClient(
         endpoint=clean_emulator,
         index_name=INDEX_NAME,
@@ -61,14 +60,12 @@ def vector_index() -> SearchIndex:
             algorithms=[
                 HnswAlgorithmConfiguration(
                     name="hnsw-1",
-                    kind="hnsw",
                     parameters=HnswParameters(
                         m=4, ef_construction=40, ef_search=20, metric="cosine"
                     ),
                 ),
                 ExhaustiveKnnAlgorithmConfiguration(
                     name="eknn-1",
-                    kind="exhaustiveKnn",
                     parameters=ExhaustiveKnnParameters(metric="cosine"),
                 ),
             ],
@@ -80,7 +77,9 @@ def vector_index() -> SearchIndex:
 
 
 @pytest.fixture()
-def vector_docs(search_client, index_client, vector_index):
+def vector_docs(
+    search_client: SearchClient, index_client: SearchIndexClient, vector_index: SearchIndex
+) -> SearchClient:
     index_client.create_index(vector_index)
     results = search_client.upload_documents(
         documents=[
@@ -114,7 +113,7 @@ def vector_docs(search_client, index_client, vector_index):
     return search_client
 
 
-def test_vector_index_crud(index_client, vector_index):
+def test_vector_index_crud(index_client: SearchIndexClient, vector_index: SearchIndex) -> None:
     created = index_client.create_index(vector_index)
     assert created.name == INDEX_NAME
     fetched = index_client.get_index(INDEX_NAME)
@@ -122,7 +121,7 @@ def test_vector_index_crud(index_client, vector_index):
     index_client.delete_index(INDEX_NAME)
 
 
-def test_vector_search_returns_nearest_first(vector_docs):
+def test_vector_search_returns_nearest_first(vector_docs: SearchClient) -> None:
     found = list(
         vector_docs.search(
             vector_queries=[
@@ -137,7 +136,7 @@ def test_vector_search_returns_nearest_first(vector_docs):
     assert scores[0] >= scores[1]
 
 
-def test_vector_search_exhaustive(vector_docs):
+def test_vector_search_exhaustive(vector_docs: SearchClient) -> None:
     found = list(
         vector_docs.search(
             vector_queries=[
@@ -153,7 +152,7 @@ def test_vector_search_exhaustive(vector_docs):
     assert len(found) == 4
 
 
-def test_hybrid_search_returns_union(vector_docs):
+def test_hybrid_search_returns_union(vector_docs: SearchClient) -> None:
     found = list(
         vector_docs.search(
             search_text="azure",
@@ -169,8 +168,8 @@ def test_hybrid_search_returns_union(vector_docs):
     assert ids == {"1", "2", "3", "4"}
 
 
-def test_vector_filter_modes(vector_docs):
-    queries = [
+def test_vector_filter_modes(vector_docs: SearchClient) -> None:
+    queries: list[VectorQuery] = [
         VectorizedQuery(
             vector=[1.0, 0.0, 0.0], k_nearest_neighbors=1, fields="content_vector"
         )
@@ -195,7 +194,7 @@ def test_vector_filter_modes(vector_docs):
     assert [doc["id"] for doc in pre] == ["4"]
 
 
-def test_multiple_vector_queries_union(vector_docs):
+def test_multiple_vector_queries_union(vector_docs: SearchClient) -> None:
     found = list(
         vector_docs.search(
             vector_queries=[
@@ -228,7 +227,6 @@ def _metric_index(metric: str) -> SearchIndex:
             algorithms=[
                 HnswAlgorithmConfiguration(
                     name="hnsw-1",
-                    kind="hnsw",
                     parameters=HnswParameters(m=4, ef_construction=40, ef_search=20, metric=metric),
                 )
             ],
@@ -237,7 +235,7 @@ def _metric_index(metric: str) -> SearchIndex:
     )
 
 
-def test_dot_product_metric(index_client, search_client):
+def test_dot_product_metric(index_client: SearchIndexClient, search_client: SearchClient) -> None:
     index_client.create_index(_metric_index("dotProduct"))
     search_client.upload_documents(
         documents=[
@@ -259,7 +257,7 @@ def test_dot_product_metric(index_client, search_client):
     assert found[0]["@search.score"] == 200.0
 
 
-def test_euclidean_metric(index_client, search_client):
+def test_euclidean_metric(index_client: SearchIndexClient, search_client: SearchClient) -> None:
     index_client.create_index(_metric_index("euclidean"))
     search_client.upload_documents(
         documents=[
@@ -280,7 +278,9 @@ def test_euclidean_metric(index_client, search_client):
     assert [doc["@search.score"] for doc in found] == [1.0, 0.5, 0.25]
 
 
-def test_non_retrievable_vector_omitted_unless_selected(index_client, search_client):
+def test_non_retrievable_vector_omitted_unless_selected(
+    index_client: SearchIndexClient, search_client: SearchClient
+) -> None:
     index_client.create_index(
         SearchIndex(
             name=INDEX_NAME,
@@ -306,12 +306,10 @@ def test_non_retrievable_vector_omitted_unless_selected(index_client, search_cli
                 algorithms=[
                     HnswAlgorithmConfiguration(
                         name="hnsw-1",
-                        kind="hnsw",
                         parameters=HnswParameters(m=4, ef_construction=40, ef_search=20),
                     ),
                     ExhaustiveKnnAlgorithmConfiguration(
                         name="eknn-1",
-                        kind="exhaustiveKnn",
                         parameters=ExhaustiveKnnParameters(),
                     ),
                 ],
@@ -336,7 +334,7 @@ def test_non_retrievable_vector_omitted_unless_selected(index_client, search_cli
             },
         ]
     )
-    queries = [
+    queries: list[VectorQuery] = [
         VectorizedQuery(
             vector=[1.0, 0.0, 0.0], k_nearest_neighbors=1, fields="content_vector"
         )
@@ -353,13 +351,15 @@ def test_non_retrievable_vector_omitted_unless_selected(index_client, search_cli
     assert "content_vector" in found[0]
 
 
-def test_vector_search_with_orderby_orders_by_field(index_client, search_client):
+def test_vector_search_with_orderby_orders_by_field(
+    index_client: SearchIndexClient, search_client: SearchClient
+) -> None:
     index_client.create_index(
         SearchIndex(
             name=INDEX_NAME,
             fields=[
                 SearchField(name="id", type="Edm.String", key=True),
-                SimpleField(name="price", type=SearchFieldDataType.Double, sortable=True),
+                SimpleField(name="price", type="Edm.Double", sortable=True),
                 SearchField(
                     name="content_vector",
                     type="Collection(Edm.Single)",
@@ -372,7 +372,6 @@ def test_vector_search_with_orderby_orders_by_field(index_client, search_client)
                 algorithms=[
                     HnswAlgorithmConfiguration(
                         name="hnsw-1",
-                        kind="hnsw",
                         parameters=HnswParameters(m=4, ef_construction=40, ef_search=20),
                     )
                 ],
@@ -396,7 +395,7 @@ def test_vector_search_with_orderby_orders_by_field(index_client, search_client)
                     vector=[0.0, 1.0, 0.0], k_nearest_neighbors=2, fields="content_vector"
                 )
             ],
-            order_by="price asc",
+            order_by=["price asc"],
         )
     )
     assert [doc["id"] for doc in found] == ["2", "1"]

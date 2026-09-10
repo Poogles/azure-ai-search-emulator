@@ -4,10 +4,11 @@ import os
 import subprocess
 import time
 import urllib.request
+from collections.abc import Iterator
 from pathlib import Path
 
-import azure.core.pipeline.policies._authentication as _authentication
 import pytest
+from azure.core.pipeline.policies import _authentication
 from testcontainers.core.container import DockerContainer
 
 # Disable testcontainers' Ryuk cleanup container. It fails to mount the Docker
@@ -42,7 +43,7 @@ def _wait_for_health(url: str, timeout: float = 30.0) -> None:
             with urllib.request.urlopen(f"{url}/health", timeout=2) as resp:
                 if resp.status == 200:
                     return
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - any failure means "not up yet"; retry
             pass
         time.sleep(0.5)
     raise RuntimeError(f"emulator did not become healthy within {timeout}s")
@@ -63,12 +64,13 @@ def _image_exists(name: str) -> bool:
     result = subprocess.run(
         ["docker", "image", "inspect", name],
         capture_output=True,
+        check=False,
     )
     return result.returncode == 0
 
 
 @pytest.fixture(scope="session")
-def emulator_image():
+def emulator_image() -> Iterator[str]:
     """Use the Docker image, building it first if it is not already present.
 
     CI loads a pre-built image (see .github/workflows/ci.yml); local runs build
@@ -79,6 +81,7 @@ def emulator_image():
             ["docker", "build", "-t", IMAGE_NAME, str(BUILD_CONTEXT)],
             capture_output=True,
             text=True,
+            check=False,
         )
         if result.returncode != 0:
             raise RuntimeError(f"docker build failed:\n{result.stderr}")
@@ -86,7 +89,7 @@ def emulator_image():
 
 
 @pytest.fixture(scope="session")
-def emulator_endpoint(emulator_image):
+def emulator_endpoint(emulator_image: str) -> Iterator[str]:
     """Start the emulator container and yield its base URL."""
     container = DockerContainer(emulator_image).with_exposed_ports(CONTAINER_PORT)
     with container:
@@ -98,7 +101,7 @@ def emulator_endpoint(emulator_image):
 
 
 @pytest.fixture()
-def clean_emulator(emulator_endpoint):
+def clean_emulator(emulator_endpoint: str) -> Iterator[str]:
     """Reset emulator state before each test."""
     _reset(emulator_endpoint)
     yield emulator_endpoint

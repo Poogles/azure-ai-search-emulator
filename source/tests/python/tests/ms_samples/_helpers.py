@@ -67,7 +67,7 @@ def wait_for_health(url: str, timeout: float = 30.0) -> None:
             with urllib.request.urlopen(f"{url}/health", timeout=2) as resp:
                 if resp.status == 200:
                     return
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - any failure means "not up yet"; retry
             pass
         time.sleep(0.5)
     raise RuntimeError(f"emulator did not become healthy within {timeout}s")
@@ -85,7 +85,12 @@ def reset(endpoint: str) -> None:
 
 
 def image_exists(name: str) -> bool:
-    return subprocess.run(["docker", "image", "inspect", name], capture_output=True).returncode == 0
+    return (
+        subprocess.run(
+            ["docker", "image", "inspect", name], capture_output=True, check=False
+        ).returncode
+        == 0
+    )
 
 
 def seed_hotels(endpoint: str, index_name: str = HOTELS_INDEX) -> None:
@@ -102,12 +107,15 @@ def seed_hotels(endpoint: str, index_name: str = HOTELS_INDEX) -> None:
         env=env,
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode != 0:
         raise RuntimeError(f"hotels seed failed:\n{result.stderr}\n{result.stdout}")
 
 
-def run_sample(endpoint: str, sample: str, index_name: str = HOTELS_INDEX) -> subprocess.CompletedProcess:
+def run_sample(
+    endpoint: str, sample: str, index_name: str = HOTELS_INDEX
+) -> subprocess.CompletedProcess[str]:
     """Run one Microsoft sample script as a subprocess against the emulator."""
     env = dict(
         os.environ,
@@ -122,4 +130,5 @@ def run_sample(endpoint: str, sample: str, index_name: str = HOTELS_INDEX) -> su
         capture_output=True,
         text=True,
         timeout=120,
+        check=False,
     )
