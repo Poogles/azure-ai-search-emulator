@@ -27,8 +27,8 @@ machine-readable one.
 - Two harness-only adaptations, both documented in
   `source/tests/python/tests/ms_samples/conftest.py`:
   - The samples do not pin an `api-version`, so they send the SDK default
-    (`2025-09-01` for the pinned SDK). The probe container accepts
-    `2024-07-01,2025-09-01`.
+    (`2026-04-01` for the pinned SDK 12.0.0). The probe container accepts
+    `2024-07-01,2026-04-01`.
   - Subprocesses re-apply the plain-HTTP shims via
     `ms_samples/shims/sitecustomize.py` on `PYTHONPATH`.
 - Samples that assume the portal `hotels-sample-index` get it from
@@ -59,11 +59,11 @@ Each sample is classified in `KNOWN_ISSUES` (`test_ms_samples.py`):
 
 ## Current state
 
-32 sync samples discovered. `make test-ms`: **10 passed, 22 skipped, 0 failed.**
-(All 10 passes are genuine; the 2 former gap pins now pass for real: 10
-genuine passes + 0 gap pins.)
+32 sync samples discovered. `make test-ms`: **17 passed, 15 skipped, 0 failed.**
+(13 genuine passes + 4 gap pins that fail with the documented Azure error
+signature: 13 genuine + 4 pinned.)
 
-### Passes (10)
+### Passes (13)
 
 | Sample | Notes |
 |--------|-------|
@@ -77,10 +77,20 @@ genuine passes + 0 gap pins.)
 | `sample_index_synonym_map_crud.py` | Genuine pass since the synonym-map CRUD fix: create (incl. from file), list, get, and delete of Solr-format maps all round-trip. Maps are stored but inert (see `known_differences.md`). |
 | `sample_query_autocomplete.py` | Genuine pass since the autocomplete fix: `POST /docs/search.post.autocomplete` returns prefix-matched completions (`text` + `queryPlusText`). The seeded hotels yield no match for `"bo"`, so the sample passes on the empty `value` array. |
 | `sample_query_suggestions.py` | Genuine pass since the suggest fix: `POST /docs/search.post.suggest` returns matching documents plus `@search.text`. The seeded hotels yield no match for `"coffee"`, so the sample passes on the empty `value` array. |
+| `sample_query_vector.py` | Genuine pass since the SDK 12 bump plus the OData lambda-filter fix: the sample creates a vector index (`Collection(Edm.Single)` + `vectorSearch` profiles), uploads 7 pre-embedded hotel docs, and runs single-vector, filtered-vector (`Tags/any(tag: tag eq 'free wifi')`), and hybrid searches. |
+| `sample_index_client_custom_request.py` | Genuine pass since the SDK 12 bump: `SearchIndexClient.send_request` GETs the seeded hotels index and prints the echoed definition. |
+| `sample_search_client_custom_request.py` | Genuine pass since the SDK 12 bump: `SearchClient.send_request` GETs `/docs/$count` and prints the document count (4). |
 
-### Documented emulator gaps (0)
+### Documented emulator gaps (4)
 
-All error-signature gaps are closed. Historical plans for each gap are in [Gap implementation plans](#gap-implementation-plans) below. The remaining 22 skips are tracked as Gaps 8–10 (same format, `☐ not started`).
+| Sample | Pinned signature | Gap |
+|--------|------------------|-----|
+| `sample_agentic_retrieval.py` | `Invalid index path segment "knowledgesources(` | [Gap 13](#gap-13--knowledge-sourcesbases--agentic-retrieval-large) — knowledge sources not implemented |
+| `sample_index_alias_crud.py` | `Method Not Allowed` | [Gap 11](#gap-11--index-aliases-mediummedium-plus) — index aliases not implemented |
+| `sample_index_crud.py` | `Unsupported field type "Edm.Collection(Edm.ComplexType)"` | [Gap 12](#gap-12--collection-of-complex-types-mediummedium-plus) — collection-of-complex fields rejected |
+| `sample_knowledge_source_crud.py` | `Invalid index path segment "knowledgesources(` | [Gap 13](#gap-13--knowledge-sourcesbases--agentic-retrieval-large) — knowledge sources not implemented |
+
+Historical plans for closed gaps, and requirements for the open ones, are in [Gap implementation plans](#gap-implementation-plans) below. The remaining 15 skips are tracked as Gaps 9–10 plus preview-SDK / SDK-bug skips (same format, `☐ not started` where applicable).
 
 ### Gap implementation plans
 
@@ -98,9 +108,12 @@ order (each builds on prior auth-guard / route changes).
 | 3 | Synonym maps CRUD | ☑ done | |
 | 4 | Autocomplete | ☑ done | |
 | 5 | Suggest | ☑ done | |
-| 8 | SDK 12 harness bump (18 samples) | ☐ not started | |
+| 8 | SDK 12 harness bump (18 samples) | ☑ done | |
 | 9 | Indexers + data sources (3 samples) | ☐ not started | |
 | 10 | AAD bearer auth (1 sample half) | ☐ not started | |
+| 11 | Index aliases (1 sample) | ☐ not started | |
+| 12 | Collection-of-complex field types (1 sample) | ☐ not started | |
+| 13 | Knowledge sources/bases + agentic retrieval (2 samples) | ☐ not started | |
 
 ---
 
@@ -333,35 +346,56 @@ both `searchFields` / `sourceFields`.
 
 ---
 
-#### Gap 8 — SDK 12 harness bump (medium)
+#### Gap 8 — SDK 12 harness bump (medium) ✅
 
 **Samples (18):** `sample_agentic_retrieval.py`, `sample_knowledge_service_stats_preview.py`, `sample_index_alias_crud.py`, `sample_index_client_custom_request.py`, `sample_index_crud.py`, `sample_query_semantic.py`, `sample_query_vector.py`, `sample_search_client_custom_request.py`, `sample_knowledge_base_configuration_preview.py`, `sample_knowledge_base_crud.py`, `sample_knowledge_retrieval_response_preview.py`, `sample_knowledge_source_crud.py`, `sample_knowledge_source_fabric_data_agent_preview.py`, `sample_knowledge_source_fabric_ontology_preview.py`, `sample_knowledge_source_file_preview.py`, `sample_knowledge_source_freshness_preview.py`, `sample_knowledge_source_mcp_server_preview.py`, `sample_knowledge_source_workiq_preview.py`
 **Route:** N/A (harness dependency)
-**Current failure:** samples fail at import / SDK internals (`SearchAlias`, `DEFAULT_VERSION`, `SearchFieldDataType.STRING`, semantic query kwargs, typed service-stats model, `knowledgebases` module) before any HTTP reaches the emulator; classified as `skip`.
+**Was:** samples failed at import / SDK internals under the pinned 11.6.0; classified as `skip`.
 
-**What is required:**
+**What was done:**
 
-- [ ] Bump `azure-search-documents==11.6.0` to 12.x in
-      `source/tests/python/pyproject.toml`, regenerate the lockfile, rebuild
-      the venv (check `requires-python` compatibility: harness is `>=3.12`).
-- [ ] Re-validate the emulator's wire contract against 12.x **before**
-      triaging: 12 renames models and enums (precedent: `SearchSuggester` →
-      `Suggester`, `sourceFields` → `searchFields` between 11.6.0 and the
-      REST docs). Expect the currently-passing 10 to wobble; fix regressions
-      first (new `KNOWN_ISSUES` `gap` pins only for genuine new divergences).
-- [ ] Triage the newly-runnable samples into new emulator gaps vs new
-      external-service skips. Vector search is now implemented (Phase 2.1,
-      see `phase_2_1_vector_indexing.md`), so `sample_query_vector.py` is
-      expected to pass — triage only for genuine divergences (e.g. an
-      unsupported metric or the inert `stored` property). Expected new gaps:
-      index aliases, semantic query (`sample_query_semantic.py` — `semantic`
-      is rejected with `400 UnsupportedQuery`; semantic search is out of
-      scope), knowledge base/source CRUD, agentic retrieval. Expected
-      permanently unrunnable here: the Fabric/ontology/file/freshness/MCP/
-      WorkIQ knowledge-source samples, which point at live external data.
-- [ ] Update `docs/supported_operations.md` (SDK version under test) and this
-      document (state table, pinned wire notes).
-- [ ] Run `make test-ms` to confirm.
+- [x] Bumped `azure-search-documents==11.6.0` to `==12.0.0` in
+      `source/tests/python/pyproject.toml`, regenerated `poetry.lock`
+      (drops `azure-common`; `azure-core>=1.37`, `isodate>=0.6.1`), rebuilt
+      the venv (`requires-python >=3.12` unaffected; SDK 12 needs `>=3.9`).
+- [x] Re-validated the wire contract against 12.0.0 **before** triaging.
+      Actual 11.6.0 → 12.0.0 deltas (correcting the pre-bump predictions):
+      the SDK default `api-version` is now `2026-04-01` (both `SearchClient`
+      and `SearchIndexClient`); the probe container now accepts
+      `2024-07-01,2026-04-01`. `SearchFieldDataType` gained uppercase members
+      (`.STRING`, …) but keeps the old lowercase names as aliases, so the
+      harness seed files are unchanged. `SearchSuggester` is still the model
+      name (the predicted `SearchSuggester` → `Suggester` rename did not
+      happen) and the wire key is still `sourceFields`; the emulator accepts
+      both `sourceFields` / `searchFields` as before. `SearchAlias` and the
+      `knowledgebases` module now exist; `DEFAULT_VERSION` is exported from
+      `azure.search.documents` (not from `indexes`). The plain-HTTP shims
+      were updated: 12.0.0 removed `indexes._search_index_client`
+      (`normalize_endpoint` is gone — the endpoint URL is used verbatim, so
+      `http://` works for api-key auth with no shim) and `_enforce_https`
+      remains bearer-token-only, so the shim now patches just that. All 10
+      previously-passing samples still pass — no regressions.
+- [x] Triaged the newly-runnable samples: 3 genuine passes
+      (`sample_query_vector.py` — after the OData lambda-filter fix below —
+      plus both `*_custom_request.py` samples), 4 new emulator gaps (Gaps
+      11–13), 11 new skips (preview-SDK models, one SDK transport bug, and
+      external-data dependencies). `sample_query_semantic.py` did not reach
+      the emulator's `400 UnsupportedQuery` semantic path as predicted: SDK
+      12.0.0 leaks `query_language`/`query_speller` into the HTTP transport
+      (`TypeError`) on the speller call, so it is a `skip` (SDK bug; semantic
+      search remains out of scope).
+- [x] Fixed one genuine divergence found during triage so the vector sample
+      passes: the filter parser now accepts the standard OData lambda form
+      `field/any(var: body)` / `field/all(var: body)` (e.g.
+      `Tags/any(tag: tag eq 'free wifi')`) alongside the existing
+      space-separated form. Tokenizer gains a `:` token; unit tests in
+      `source/rust/src/filter/mod.rs` plus a contract test
+      (`filter_odata_lambda_any_all`) cover both forms and the malformed
+      cases. Documented in `supported_operations.md` / `known_differences.md`.
+- [x] Updated `docs/supported_operations.md` (SDK version under test, filter
+      syntax) and this document (state table, tracker, wire notes).
+- [x] `make test-ms` confirms the new state: 13 genuine passes + 4 gap pins
+      (17 passed), 15 skipped, 0 failed.
 
 ---
 
@@ -419,6 +453,63 @@ lands.
 
 ---
 
+#### Gap 11 — Index aliases (medium/medium-plus)
+
+**Samples (1):** `sample_index_alias_crud.py`
+**Routes:** alias CRUD — none registered (`POST /aliases`, `GET /aliases`, `GET /aliases('{name}')`, `PUT /aliases('{name}')`, `DELETE /aliases('{name}')`)
+**Current failure:** `create_alias` fails with `Operation returned an invalid status 'Method Not Allowed'`; pinned as `gap` on `Method Not Allowed`.
+
+**What is required:**
+
+- [ ] Define an `Alias` resource (`name`, `indexes`, `etag`) in `source/rust/src/service/mod.rs` with service-level storage (like synonym maps) and `reset()` coverage.
+- [ ] Add the five alias routes to the azure sub-router, mirroring the synonym-map shapes: create returns `201`, duplicate create returns `409`, missing alias returns `404`, delete returns `204`; validate (missing/empty name, unknown index references, path/body name mismatch) with `400`.
+- [ ] Extend `azure_guard` to cover `/aliases` and `/aliases(` paths.
+- [ ] Decide alias resolution semantics: at minimum, alias CRUD round-trips; document whether search/document routes resolve an alias name to its index (Azure does) in `known_differences.md` either way.
+- [ ] Add contract tests (CRUD, validation, auth, reset) and document the surface in `docs/supported_operations.md` / `docs/known_differences.md`.
+- [ ] Remove the `KNOWN_ISSUES` entry.
+- [ ] Run `make test-ms` to confirm.
+
+---
+
+#### Gap 12 — Collection-of-complex field types (medium/medium-plus)
+
+**Samples (1):** `sample_index_crud.py`
+**Route:** N/A (schema validation)
+**Current failure:** `create_index` with a `ComplexField(..., collection=True)` fails with `400 InvalidIndex`: `Unsupported field type "Edm.Collection(Edm.ComplexType)"`; pinned as `gap` on that signature.
+
+**What is required:**
+
+- [ ] Accept `Collection(Edm.ComplexType)` in `validate_schema` (`source/rust/src/service/mod.rs`): a complex field with `collection: true`, non-empty `fields` array of scalar/collection-of-scalar subfields (same subfield rules as `Edm.ComplexType`).
+- [ ] Accept arrays of objects in document validation (per-element subfield checking, same as single complex values) and in indexing (full-text indexing of searchable string subfields across all elements).
+- [ ] Decide filter/projection semantics for collections of complex objects (`Address/any(...)` shapes) — at minimum reject explicitly with `400 InvalidQuery` where unsupported, and document the choice in `known_differences.md`.
+- [ ] Echo the type faithfully in `GET /indexes('{name}')` so SDK round-trips (`create` → `get`) agree.
+- [ ] Add contract tests (schema accept/reject, document validation, search/filter behaviour) and update `docs/supported_operations.md` (supported field types).
+- [ ] Remove the `KNOWN_ISSUES` entry.
+- [ ] Run `make test-ms` to confirm.
+
+**Notes:** `sample_index_crud.py` also exercises `CorsOptions` and (empty) `scoringProfiles` on the index definition; those are already accepted (the sample fails only on the field type), so no extra work is expected there — re-validate when the gap lands.
+
+---
+
+#### Gap 13 — Knowledge sources/bases + agentic retrieval (large)
+
+**Samples (2):** `sample_knowledge_source_crud.py`, `sample_agentic_retrieval.py`
+**Routes:** knowledge-source, knowledge-base, and retrieval routes — none registered (`/knowledgesources…`, `/knowledgebases…`, agentic retrieval)
+**Current failure:** `create_or_update_knowledge_source` fails with `400 InvalidIndexName`: `Invalid index path segment "knowledgesources('…')"; expected indexes('name')`; pinned as `gap` on `Invalid index path segment "knowledgesources(`.
+
+**What is required:**
+
+- [ ] Define `KnowledgeSource` / `KnowledgeBase` resources (names, references, etags) with service-level storage and `reset()` coverage, mirroring the synonym-map pattern.
+- [ ] Add the CRUD routes to the azure sub-router (`knowledgesources`, `knowledgebases` literal + `('name')` forms); extend `azure_guard` to cover them.
+- [ ] Implement (or explicitly reject with `400`) the retrieval/agentic operations the samples exercise; document the choice in `known_differences.md` (model inference is an initial-design non-goal — retrieval over local indexes may be feasible, agentic generation is not).
+- [ ] Add contract tests (CRUD, validation, auth, reset) and document the surface in `docs/supported_operations.md` / `docs/known_differences.md`.
+- [ ] Remove the `KNOWN_ISSUES` entries.
+- [ ] Run `make test-ms` to confirm.
+
+**Notes:** The remaining knowledge samples stay `skip`: the configuration/retrieval-response previews and the Fabric/ontology/file/MCP/WorkIQ source samples import preview-SDK models absent from pinned 12.0.0 (`KnowledgeBaseRetrieveDefaults`, `KnowledgeBaseResponseCompletedEvent`, `FabricDataAgentKnowledgeSource`, `FabricOntologyKnowledgeSource`, `FileUploadMetadata`, `McpServerAutoOutputParsing`, `EntraAppAuthentication`), and the Fabric/ontology/file/freshness/MCP/WorkIQ variants point at live external data in any case.
+
+---
+
 #### Cross-cutting changes (apply as each gap lands)
 
 - [x] `azure_guard` middleware (`source/rust/src/api/mod.rs`): extended to
@@ -435,21 +526,53 @@ lands.
       `KNOWN_ISSUES` entries for Gaps 1, 2, 3, 4, 5, 6, 7.
 - [x] `source/tests/python/ms_samples/setup_hotels.py`: added suggester
       definition (done with Gaps 4 and 5).
+- [x] Harness SDK bump (done with Gap 8): `pyproject.toml` pins
+      `azure-search-documents==12.0.0`, `poetry.lock` regenerated, venv
+      rebuilt; probe `API_VERSIONS` is now `2024-07-01,2026-04-01`; the
+      plain-HTTP shims (`source/tests/python/conftest.py`,
+      `ms_samples/shims/sitecustomize.py`) were updated for the 12.0.0 module
+      layout (`normalize_endpoint` gone; `_enforce_https` bearer-only).
+- [x] OData lambda filters (done with Gap 8): `field/any(var: body)` /
+      `field/all(var: body)` parse, validate, and evaluate; unit tests in
+      `source/rust/src/filter/mod.rs`, contract test
+      `filter_odata_lambda_any_all`, documented in `supported_operations.md` /
+      `known_differences.md`.
+- [x] `source/tests/python/tests/ms_samples/test_ms_samples.py`: retriaged
+      the 18 Gap-8 samples — removed 3 entries that now pass
+      (`sample_query_vector.py`, both `*_custom_request.py`), added 4 `gap`
+      pins (Gaps 11–13), rewrote 11 entries as precise `skip` reasons.
 
-### Skipped — needs `azure-search-documents >= 12.0.0` (18)
+### Skipped — needs a newer/preview SDK than the pinned `12.0.0` (11)
 
-Upstream `main` targets SDK 12 (`12.0.0` is latest on PyPI); the harness pins
-`11.6.0`, the version the emulator is validated against (see
-`supported_operations.md`). These samples fail on import or SDK internals
-before emulator behaviour is reached:
+Upstream `main` already targets models that post-date stable `12.0.0` (latest
+on PyPI and the version the emulator is validated against — see
+`supported_operations.md`). These samples fail on import, model construction,
+or SDK internals before emulator behaviour is reached:
 
-- `sample_agentic_retrieval.py` (`knowledgebases` module), `sample_index_alias_crud.py` (`SearchAlias`), `sample_index_client_custom_request.py` / `sample_search_client_custom_request.py` (`DEFAULT_VERSION` export), `sample_index_crud.py` / `sample_query_vector.py` (`SearchFieldDataType.STRING`), `sample_query_semantic.py` (semantic query kwargs),
-- `sample_knowledge_service_stats_preview.py` (typed service-stats model; SDK 11 returns a dict),
-- all knowledge-base/source previews: `sample_knowledge_base_configuration_preview.py`, `sample_knowledge_base_crud.py`, `sample_knowledge_retrieval_response_preview.py`, `sample_knowledge_source_crud.py`, `sample_knowledge_source_fabric_data_agent_preview.py`, `sample_knowledge_source_fabric_ontology_preview.py`, `sample_knowledge_source_file_preview.py`, `sample_knowledge_source_freshness_preview.py`, `sample_knowledge_source_mcp_server_preview.py`, `sample_knowledge_source_workiq_preview.py`.
+- `sample_knowledge_service_stats_preview.py` — the sample reads
+  `stats.counters.knowledge_base_counter.usage`, but 12.0.0's
+  `SearchServiceCounters` has no `knowledge_base_counter` (preview feature).
+- `sample_query_semantic.py` — SDK 12.0.0 leaks `query_language` /
+  `query_speller` into the HTTP transport (`TypeError:
+  Session.request() got an unexpected keyword argument 'query_language'`) on
+  the speller call, before any request reaches the emulator. Semantic search
+  itself is out of scope (see `known_differences.md`).
+- `sample_knowledge_base_configuration_preview.py`
+  (`KnowledgeBaseRetrieveDefaults`), `sample_knowledge_retrieval_response_preview.py`
+  (`KnowledgeBaseResponseCompletedEvent`), `sample_knowledge_source_fabric_data_agent_preview.py`
+  (`FabricDataAgentKnowledgeSource`), `sample_knowledge_source_fabric_ontology_preview.py`
+  (`FabricOntologyKnowledgeSource`), `sample_knowledge_source_file_preview.py`
+  (`FileUploadMetadata`), `sample_knowledge_source_mcp_server_preview.py`
+  (`McpServerAutoOutputParsing`), `sample_knowledge_source_workiq_preview.py`
+  (`EntraAppAuthentication`): each imports a model absent from 12.0.0.
+- `sample_knowledge_base_crud.py` — `KnowledgeBase(...)` rejects the
+  sample's `tags` kwarg in 12.0.0 (`TypeError` at construction).
+- `sample_knowledge_source_freshness_preview.py` — fails today on the
+  unimplemented `knowledgebases(...)` path (Gap 13), and points at live
+  external data for its freshness policy in any case, so it stays `skip`.
 
-Bumping the harness SDK would unblock these and give a truer gap list, but the
-emulator's wire format would need re-validation against 12.x first. Tracked
-as [Gap 8](#gap-8--sdk-12-harness-bump-medium).
+The Fabric/ontology/file/MCP/WorkIQ variants additionally point at live
+external data and are permanently unrunnable here regardless of SDK version.
 
 ### Skipped — external service (4)
 

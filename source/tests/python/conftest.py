@@ -7,7 +7,6 @@ import urllib.request
 from pathlib import Path
 
 import azure.core.pipeline.policies._authentication as _authentication
-import azure.search.documents.indexes._search_index_client as _search_index_client
 import pytest
 from testcontainers.core.container import DockerContainer
 
@@ -17,23 +16,17 @@ from testcontainers.core.container import DockerContainer
 os.environ.setdefault("TESTCONTAINERS_RYUK_DISABLED", "true")
 
 
-def _allow_http_endpoint(endpoint: str) -> str:
-    if not endpoint.lower().startswith("http"):
-        return "https://" + endpoint
-    return endpoint
-
-
 def _no_op_enforce_https(request: object) -> None:
     return None
 
 
-# The pinned SDK (azure-search-documents==11.6.0) rejects non-TLS endpoints in
-# two places: SearchIndexClient.normalize_endpoint (only accepts https:// URLs)
-# and the bearer-token auth policy (_enforce_https). The emulator is a local
-# plain-HTTP service, so the harness allows http:// in both. These are
-# test-harness-only shims: the full HTTP contract is still exercised, only the
-# SDK's endpoint-scheme validation is bypassed.
-_search_index_client.normalize_endpoint = _allow_http_endpoint
+# The emulator is a local plain-HTTP service. The pinned SDK
+# (azure-search-documents==12.0.0) uses the endpoint URL verbatim as the
+# pipeline base URL, so http:// endpoints work for api-key auth without any
+# shim. The one remaining scheme check is the bearer-token auth policy
+# (_enforce_https), which rejects non-TLS URLs; no harness test uses bearer
+# tokens, but the shim is kept so a future one would still reach the emulator.
+# Test-harness-only: the full HTTP contract is still exercised.
 _authentication._enforce_https = _no_op_enforce_https
 
 IMAGE_NAME = "aisearch-emulator"

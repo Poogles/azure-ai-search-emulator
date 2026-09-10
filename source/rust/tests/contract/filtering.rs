@@ -119,3 +119,100 @@ async fn filter_non_filterable_field_returns_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "InvalidQuery");
 }
+
+async fn app_with_tagged_docs() -> axum::Router {
+    let app = app();
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "PUT",
+            &format!("/indexes('tagged')?api-version={API_VERSION}"),
+            Some(API_KEY),
+            Some(json!({
+                "name": "tagged",
+                "fields": [
+                    {"name": "id", "type": "Edm.String", "key": true},
+                    {"name": "tags", "type": "Edm.Collection(Edm.String)", "filterable": true}
+                ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        upload_request(
+            "tagged",
+            json!([
+                {"@search.action": "upload", "document": {"id": "1", "tags": ["red", "blue"]}},
+                {"@search.action": "upload", "document": {"id": "2", "tags": ["green"]}},
+                {"@search.action": "upload", "document": {"id": "3", "tags": ["red", "green"]}}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    app
+}
+
+#[tokio::test]
+async fn filter_odata_lambda_any_all() {
+    let app = app_with_tagged_docs().await;
+
+    // OData lambda `any`: `tags/any(t: t eq 'red')`.
+    let (status, body) = call(
+        app.clone(),
+        search_request(
+            "tagged",
+            json!({"search": "*", "filter": "tags/any(t: t eq 'red')"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<&str> = body["value"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|d| d["id"].as_str().unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(ids, vec!["1", "3"]);
+
+    // OData lambda `all`: `tags/all(t: t ne 'green')` matches only doc 1.
+    let (status, body) = call(
+        app.clone(),
+        search_request(
+            "tagged",
+            json!({"search": "*", "filter": "tags/all(t: t ne 'green')"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["value"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["value"][0]["id"], "1");
+
+    // The space-separated form still works alongside the OData form.
+    let (status, body) = call(
+        app.clone(),
+        search_request(
+            "tagged",
+            json!({"search": "*", "filter": "tags any t eq 'red'"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["value"].as_array().map(Vec::len), Some(2));
+
+    // A malformed lambda (missing the ':' separator) is rejected.
+    let (status, body) = call(
+        app,
+        search_request(
+            "tagged",
+            json!({"search": "*", "filter": "tags/any(t eq 'red')"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "InvalidQuery");
+}

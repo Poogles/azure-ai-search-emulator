@@ -25,7 +25,7 @@ CONTAINER_PORT = 8080
 BUILD_CONTEXT = REPO_ROOT / "source" / "rust"
 
 # The emulator's own default plus the SDK default the samples send.
-API_VERSIONS = "2024-07-01,2025-09-01"
+API_VERSIONS = "2024-07-01,2026-04-01"
 API_KEY = "test-key"
 HOTELS_INDEX = "hotels-sample-index"
 

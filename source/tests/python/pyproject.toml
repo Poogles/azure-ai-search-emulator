@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Python SDK end-to-end compatibility tests for the Azure AI Search emulator"
 requires-python = ">=3.12"
 dependencies = [
-    "azure-search-documents==11.6.0",
+    "azure-search-documents==12.0.0",
     "pytest>=8.0",
     "testcontainers>=4.0",
 ]

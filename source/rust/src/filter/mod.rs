@@ -292,6 +292,7 @@ enum Token {
     RParen,
     Dot,
     Comma,
+    Colon,
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, String> {
@@ -304,6 +305,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
             ')' => tokens.push(Token::RParen),
             '.' => tokens.push(Token::Dot),
             ',' => tokens.push(Token::Comma),
+            ':' => tokens.push(Token::Colon),
             '\'' => {
                 let mut text = String::new();
                 loop {
@@ -397,6 +399,19 @@ fn is_number_start(peek: Option<&(usize, char)>) -> bool {
     matches!(peek, Some((_, ch)) if ch.is_ascii_digit())
 }
 
+/// Splits a collection-lambda field reference (`Tags/any`, `Tags/all`) into
+/// the collection field and the lambda operator. Returns `None` for plain
+/// field names and complex paths that do not end in `/any` or `/all`.
+fn split_lambda_field(name: &str) -> Option<(String, String)> {
+    if let Some(field) = name.strip_suffix("/any") {
+        return Some((field.to_owned(), "any".to_owned()));
+    }
+    if let Some(field) = name.strip_suffix("/all") {
+        return Some((field.to_owned(), "all".to_owned()));
+    }
+    None
+}
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -486,6 +501,44 @@ impl Parser {
     fn parse_comparison(&mut self) -> Result<FilterExpr, String> {
         // Collection filtering: `field any var op value` / `field all var op value`.
         let first = self.expect_ident("field name")?;
+        // OData lambda syntax: `field/any(var: body)` / `field/all(var: body)`.
+        // The tokenizer folds `field/any` into a single identifier (because `/`
+        // continues an identifier), so detect the lambda operator as a suffix.
+        if let Some((field, kind)) = split_lambda_field(&first) {
+            if matches!(self.peek(), Some(Token::LParen)) {
+                self.next();
+                let _variable = self.expect_ident("lambda variable")?;
+                match self.next() {
+                    Some(Token::Colon) => {}
+                    other => {
+                        return Err(format!(
+                            "Expected ':' after lambda variable, found {}.",
+                            describe_token(other.as_ref())
+                        ))
+                    }
+                }
+                let inner = self.parse_comparison()?;
+                match self.next() {
+                    Some(Token::RParen) => {}
+                    other => {
+                        return Err(format!(
+                            "Expected ')' after lambda body, found {}.",
+                            describe_token(other.as_ref())
+                        ))
+                    }
+                }
+                return match kind.as_str() {
+                    "any" => Ok(FilterExpr::Any {
+                        field,
+                        inner: Box::new(inner),
+                    }),
+                    _ => Ok(FilterExpr::All {
+                        field,
+                        inner: Box::new(inner),
+                    }),
+                };
+            }
+        }
         if self.peek_ident_is("any") || self.peek_ident_is("all") {
             let Some(Token::Ident(kind)) = self.next() else {
                 return Err("Expected 'any' or 'all' keyword.".to_owned());
@@ -564,6 +617,7 @@ fn describe_token(token: Option<&Token>) -> String {
         Some(Token::RParen) => "')'".to_owned(),
         Some(Token::Dot) => "'.'".to_owned(),
         Some(Token::Comma) => "','".to_owned(),
+        Some(Token::Colon) => "':'".to_owned(),
     }
 }
 
@@ -721,6 +775,45 @@ mod tests {
             &parse_ok("tags all x ne 'banned'"),
             &[("tags", json!([]))]
         ));
+    }
+
+    #[test]
+    fn parses_odata_lambda_any_all() {
+        // OData lambda syntax: `field/any(var: body)` / `field/all(var: body)`.
+        assert!(matches(
+            &parse_ok("tags/any(t: t eq 'red')"),
+            &[("tags", json!(["blue", "red"]))]
+        ));
+        assert!(!matches(
+            &parse_ok("tags/any(t: t eq 'red')"),
+            &[("tags", json!(["blue"]))]
+        ));
+        assert!(matches(
+            &parse_ok("tags/all(t: t ne 'banned')"),
+            &[("tags", json!(["a", "b"]))]
+        ));
+        assert!(!matches(
+            &parse_ok("tags/all(t: t ne 'banned')"),
+            &[("tags", json!(["a", "banned"]))]
+        ));
+        // The lambda variable name is arbitrary and need not match the field.
+        assert!(matches(
+            &parse_ok("tags/any(x: x eq 'red')"),
+            &[("tags", json!(["red"]))]
+        ));
+        // Numeric and boolean bodies.
+        assert!(matches(
+            &parse_ok("tags/any(t: t gt 2)"),
+            &[("tags", json!([1, 3]))]
+        ));
+        assert!(matches(
+            &parse_ok("tags/all(t: t eq true)"),
+            &[("tags", json!([true, true]))]
+        ));
+        // A lambda operator only applies when followed by '('.
+        assert!(parse_filter("tags/any").is_err());
+        assert!(parse_filter("tags/any(t eq 'red')").is_err());
+        assert!(parse_filter("tags/any(t: t eq 'red'").is_err());
     }
 
     #[test]

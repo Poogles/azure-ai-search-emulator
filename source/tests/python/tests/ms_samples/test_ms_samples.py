@@ -40,25 +40,24 @@ except RuntimeError as exc:  # submodule not checked out
 
 # sample filename -> (category, detail)
 KNOWN_ISSUES = {
-    # --- Cannot run here: needs azure-search-documents >= 12.0.0 (harness pins 11.6.0).
-    "sample_agentic_retrieval.py": ("skip", "needs azure-search-documents>=12 (knowledgebases)"),
-    "sample_knowledge_service_stats_preview.py": ("skip", "needs azure-search-documents>=12 (typed service stats model)"),
-    "sample_index_alias_crud.py": ("skip", "needs azure-search-documents>=12 (SearchAlias)"),
-    "sample_index_client_custom_request.py": ("skip", "needs azure-search-documents>=12 (DEFAULT_VERSION)"),
-    "sample_index_crud.py": ("skip", "needs azure-search-documents>=12 (SearchFieldDataType.STRING)"),
-    "sample_query_semantic.py": ("skip", "needs azure-search-documents>=12 (semantic query kwargs)"),
-    "sample_query_vector.py": ("skip", "needs azure-search-documents>=12 (SearchFieldDataType.STRING)"),
-    "sample_search_client_custom_request.py": ("skip", "needs azure-search-documents>=12 (DEFAULT_VERSION)"),
-    "sample_knowledge_base_configuration_preview.py": ("skip", "needs azure-search-documents>=12 (knowledge bases)"),
-    "sample_knowledge_base_crud.py": ("skip", "needs azure-search-documents>=12 (knowledge bases)"),
-    "sample_knowledge_retrieval_response_preview.py": ("skip", "needs azure-search-documents>=12 (knowledge bases)"),
-    "sample_knowledge_source_crud.py": ("skip", "needs azure-search-documents>=12 (knowledge sources)"),
-    "sample_knowledge_source_fabric_data_agent_preview.py": ("skip", "needs azure-search-documents>=12 (knowledge sources)"),
-    "sample_knowledge_source_fabric_ontology_preview.py": ("skip", "needs azure-search-documents>=12 (knowledge sources)"),
-    "sample_knowledge_source_file_preview.py": ("skip", "needs azure-search-documents>=12 (knowledge sources)"),
-    "sample_knowledge_source_freshness_preview.py": ("skip", "needs azure-search-documents>=12 (knowledge sources)"),
-    "sample_knowledge_source_mcp_server_preview.py": ("skip", "needs azure-search-documents>=12 (knowledge sources)"),
-    "sample_knowledge_source_workiq_preview.py": ("skip", "needs azure-search-documents>=12 (knowledge sources)"),
+    # --- Emulator gaps: the feature is not implemented; pinned to the Azure error
+    # signature so the suite goes red if the gap is closed or the signature changes.
+    "sample_agentic_retrieval.py": ("gap", 'Invalid index path segment "knowledgesources('),
+    "sample_index_alias_crud.py": ("gap", "Method Not Allowed"),
+    "sample_index_crud.py": ("gap", 'Unsupported field type "Edm.Collection(Edm.ComplexType)"'),
+    "sample_knowledge_source_crud.py": ("gap", 'Invalid index path segment "knowledgesources('),
+    # --- Cannot run here: the sample targets a newer/preview SDK than the pinned 12.0.0.
+    "sample_knowledge_service_stats_preview.py": ("skip", "SDK 12.0.0 SearchServiceCounters lacks knowledge_base_counter (preview SDK feature)"),
+    "sample_query_semantic.py": ("skip", "SDK 12.0.0 leaks query_language/query_speller into the HTTP transport (TypeError); semantic search is out of scope"),
+    "sample_knowledge_base_configuration_preview.py": ("skip", "needs a preview SDK (KnowledgeBaseRetrieveDefaults not in 12.0.0)"),
+    "sample_knowledge_base_crud.py": ("skip", "needs a newer SDK (KnowledgeBase rejects the tags kwarg in 12.0.0)"),
+    "sample_knowledge_retrieval_response_preview.py": ("skip", "needs a preview SDK (KnowledgeBaseResponseCompletedEvent not in 12.0.0)"),
+    "sample_knowledge_source_fabric_data_agent_preview.py": ("skip", "needs a preview SDK (FabricDataAgentKnowledgeSource) + live Fabric data"),
+    "sample_knowledge_source_fabric_ontology_preview.py": ("skip", "needs a preview SDK (FabricOntologyKnowledgeSource) + live Fabric data"),
+    "sample_knowledge_source_file_preview.py": ("skip", "needs a preview SDK (FileUploadMetadata) + live file data"),
+    "sample_knowledge_source_freshness_preview.py": ("skip", "knowledge bases/sources not implemented + points at live external data"),
+    "sample_knowledge_source_mcp_server_preview.py": ("skip", "needs a preview SDK (McpServerAutoOutputParsing) + a live MCP server"),
+    "sample_knowledge_source_workiq_preview.py": ("skip", "needs a preview SDK (EntraAppAuthentication) + live WorkIQ data"),
     # --- Cannot run here: needs azure-identity and a real Azure AD environment.
     "sample_authentication.py": ("skip", "needs azure-identity + real AAD for the AAD half (API-key half passes)"),
     # --- Cannot run here: needs an external Azure Storage account.

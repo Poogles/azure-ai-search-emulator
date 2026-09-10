@@ -1,6 +1,6 @@
 ---
 status: complete
-status_last_reviewed: 2026-09-09
+status_last_reviewed: 2026-09-10
 ---
 
 # Known Differences from Azure AI Search
@@ -60,7 +60,7 @@ Differences fall into two categories:
 
 ### Filter matching
 
-- Only the documented operator set (`and`/`or`/`not`, parentheses, `eq`/`ne`/`gt`/`ge`/`lt`/`le`, `any`/`all`); anything else (e.g. `in`, string functions, `search.ismatch`) is rejected with `400 InvalidQuery` rather than approximated.
+- Only the documented operator set (`and`/`or`/`not`, parentheses, `eq`/`ne`/`gt`/`ge`/`lt`/`le`, `any`/`all` in both the space-separated and `field/any(var: body)` lambda forms); anything else (e.g. `in`, string functions, `search.ismatch`) is rejected with `400 InvalidQuery` rather than approximated.
 - String comparisons are ordinal and case-sensitive; Azure can be configured otherwise. Type mismatches and missing fields never match.
 - **Rationale:** explicit rejection beats silently wrong result sets; test filters stay within the supported set.
 

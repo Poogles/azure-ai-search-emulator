@@ -9,8 +9,8 @@ They are run as subprocesses exactly as Microsoft documents, with the
 Two differences from the parent e2e harness:
 
 * The samples do not pin an ``api-version``, so they use the SDK default
-  (``2025-09-01`` for the pinned SDK). The emulator is therefore started with
-  both ``2024-07-01`` and the SDK default accepted.
+  (``2026-04-01`` for the pinned SDK 12.0.0). The emulator is therefore
+  started with both ``2024-07-01`` and the SDK default accepted.
 * The samples are run in a subprocess, so the plain-HTTP shims from the parent
   ``conftest.py`` are re-applied via ``ms_samples/shims/sitecustomize.py`` on
   ``PYTHONPATH``.
