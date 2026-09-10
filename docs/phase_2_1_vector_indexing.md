@@ -1,6 +1,6 @@
 ---
 status: draft
-status_last_reviewed: 2026-09-09
+status_last_reviewed: 2026-09-10
 ---
 
 # Phase 2.1 — Vector Indexing and Vector Search
@@ -23,40 +23,62 @@ Rationale:
 
 - Pure Rust (no C++ toolchain dependency), consistent with the single-static-binary goal.
 - Provides L2, Cosine, and a custom-distance trait (inner product / dot product implemented via the trait).
-- HNSW graph for approximate nearest-neighbour; flat (brute-force) mode for small indexes and exact results.
-- SIMD-accelerated (AVX2) for f32 vectors via `anndists`.
+- HNSW graph for approximate nearest-neighbour; exact results via direct brute-force linear scan (not via HNSW tuning), for `exhaustiveKnn` kind and per-query `exhaustive: true`.
+- SIMD via `anndists` is opt-in (`simdeez_f` feature + `RUSTFLAGS=-C target-cpu=native`); not automatic. The exact feature combination is pinned in `docs/decisions/0004-vector-index.md`. Behaviour differs on aarch64 CI (no AVX2); correctness tests must not depend on SIMD being active.
 - In-process, no external service — matches the Tantivy integration pattern (see `docs/decisions/0003-search-engine.md`).
 
 Alternative considered: **usearch** (C++ core, thin Rust bindings). Rejected for this project because it introduces a C++ build dependency that complicates the Nix build environment (the same class of problem that excluded Tantivy's `zstd` feature). hnsw_rs is the safer fit for the existing build constraints.
 
 ### Index schema: vector field types
 
-Accept and validate `Edm.Collection(Edm.Single, <dimension>)` (and the SDK form `Collection(Edm.Single, <dimension>)`) as a field type.
+Vector fields use the Azure wire format — the dimension is a **separate property**, not part of the type string:
 
-- `<dimension>` is a positive integer (1–3072, matching Azure's limit).
-- The field must not be `key`, `searchable`, `filterable`, `sortable`, or `facetable` (Azure restriction).
-- The field must be `retrievable: true` (default) to be returned in results.
+```json
+{
+  "name": "content_vector",
+  "type": "Collection(Edm.Single)",
+  "searchable": true,
+  "retrievable": true,
+  "dimensions": 1536,
+  "vectorSearchProfile": "my-vector-profile"
+}
+```
+
+Rules:
+
+- `type` must be `Collection(Edm.Single)` (both `Collection(Edm.Single)` as sent by the SDK and `Edm.Collection(Edm.Single)` as in REST docs are accepted and normalized, matching the existing `normalize_field_type` behaviour in `source/rust/src/storage/mod.rs`).
+- `dimensions` is required on vector fields: a positive integer, 1–3072 (matching Azure's limit; cap overridable via `EMULATOR_VECTOR__MAX_DIMENSION`, see §Configuration). Missing/non-integer/out-of-range → `400 InvalidIndex`.
+- `vectorSearchProfile` is required on vector fields and must reference a profile in the index's `vectorSearch.profiles` array. Unknown profile name → `400 InvalidIndex`.
+- `searchable` **must be `true`** on vector fields (Azure requirement). `searchable: false` → `400 InvalidIndex`.
+- The field must not be `key`, `filterable`, `sortable`, or `facetable` (Azure restriction) → `400 InvalidIndex`.
+- `retrievable` may be `true` or `false` (default `true`). `retrievable: false` vectors are still searchable but omitted from responses unless explicitly selected (same as Azure). The SDK's `stored` property is accepted but inert (documented in `known_differences.md`).
 - Multiple vector fields per index are supported (up to 16, matching Azure).
-- The index definition must include a `vectorSearch` property with at least one algorithm entry when vector fields are present; its absence is a `400 InvalidIndex`.
+- The index definition must include a `vectorSearch` property with at least one algorithm entry **and** at least one profile entry when vector fields are present; its absence is a `400 InvalidIndex`.
 
-#### `vectorSearch` algorithm configuration
+#### `vectorSearch` algorithm and profile configuration
 
 ```json
 {
   "vectorSearch": {
     "algorithms": [
       {
-        "name": "algo1",
+        "name": "hnsw-1",
         "kind": "hnsw",
-        "vectorFormat": "float32",
-        "metric": "cosine",
-        "exhaustiveThreshold": 0,
-        "parameters": {
+        "hnswParameters": {
           "m": 4,
-          "efConstruction": 100,
-          "efSearch": 100
+          "efConstruction": 400,
+          "efSearch": 500,
+          "metric": "cosine"
         }
+      },
+      {
+        "name": "eknn-1",
+        "kind": "exhaustiveKnn",
+        "exhaustiveKnnParameters": { "metric": "cosine" }
       }
+    ],
+    "profiles": [
+      { "name": "my-vector-profile", "algorithmConfigurationName": "hnsw-1" }
     ]
   }
 }
@@ -64,28 +86,37 @@ Accept and validate `Edm.Collection(Edm.Single, <dimension>)` (and the SDK form 
 
 Supported:
 
-- `kind`: `hnsw` (HNSW graph) and `flat` (brute-force; maps to hnsw_rs with `efSearch = index size`).
-- `vectorFormat`: `float32` only. `byte` (quantized) is rejected with `400 InvalidIndex`.
-- `metric`: `cosine`, `dotProduct`, `euclidean`.
-- `exhaustiveThreshold`: accepted and stored; when the index has fewer vectors than this threshold, brute-force is used regardless of `kind` (matching Azure behaviour). Default `0` (always use the declared algorithm).
-- `parameters`: `m` (default 4), `efConstruction` (default 100), `efSearch` (default 100). Accepted and passed to hnsw_rs.
+- `kind`: `hnsw` (HNSW graph) and `exhaustiveKnn` (brute-force linear scan; never touches the HNSW graph). There is no `kind: "flat"` in Azure — `flat` from earlier drafts of this doc is replaced by `exhaustiveKnn`.
+- Parameters are nested per kind: `hnswParameters: {m, efConstruction, efSearch, metric}`, `exhaustiveKnnParameters: {metric}`. A top-level `parameters` object or top-level `metric`/`vectorFormat`/`exhaustiveThreshold` (earlier draft shape) is **not** accepted; unknown top-level keys on algorithm entries are ignored for forward-compat, but a missing kind-specific parameters object falls back to defaults (`m: 4`, `efConstruction: 400`, `efSearch: 500`, `metric: cosine`).
+- `metric`: `cosine`, `dotProduct`, `euclidean` (Azure spelling; also accept `cosineSimilarity`? No — reject unknown metrics with `400 InvalidIndex`).
+- `profiles[]`: each entry maps `name` → `algorithmConfigurationName` (an algorithm in the same `vectorSearch.algorithms` array). A profile referencing an unknown algorithm → `400 InvalidIndex`. Duplicate profile or algorithm names → `400 InvalidIndex`.
+- Exhaustive search is a **per-query** flag (`vectorQueries[].exhaustive: true`), not a schema-level `exhaustiveThreshold`. There is no `exhaustiveThreshold` property in the `2024-07-01` REST API; this doc does not define one.
+- Quantized vector types (`Collection(Edm.Half)`, `Collection(Edm.Int8)`, `Collection(Edm.UInt8)`, etc.) are rejected with `400 InvalidIndex` ("quantized vector types are not supported; only 'Collection(Edm.Single)' is supported"). There is no `vectorFormat: "byte"` property in the index schema.
 
-Each vector field in the schema references an algorithm by name via its `vectorSearchAlgorithm` property. A field referencing a non-existent algorithm name is a `400 InvalidIndex`.
+SDK ↔ REST key mapping (handled in `source/rust/src/api/`, same pattern as `sourceFields`/`searchFields` for suggesters):
+
+| SDK (`azure-search-documents`) | REST / emulator storage |
+|-------------------------------|-------------------------|
+| `SearchField(type=Collection(Single), vector_search_dimensions=N)` | `dimensions: N` |
+| `SearchField(vector_search_profile_name="p")` | `vectorSearchProfile: "p"` |
+| `HnswAlgorithmConfiguration(name, kind="hnsw", parameters=...)` | `vectorSearch.algorithms[]` with `hnswParameters` |
+| `ExhaustiveKnnAlgorithmConfiguration(...)` | `vectorSearch.algorithms[]` with `kind: "exhaustiveKnn"` |
+| `VectorSearchProfile(name, algorithm_configuration_name=...)` | `vectorSearch.profiles[]` with `algorithmConfigurationName` |
 
 ### Document validation: vector fields
 
 - A vector field value must be a JSON array of numbers (floats).
-- The array length must exactly match the declared dimension.
-- Values must be finite (no `NaN`, no `Infinity`).
+- The array length must exactly match the field's declared `dimensions`.
+- Values must be finite (no `NaN`, no `Infinity`; JSON has no NaN/Infinity literals, so this covers programmatic `f64::NAN` via SDK serialisation guards and string-coerced values).
 - Violations produce a per-document `400` in the batch response (same pattern as existing type validation).
 - Vector fields are stored in the `Document.fields` map as `Value::Array(Vec<Value::Number>)` (same as any other field); the vector index is a secondary structure updated alongside storage.
 
 ### Vector index lifecycle
 
-A new `VectorIndex` component (in `src/vector/`) mirrors the `SearchEngine` pattern:
+A new `VectorIndex` component (in `source/rust/src/vector/`) mirrors the `SearchEngine` pattern:
 
-- One hnsw_rs index per (emulator index, vector field) pair.
-- Created at index creation time (from the schema's vector fields + algorithm config).
+- One hnsw_rs index per (emulator index, vector field) pair (hnsw_rs indexes have a fixed dimension, so sharing across fields with different dimensions is not possible).
+- Created at index creation time (from the schema's vector fields + resolved profile → algorithm config).
 - Updated on document upload/merge (upsert by key) and delete.
 - Destroyed on index deletion and service reset.
 - Guarded by the same `RwLock` pattern as `SearchEngine` (read lock for search, write lock for mutation).
@@ -93,107 +124,144 @@ A new `VectorIndex` component (in `src/vector/`) mirrors the `SearchEngine` patt
 
 #### hnsw_rs integration notes
 
-- hnsw_rs uses `f32` slices as its point type. Vectors are stored as `Vec<f32>` in the index.
-- The index is keyed by a `u32` internal ID; a side-map (`BTreeMap<u32, String>`) tracks internal ID → document key for result resolution.
-- For `flat` kind or when `exhaustiveThreshold` is met, hnsw_rs is configured with `efSearch = total_vectors` (effectively brute-force).
-- Dot product: implemented via `anndists`'s custom distance trait (inner product; hnsw_rs optimises for minimising distance, so we negate the dot product or use the appropriate metric wrapper).
-- Cosine: first-class in `anndists`.
-- Euclidean (L2): first-class in `anndists`.
+- hnsw_rs uses `f32` slices as its point type. Vectors are stored as `Vec<f32>` in the index (converted from JSON numbers; non-finite rejected at validation time).
+- The index is keyed by hnsw_rs `DataId`; a side-map (`BTreeMap<DataId, String>`, `DataId` is `u64` in current hnsw_rs — confirm against the pinned version in `0004-vector-index.md`) tracks internal ID → document key for result resolution.
+- **Deletes via rebuild.** hnsw_rs has no reliable point-deletion API, so document delete (and vector-field removal on merge) rebuilds the affected per-field index from the surviving stored documents. Acceptable at emulator scale; document the O(n) cost in `0004-vector-index.md`. Correctness test: insert → delete → search must not return the deleted key.
+- **Exact path bypasses HNSW.** For `exhaustiveKnn` profiles and per-query `exhaustive: true`, run a direct linear scan over the stored `Vec<f32>` values — do not approximate by setting `efSearch = index size`.
+- Dot product: implemented via `anndists`'s custom distance trait (inner product; hnsw_rs minimises distance, so negate the dot product in the wrapper).
+- Cosine: first-class in `anndists`. Vectors are **normalized to unit length on insert** (and the query vector is normalized at search time) so cosine distance is well-defined for unnormalized SDK input. Euclidean (L2): first-class in `anndists`, no normalization.
+- `m` / `efConstruction` / `efSearch` from `hnswParameters` are passed to hnsw_rs; `efSearch` may additionally be raised per-query to satisfy `k` (never lowered below the configured value silently — document the rule in `0004`).
 
 ### Query: `vectorQueries` parameter
 
-The search request body accepts a `vectorQueries` array:
+The search request body accepts an Azure-shaped `vectorQueries` array plus a **top-level** `filter` and `vectorFilterMode`:
 
 ```json
 {
+  "search": "*",
+  "filter": "category eq 'tech'",
   "vectorQueries": [
     {
-      "key": "embedding",
-      "vector": [0.1, 0.2, 0.3, "..."],
-      "k": 50,
-      "filters": "category eq 'tech'"
+      "kind": "vector",
+      "vector": [0.1, 0.2, 0.3],
+      "fields": "content_vector",
+      "k": 5,
+      "exhaustive": true
     }
   ],
-  "vectorFilterMode": "postFilter"
+  "vectorFilterMode": "preFilter"
 }
 ```
 
-- `key`: must reference a vector field in the index schema. Unknown key → `400 InvalidQuery`.
-- `vector`: array of floats; length must match the field's dimension. Mismatch → `400 InvalidQuery`.
-- `k`: number of nearest neighbours to retrieve (default 1000, max 1000). Must be a positive integer.
-- `filters`: optional OData filter expression, parsed by the existing `src/filter` module. Applied per `vectorFilterMode`.
-- Multiple `vectorQueries` entries are supported (Azure allows up to 5); results are the union of all vector query matches, scored by the best (highest) score across queries.
+Field semantics (wire names; SDK names in parentheses):
+
+- `kind`: must be `"vector"`. `kind: "text"` (vectorizer queries) → `400 UnsupportedQuery` (no vectorizer in the emulator). Missing `kind` defaults to `"vector"` for back-compat with early adopters, but this leniency is documented as emulator-only.
+- `vector` (SDK: `vector`): array of floats; length must match **every** field listed in `fields`. Mismatch → `400 InvalidQuery`. Non-finite values → `400 InvalidQuery`.
+- `fields` (SDK: `fields`, single string): comma-separated field list (`"a,b"`) or JSON array (`["a","b"]`) — both accepted. Every entry must be a vector field in the index schema. Unknown/non-vector field → `400 InvalidQuery`. A single query targeting multiple fields searches each field's per-field index and unions the per-field hits (best score per document wins).
+- `k` (SDK: `k_nearest_neighbors`): number of nearest neighbours per query. Positive integer, max 1000. Missing `k` defaults to 3 (matching the SDK default), **not** 1000. Non-positive/non-integer → `400 InvalidQuery`.
+- `exhaustive` (SDK: `exhaustive`): optional bool, default `false`. When `true`, forces the brute-force path for that query even if the profile's algorithm is `hnsw`.
+- `weight` (SDK: `weight`): optional positive float, default `1.0`. Accepted but **inert** (no weighted fusion in the emulator); documented in `known_differences.md` like `sessionId`.
+- There is **no per-query `filters`** property (earlier draft shape with `key`/`filters` is removed). Filtering uses the top-level `filter` expression, parsed by the existing `source/rust/src/filter/` module, applied per `vectorFilterMode`.
+- Multiple `vectorQueries` entries are supported (max 5 per search, matching Azure); results are the **union** of all vector query matches, scored by the best (highest) score across queries (and across fields within a query).
+
+SDK ↔ wire mapping for search (`source/rust/src/api/` translates; service layer sees wire shape only):
+
+| SDK (`SearchClient.search`) | Wire body |
+|-----------------------------|-----------|
+| `vector_queries=[VectorizedQuery(vector=..., fields=..., k_nearest_neighbors=..., exhaustive=...)]` | `vectorQueries: [{kind: "vector", vector, fields, k, exhaustive}]` |
+| `vector_filter_mode="preFilter"` / `"postFilter"` | `vectorFilterMode` (same strings) |
+| `filter="category eq 'tech'"` | `filter` (top-level; shared by full-text and vector paths) |
 
 #### `vectorFilterMode`
 
-- `postFilter` (default): retrieve top-k by vector similarity, then apply the filter to the results.
-- `preFilter`: apply the filter first to get a candidate set, then find top-k within that set. hnsw_rs supports filtered search via its `filter` module (a predicate over point IDs).
-
-Both modes are implemented. `postFilter` is the simple path (filter after retrieval); `preFilter` uses hnsw_rs's filter trait to constrain the graph traversal.
+- `postFilter` (default): retrieve top-k by vector similarity, then apply the top-level `filter` to the retrieved hits.
+- `preFilter`: apply the top-level `filter` first to get a candidate key set, then find top-k within that set. Implemented as a constrained scan: brute-force path filters candidates directly; the HNSW path uses hnsw_rs's `filter` module predicate over point IDs (via the `DataId` → key side-map), falling back to brute-force when the candidate set is small.
 
 #### Vector-only vs hybrid search
 
-- **Vector-only:** `vectorQueries` present, no `search` text (or `search: "*"`). Results ordered by vector score descending.
-- **Hybrid:** `vectorQueries` present AND a non-trivial `search` text. The full-text engine produces a candidate set; the vector index produces a scored set; results are the intersection (documents matching both), ordered by vector score. This matches Azure's default hybrid behaviour where both signals must match.
+- **Vector-only:** `vectorQueries` present, no `search` text (or `search: "*"` / empty). Results are the union of vector hits, ordered by vector score descending.
+- **Hybrid:** `vectorQueries` present AND a non-trivial `search` text. The full-text engine produces a scored set; the vector index produces a scored set; results are the **union** (documents matching either side), ordered by score descending where a document's score is the max of its vector score and its full-text score (`1.0` in Phase 2). Azure fuses with RRF/a ranking model, so exact hybrid ordering is an acknowledged difference (see §Known differences) — but recall (union, not intersection) matches Azure.
 - **Full-text only:** no `vectorQueries`. Existing behaviour unchanged.
 
 ### Scoring and response
 
-- `@search.score` for vector results is the similarity score from hnsw_rs:
-  - `cosine`: value in [0, 1] (1 = identical direction). hnsw_rs returns distance; we convert: `score = 1 - distance` (cosine distance is `1 - cosine_similarity`).
-  - `dotProduct`: the raw inner product value (can be negative).
-  - `euclidean`: `1 / (1 + distance)` (mapping to (0, 1], higher = closer). Azure uses a similar inverse-distance mapping.
-- For hybrid results, the vector score is used (full-text score remains `1.0` as in Phase 2).
-- For full-text-only results, `@search.score` remains `1.0` (unchanged from Phase 2).
+- `@search.score` for vector results is the similarity score for the query's metric:
+  - `cosine`: `1 - cosine_distance` on unit-normalized vectors, value in [0, 1] (1 = identical direction).
+  - `dotProduct`: the raw inner product value (can be negative; ordering still descending).
+  - `euclidean`: `1 / (1 + l2_distance)` (mapping to (0, 1], higher = closer).
+- All three formulas are emulator-defined approximations of Azure's internal scoring — exact values differ from Azure (see §Known differences). Test assertions must check ordering and recall, not exact score equality.
+- For hybrid results, score is `max(vector score, full-text score)`; full-text-only score remains `1.0` (unchanged from Phase 2).
 - Results are ordered by `@search.score` descending (highest similarity first), with the key field as tie-breaker for determinism.
+- `top`/`skip` pagination and `count=true` apply to the **merged** (union) result set, after ordering. `select` projection includes/excludes vector fields like any other field (large payload warning documented in §What is NOT in scope).
+
+### Continuation tokens with vector search
+
+Phase 2 tokens are `base64(json{filter, orderby, skip, state_version})`. Vector queries are part of the search identity, so:
+
+- When `vectorQueries` is present, the token additionally carries a hash of the normalized `vectorQueries` array plus `vectorFilterMode`. A next-page request whose vector queries differ from the token → `400 InvalidQuery` ("vector query changed during paging").
+- `state_version` staleness applies unchanged (document mutation between pages → `400` stale token).
 
 ### `vectorFilterMode` and other vector search options
 
 Accepted and functional:
 
-- `vectorQueries` (array, as above).
+- `vectorQueries` (array, Azure shape as above).
 - `vectorFilterMode` (`postFilter` / `preFilter`).
+- Top-level `filter` (shared with full-text; gates vector results per `vectorFilterMode`).
+- Per-query `exhaustive` (forces brute-force for that query).
+- `weight`: accepted but inert (documented difference).
 
-Rejected with `400 UnsupportedQuery` (semantic search, not vector):
+Rejected with `400 UnsupportedQuery` (semantic search / vectorization, not raw vector):
 
 - `semantic`, `semanticConfiguration`, `semanticQuery`, `semanticErrorHandling`, `semanticMaxWaitInMilliseconds`.
+- `vectorQueries[].kind: "text"` (vectorizer queries), `vectorizers` in index config, `hybridSearch` preview knobs, per-query `threshold` (preview).
+
+Vector fields in other query options (all `400 InvalidQuery`):
+
+- `filter`: vector fields cannot appear (not `filterable`).
+- `orderby`: vector fields cannot appear (not `sortable`).
+- `facets`: vector fields cannot appear (not `facetable`).
+- `searchFields` / `search`: vector fields are not full-text indexed; referencing one → `400 InvalidQuery`.
 
 ### Architecture integration
 
 ```
-src/
+source/rust/src/
   vector/
     mod.rs          — VectorIndex, VectorEngine (per-index vector store)
-    distance.rs     — Metric enum, anndists trait impls (dot product wrapper)
+    distance.rs     — Metric enum, anndists trait impls (dot product wrapper, cosine normalization)
   query/
     mod.rs          — unchanged (full-text only)
   service/
     mod.rs          — search() extended: parse vectorQueries, call VectorEngine,
-                      merge with full-text results, apply filter mode, score, order
+                      merge with full-text results (union), apply filter mode, score, order
   storage/
-    mod.rs          — FieldDefinition: add `vector_dimension: Option<usize>`,
-                      `vector_search_algorithm: Option<String>`
-                      IndexDefinition: add `vector_search: Option<Value>` (raw)
+    mod.rs          — FieldDefinition: add `vector_dimensions: Option<usize>`,
+                      `vector_search_profile: Option<String>`
+                      IndexDefinition: add `vector_search: Option<Value>` (raw, echoed)
+                      + parsed profiles/algorithms table
   api/
-    mod.rs          — search handler: pass vectorQueries/vectorFilterMode to service
+    mod.rs          — search handler: translate SDK keys (k_nearest_neighbors→k, etc.),
+                      pass vectorQueries/vectorFilterMode/filter to service
 ```
 
 The `VectorEngine` sits alongside `SearchEngine` in the service layer. The service orchestrates:
 
-1. Parse `vectorQueries` from the request body.
-2. If present, call `VectorEngine.search(index, field, vector, k, filter)` → scored keys.
-3. If full-text is also active, call `SearchEngine.search(...)` → matching keys.
-4. Intersect (hybrid) or use vector results alone.
-5. Apply `vectorFilterMode` semantics (pre vs post).
-6. Resolve keys to documents from storage.
-7. Order by score descending, apply top/skip/select.
-8. Build response with real `@search.score` values.
+1. Parse and validate `vectorQueries` from the request body (wire shape; SDK translation already done in `api/`).
+2. Resolve each query's `fields` → per-field `VectorIndex` (via field's `vectorSearchProfile` → profile → algorithm).
+3. Execute each (query × field): HNSW path by default; brute-force path when the profile kind is `exhaustiveKnn` or the query sets `exhaustive: true`. Returns scored keys.
+4. Union per-field hits per query (best score wins), then union across queries (best score wins).
+5. If full-text is also active, call `SearchEngine.search(...)` and union with vector hits (`max` score).
+6. Apply `vectorFilterMode` semantics against the top-level `filter` (pre constrains candidates before top-k; post filters after retrieval).
+7. Resolve keys to documents from storage.
+8. Order by score descending (key tie-breaker), apply top/skip/select; `count` reflects the merged set.
+9. Build response with `@search.score` values per §Scoring.
 
 ### Configuration
 
-No new environment variables. Vector behaviour is entirely driven by the index schema (algorithm, metric, parameters). The `exhaustiveThreshold` in the schema controls when brute-force is used.
+No new behaviour flags. Vector behaviour is driven by the index schema (profile → algorithm, metric, parameters) plus per-query `exhaustive`.
 
-Optional: `EMULATOR_VECTOR__MAX_DIMENSION` (default `3072`) to cap accepted vector dimensions, useful for memory-constrained CI environments.
+Optional: `EMULATOR_VECTOR__MAX_DIMENSION` (default `3072`, same `__` nesting convention as `EMULATOR_STORAGE__MODE`) to cap accepted vector dimensions, useful for memory-constrained CI environments. Values above the cap → `400 InvalidIndex` at index creation.
 
 ### Error handling
 
@@ -201,134 +269,154 @@ New error cases (all `400` with Azure structure):
 
 | Condition | Code | Message pattern |
 |-----------|------|-----------------|
-| Vector field with invalid dimension (0, >3072, non-integer) | `InvalidIndex` | "Vector field 'X' has invalid dimension N; must be 1-3072" |
-| Vector field with `searchable`/`filterable`/`sortable`/`facetable`/`key` | `InvalidIndex` | "Vector field 'X' cannot be searchable/filterable/sortable/facetable/key" |
-| Index has vector fields but no `vectorSearch` property | `InvalidIndex` | "Index 'X' has vector fields but no vectorSearch configuration" |
-| Vector field references unknown algorithm name | `InvalidIndex` | "Vector field 'X' references unknown algorithm 'Y'" |
-| `vectorFormat` other than `float32` | `InvalidIndex` | "Unsupported vectorFormat 'byte'; only 'float32' is supported" |
-| `vectorQueries` references unknown field | `InvalidQuery` | "Vector query key 'X' is not a vector field in index 'Y'" |
+| Vector field missing/invalid `dimensions` (missing, 0, >cap, non-integer) | `InvalidIndex` | "Vector field 'X' has invalid dimensions N; must be 1-3072" |
+| Vector field with `searchable: false` | `InvalidIndex` | "Vector field 'X' must be searchable" |
+| Vector field with `filterable`/`sortable`/`facetable`/`key` | `InvalidIndex` | "Vector field 'X' cannot be filterable/sortable/facetable/key" |
+| Index has vector fields but no `vectorSearch` property (or no `profiles`) | `InvalidIndex` | "Index 'X' has vector fields but no vectorSearch configuration" |
+| Vector field references unknown profile name | `InvalidIndex` | "Vector field 'X' references unknown vector search profile 'Y'" |
+| Profile references unknown algorithm name | `InvalidIndex` | "Vector search profile 'Y' references unknown algorithm 'Z'" |
+| Unknown `metric` | `InvalidIndex` | "Unknown metric 'M' on algorithm 'Z'" |
+| Quantized vector type (`Collection(Edm.Half)`, `...Int8`, etc.) | `InvalidIndex` | "Unsupported vector field type 'T'; only 'Collection(Edm.Single)' is supported" |
+| `vectorQueries` references unknown/non-vector field | `InvalidQuery` | "Vector query field 'X' is not a vector field in index 'Y'" |
 | `vectorQueries` vector length mismatch | `InvalidQuery` | "Vector query for 'X' has dimension N; expected M" |
 | `vectorQueries` vector contains non-finite values | `InvalidQuery` | "Vector query for 'X' contains non-finite values" |
-| `k` not a positive integer | `InvalidQuery` | "Vector query 'k' must be a positive integer" |
+| `k`/`k_nearest_neighbors` not a positive integer (or >1000) | `InvalidQuery` | "Vector query 'k' must be a positive integer (max 1000)" |
 | More than 5 `vectorQueries` entries | `InvalidQuery` | "At most 5 vector queries are supported" |
+| `vectorQueries[].kind: "text"` (vectorizer) | `UnsupportedQuery` | "Vectorizer queries (kind 'text') are not supported" |
+| Vector query changed between pages (token mismatch) | `InvalidQuery` | "Vector query changed during paging; restart the search" |
 | Document vector field wrong length | per-doc `400` | "Field 'X' expects a vector of dimension M, got N" |
 | Document vector field contains non-numeric values | per-doc `400` | "Field 'X' must contain only numeric values" |
 
 ### What is NOT in scope
 
 - **Semantic search** (`semantic`, `semanticConfiguration`, etc.) — Azure's hosted model inference (extractive answers, captions, query rewriting). Rejected with `400 UnsupportedQuery` (unchanged from Phase 2).
-- **`byte` vector format** (quantized vectors) — rejected at index creation.
+- **Vectorizers / integrated vectorization** (`kind: "text"` queries, `vectorizers` config) — rejected with `400 UnsupportedQuery`. Callers must supply raw vectors.
+- **Quantized vector types** (`Collection(Edm.Half)` etc.) — rejected at index creation.
+- **Weighted fusion / RRF** — `weight`, `hybridSearch` preview knobs accepted-but-inert or rejected per §Vector search options; hybrid is union + max-score (documented difference).
 - **Vector field in filters** — vector fields cannot appear in OData `$filter` expressions (they are not `filterable`).
 - **Vector field in `orderby`** — not sortable.
 - **Vector field in `facets`** — not facetable.
-- **Vector field in `select`** — accepted (the vector is returned in the response if `retrievable: true`), but this is a large payload; documented as a consideration.
-- **Multiple metrics per index** — each algorithm entry has one metric; different vector fields can use different algorithms/metrics (supported).
+- **Vector field in `searchFields`/`search`** — not full-text indexed; referencing one is `400 InvalidQuery`.
+- **Vector field in `select`** — accepted (the vector is returned in the response subject to `retrievable`), but this is a large payload; documented as a consideration.
+- **`stored` property** — accepted but inert (no separate stored/retrievable enforcement beyond `retrievable`).
+- **Multiple metrics per index** — each algorithm entry has one metric; different vector fields can use different profiles/metrics (supported).
 - **Vector index persistence** — in-memory only (same as full-text and document storage).
 
 ## Deliverables
 
-1. `src/vector/` module: `VectorEngine`, `VectorIndex`, distance metric wrappers.
-2. Schema validation extended: `Edm.Collection(Edm.Single, N)` field type, `vectorSearch` config parsing and validation.
+1. `source/rust/src/vector/` module: `VectorEngine`, `VectorIndex`, distance metric wrappers (incl. cosine normalization, negated-dot-product wrapper, brute-force path).
+2. Schema validation extended: `Collection(Edm.Single)` + `dimensions` + `vectorSearchProfile`, `vectorSearch` algorithms + profiles parsing and validation.
 3. Document validation extended: vector field type checking (array of floats, correct dimension, finite values).
-4. Search path extended: `vectorQueries` parsing, vector search execution, hybrid merge, scoring, ordering.
-5. `vectorFilterMode` support (`postFilter`, `preFilter`).
-6. Updated `docs/supported_operations.md`: vector field types, vector search operations, new error codes.
-7. Updated `docs/known_differences.md`: vector scoring differences, HNSW approximation vs Azure's exact results at small scale.
-8. `docs/decisions/0004-vector-index.md`: hnsw_rs selection rationale.
-9. Contract tests: `tests/contract/vector_search.rs`.
-10. Unit tests: vector module (distance, index lifecycle, filter modes), schema validation, document validation.
+4. Search path extended: `vectorQueries` parsing (Azure shape + SDK key translation), vector search execution, hybrid union merge, scoring, ordering.
+5. `vectorFilterMode` support (`postFilter`, `preFilter`) against the top-level `filter`; per-query `exhaustive` support.
+6. Updated `docs/supported_operations.md`: vector field types, vector search operations (flip `vectorQueries`/`vectorFilterMode` from Unsupported to Supported, document inert `weight`/`stored`), new error codes.
+7. Updated `docs/known_differences.md`: vector scoring approximations, HNSW approximation vs exact brute-force paths, hybrid union+max vs Azure fusion, inert `weight`/`stored`, stale-token-on-vector-change.
+8. `docs/decisions/0004-vector-index.md`: hnsw_rs selection rationale + pinned version, `DataId` type, SIMD feature decision, delete-via-rebuild, exact-path bypass.
+9. Contract tests: `source/rust/tests/contract/vector_search.rs`.
+10. Unit tests: vector module (distance incl. normalization, index lifecycle incl. delete-rebuild, filter modes, exhaustive flag), schema validation, document validation.
 11. Python SDK compatibility tests: vector index creation, document upload with vectors, vector search, hybrid search.
-12. Updated `docs/phase_2_production_api.md`: remove vector from "Out of scope" (mark as Phase 2.1).
+12. HTTP fixtures: extend `source/tests/python/fixtures/` with vector wire-format captures for Phase 3 C# replay.
+13. Updated `docs/phase_2_production_api.md`: remove vector from "Out of scope" (mark as Phase 2.1).
 
 ## Test plan
 
-### Unit tests (`src/vector/`)
+### Unit tests (`source/rust/src/vector/`)
 
-- Distance metric correctness: cosine, dot product, euclidean against known vectors.
-- Index lifecycle: create, insert, search, delete, reset.
-- `exhaustiveThreshold`: small index uses brute-force, large index uses HNSW.
-- Filter mode: `preFilter` constrains candidates; `postFilter` filters after retrieval.
-- Dimension mismatch rejection.
+- Distance metric correctness: cosine (incl. unnormalized input → normalized), dot product (incl. negative), euclidean against known vectors.
+- Normalization: cosine insert/search normalizes; euclidean/dotProduct do not.
+- Index lifecycle: create, insert, search, delete (rebuild → deleted key absent), reset.
+- Exact path: `exhaustiveKnn` profile and `exhaustive: true` return exact brute-force neighbours (cross-checked against a naive scan).
+- Filter mode: `preFilter` constrains candidates (incl. HNSW predicate path + small-set fallback); `postFilter` filters after retrieval; differing result sets on a crafted fixture.
+- Dimension mismatch rejection (insert and query).
 - Concurrent insert/search (8 threads, no corruption).
 
-### Contract tests (`tests/contract/vector_search.rs`)
+### Contract tests (`source/rust/tests/contract/vector_search.rs`)
 
-- Create index with vector field: valid schema → `201`; missing `vectorSearch` → `400`; invalid dimension → `400`; wrong `vectorFormat` → `400`.
-- Upload documents with vectors: correct dimension → `201`; wrong dimension → per-doc `400`; non-numeric → per-doc `400`.
-- Vector search: returns correct nearest neighbours; `k` respected; score ordering correct.
-- Hybrid search: intersection of full-text and vector results.
-- `vectorFilterMode`: `preFilter` vs `postFilter` produce correct result sets.
-- Multiple vector queries: union of results, best score wins.
-- Error cases: unknown key, dimension mismatch, non-finite values, `k` validation.
-- Vector field in `select`: returned in response.
-- Vector field NOT in `filter`/`orderby`/`facets`: `400 InvalidQuery`.
+- Create index with vector field: valid Azure-shaped schema → `201`; missing `vectorSearch`/`profiles` → `400`; invalid `dimensions` → `400`; unknown profile / unknown algorithm → `400`; quantized type → `400`; `searchable: false` → `400`.
+- Upload documents with vectors: correct dimension → per-doc `201`; wrong dimension → per-doc `400`; non-numeric → per-doc `400`.
+- Vector search (raw wire format): returns correct nearest neighbours; `k` respected; `fields` as string and array both work; score ordering correct.
+- Per-query `exhaustive: true` matches brute-force order on a fixture where HNSW order could differ.
+- `kind: "text"` → `400 UnsupportedQuery`.
+- Hybrid search: **union** of full-text and vector results (doc matching only one side is present), ordered by max score.
+- `vectorFilterMode`: `preFilter` vs `postFilter` produce the documented different result sets on a crafted fixture.
+- Multiple vector queries + multi-field query: union of results, best score wins.
+- Paging: `top`/`skip` on merged set; `count=true` reflects merged set; changed `vectorQueries` with a continuation token → `400`.
+- Error cases: unknown field, dimension mismatch, non-finite values, `k` validation (zero/negative/non-integer/>1000), >5 queries.
+- Vector field in `select`: returned (subject to `retrievable`); in `filter`/`orderby`/`facets`/`searchFields` → `400 InvalidQuery`.
 
 ### Python SDK compatibility tests
 
-- `SearchIndexClient.create_index` with vector fields and `vectorSearch` config.
+- `SearchIndexClient.create_index` with vector fields (`vector_search_dimensions`, `vector_search_profile_name`) and `VectorSearch` + `HnswAlgorithmConfiguration` / `VectorSearchProfile`.
 - `SearchClient.upload_documents` with vector field values.
-- `SearchClient.search` with `vector_queries` parameter (the SDK's `vector_queries=` kwarg).
-- Hybrid: `search` + `vector_queries` together.
-- `vector_filter_mode` parameter.
-- Score values are present and ordered correctly.
+- `SearchClient.search` with `vector_queries=[VectorizedQuery(vector=..., fields=..., k_nearest_neighbors=..., exhaustive=...)]`.
+- Hybrid: `search_text=` + `vector_queries` together (union recall).
+- `vector_filter_mode=` (`preFilter`/`postFilter`) + top-level `filter=`.
+- Score values present and ordered; no exact-score assertions.
 
 ### E2E
 
-- Full RAG-style flow: create index with text + vector fields, upload documents with embeddings, search by vector, search hybrid, verify result ordering and scores.
+- Full RAG-style flow: create index with text + vector fields, upload documents with embeddings, search by vector, search hybrid, verify result ordering and scores (ordering only).
 
 ## Known differences (to be documented)
 
 | Behaviour | Emulator | Azure | Rationale |
 |-----------|----------|-------|-----------|
-| Vector search algorithm | HNSW (approximate) or flat (exact) | HNSW (approximate) | Same algorithm family; recall may differ slightly due to implementation. At `exhaustiveThreshold` or `flat` kind, results are exact. |
-| `@search.score` for cosine | `1 - cosine_distance` (from hnsw_rs) | Azure's internal scoring | Both in [0,1], higher = more similar. Exact values may differ. |
-| `@search.score` for euclidean | `1 / (1 + l2_distance)` | Azure's internal scoring | Both in (0,1], higher = closer. Exact values may differ. |
-| Hybrid ranking | Vector score only (full-text is a gate) | Azure combines both signals with a ranking model | Deterministic; test assertions must not depend on Azure's hybrid ranking model. |
-| `byte` vector format | Rejected | Supported | Quantized vectors are an optimisation not needed for a test double. |
+| Vector search algorithm | HNSW (approximate) or brute-force (exact, for `exhaustiveKnn` / `exhaustive: true`) | HNSW (approximate) + exhaustiveKnn | Same algorithm family; recall may differ slightly on the HNSW path. The brute-force path is exact. |
+| `@search.score` (all metrics) | Emulator-defined formulas (§Scoring) | Azure's internal scoring | Same direction (higher = more similar) and, for cosine, same [0,1] range. Exact values differ; do not assert equality. |
+| Hybrid ranking | Union + max-score (deterministic) | RRF / ranking-model fusion | Deterministic; recall matches (union) but ordering may differ. Test assertions must not depend on Azure's hybrid ranking model. |
+| Per-query `weight`, `stored`, `sessionId` | Accepted but inert | Affect ranking/storage/scoring | Deterministic test double; assertions must not depend on them. |
+| Quantized vector types | Rejected | Supported | Quantization is an optimisation not needed for a test double. |
+| Vectorizer (`kind: "text"`) queries | Rejected (`400 UnsupportedQuery`) | Supported with a vectorizer | No model inference in the emulator. |
+| Paging with vectors | Token binds `vectorQueries`+`vectorFilterMode`; changing them mid-paging is `400` | Tokens tolerate broader reuse | Fail-fast beats silently shifted pages. |
 | Max vector queries per search | 5 | 5 | Matches Azure. |
-| Max dimension | 3072 | 3072 | Matches Azure. |
+| Max dimension | 3072 (or `EMULATOR_VECTOR__MAX_DIMENSION`) | 3072 | Matches Azure; cap is lowerable for CI. |
 
 ## Checklist
 
 ### Schema and validation
 
-- [ ] `Edm.Collection(Edm.Single, N)` accepted as a field type (both `Edm.` and bare `Collection(...)` forms).
-- [ ] Dimension validated (1–3072, integer).
-- [ ] Vector fields rejected when `key`/`searchable`/`filterable`/`sortable`/`facetable` is true.
-- [ ] `vectorSearch` property required when vector fields are present.
-- [ ] Algorithm config validated: `kind`, `vectorFormat`, `metric`, `parameters`.
-- [ ] `byte` format rejected with clear error.
-- [ ] Field-to-algorithm reference validated.
+- [ ] `Collection(Edm.Single)` accepted (both `Edm.`-prefixed and bare SDK forms, normalized).
+- [ ] `dimensions` required and validated (1–cap, integer).
+- [ ] `vectorSearchProfile` required; unknown profile → `400`.
+- [ ] `vectorSearch.profiles[]` validated (unknown algorithm, duplicates → `400`).
+- [ ] Vector fields require `searchable: true`; rejected when `key`/`filterable`/`sortable`/`facetable`.
+- [ ] `retrievable: true/false` honored; `stored` accepted-but-inert.
+- [ ] Algorithm config validated: `kind` (`hnsw`/`exhaustiveKnn`), nested `hnswParameters`/`exhaustiveKnnParameters`, `metric`.
+- [ ] Quantized types rejected with clear error.
+- [ ] Field→profile→algorithm resolution validated.
 - [ ] Multiple vector fields per index supported (up to 16).
 
 ### Document management
 
 - [ ] Vector field values validated: array of floats, correct dimension, finite.
 - [ ] Per-document errors for invalid vectors in batch responses.
-- [ ] Vector stored in document (retrievable in search results via `select`).
+- [ ] Vector stored in document (returned via `select` subject to `retrievable`).
+- [ ] Cosine vectors normalized on insert (euclidean/dotProduct untouched).
 - [ ] Merge semantics: vector field replaced wholesale on merge (same as collections).
-- [ ] Delete removes vector from the vector index.
+- [ ] Delete removes vector (rebuild) and deleted keys never match.
 
 ### Vector search
 
-- [ ] `vectorQueries` parsed: `key`, `vector`, `k`, `filters`.
-- [ ] Single vector query returns top-k by similarity.
+- [ ] `vectorQueries` parsed: `kind`, `vector`, `fields` (string + array), `k`, `exhaustive`, `weight` (inert).
+- [ ] SDK key translation (`k_nearest_neighbors`→`k`, `fields`, `exhaustive`, `vector_filter_mode`) in `api/`.
+- [ ] Single vector query returns top-k by similarity; multi-field query unions per-field hits.
 - [ ] Multiple vector queries: union, best score.
-- [ ] `k` validated (positive integer, max 1000).
-- [ ] Score values correct per metric (cosine, dotProduct, euclidean).
-- [ ] Results ordered by score descending, key tie-breaker.
-- [ ] `vectorFilterMode=postFilter`: filter applied after retrieval.
-- [ ] `vectorFilterMode=preFilter`: filter constrains graph traversal.
-- [ ] Hybrid search: intersection with full-text, ordered by vector score.
+- [ ] `k` validated (positive integer, max 1000, default 3 when missing).
+- [ ] `kind: "text"` → `400 UnsupportedQuery`.
+- [ ] Score values correct per metric (cosine, dotProduct, euclidean); ordered desc, key tie-breaker.
+- [ ] `vectorFilterMode=postFilter`: top-level `filter` applied after retrieval.
+- [ ] `vectorFilterMode=preFilter`: filter constrains candidates (predicate + fallback).
+- [ ] Per-query `exhaustive: true` forces brute-force.
+- [ ] Hybrid search: union with full-text, ordered by max score.
 - [ ] Vector-only search (no full-text term): all vector results returned.
-- [ ] `top`/`skip` pagination applied to vector results.
+- [ ] `top`/`skip` pagination applied to merged results; `count` reflects merged set; token binds vector queries.
 - [ ] `select` projection includes/excludes vector fields correctly.
-- [ ] `count=true` works with vector search.
+- [ ] Vector fields in `filter`/`orderby`/`facets`/`searchFields` → `400 InvalidQuery`.
 
 ### Integration
 
 - [ ] Vector index created/destroyed with the emulator index.
-- [ ] Vector index updated on upload/merge/delete (immediate consistency).
+- [ ] Vector index updated on upload/merge/delete (immediate consistency; delete via rebuild).
 - [ ] Service reset clears all vector indexes.
 - [ ] Concurrent vector search + document upload does not corrupt state.
 - [ ] Existing full-text-only searches unaffected (no `vectorQueries` → same path as before).
@@ -336,14 +424,14 @@ New error cases (all `400` with Azure structure):
 ### Errors
 
 - [ ] All new error cases return correct status code and Azure error structure.
-- [ ] Vector field in `filter`/`orderby`/`facets` → `400 InvalidQuery`.
-- [ ] Semantic search params still rejected with `400 UnsupportedQuery`.
+- [ ] Semantic/vectorizer params still rejected with `400 UnsupportedQuery`.
 
 ### Tests
 
-- [ ] Unit tests: distance metrics, index lifecycle, filter modes, concurrency.
-- [ ] Contract tests: `tests/contract/vector_search.rs` covers all matrix entries.
-- [ ] Python SDK tests: vector index creation, upload, search, hybrid.
+- [ ] Unit tests: distance metrics, normalization, index lifecycle incl. delete-rebuild, filter modes, exhaustive flag, concurrency.
+- [ ] Contract tests: `source/rust/tests/contract/vector_search.rs` covers all matrix entries.
+- [ ] Python SDK tests: vector index creation, upload, search, hybrid, filter modes.
+- [ ] Fixtures captured for C# replay.
 - [ ] E2E: RAG-style flow.
 - [ ] All existing tests still pass (no regression).
 
@@ -352,9 +440,9 @@ New error cases (all `400` with Azure structure):
 - [ ] `cargo fmt --check` passes.
 - [ ] `cargo clippy --all-targets -- -D warnings` passes.
 - [ ] All test suites green (unit, contract, SDK, e2e).
-- [ ] `docs/supported_operations.md` updated.
+- [ ] `docs/supported_operations.md` updated (vector flipped to Supported; inert `weight`/`stored` noted).
 - [ ] `docs/known_differences.md` updated.
-- [ ] `docs/decisions/0004-vector-index.md` written.
+- [ ] `docs/decisions/0004-vector-index.md` written (hnsw_rs version, DataId, SIMD, rebuild, exact bypass).
 
 ## Exit criteria
 
