@@ -500,8 +500,6 @@ def test_upload_to_missing_index_returns_404(clean_emulator: str) -> None:
 
 def test_unsupported_query_options_rejected(priced_docs: SearchClient) -> None:
     cases = [
-        {"search_mode": "exact"},
-        {"highlight_fields": "title"},
         {"scoring_profile": "profile"},
         {"semantic_configuration_name": "config"},
         {"query_type": "full"},
@@ -513,6 +511,14 @@ def test_unsupported_query_options_rejected(priced_docs: SearchClient) -> None:
         response = exc_info.value.response
         assert response is not None
         assert json.loads(response.text())["error"]["code"] == "UnsupportedQuery"
+
+    # An invalid searchMode is a malformed query, not an unsupported option.
+    with pytest.raises(HttpResponseError) as exc_info:
+        list(priced_docs.search(search_text="*", search_mode="exact"))
+    assert exc_info.value.status_code == 400
+    response = exc_info.value.response
+    assert response is not None
+    assert json.loads(response.text())["error"]["code"] == "InvalidQuery"
 
 
 def test_error_body_is_azure_structured(index_client: SearchIndexClient) -> None:
@@ -676,3 +682,281 @@ def test_knowledge_base_retrieve_returns_empty(
     assert response.response == []
     assert response.activity == []
     assert response.references == []
+
+
+def test_search_mode_any_matches_union(
+    index_client: SearchIndexClient, search_client: SearchClient, full_index: SearchIndex
+) -> None:
+    index_client.create_index(full_index)
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "azure search", "price": 1.0},
+            {"id": "2", "title": "local emulators", "price": 2.0},
+            {"id": "3", "title": "unrelated", "price": 3.0},
+        ]
+    )
+    # Default (all/AND): no document contains both terms.
+    assert list(search_client.search(search_text="azure emulators")) == []
+    # Explicit all: same AND semantics.
+    found = list(search_client.search(search_text="azure emulators", search_mode="all"))
+    assert found == []
+    # Any (OR): either term matches.
+    found = list(search_client.search(search_text="azure emulators", search_mode="any"))
+    assert {doc["id"] for doc in found} == {"1", "2"}
+
+
+def test_search_stemming_and_stopwords(
+    index_client: SearchIndexClient, search_client: SearchClient, full_index: SearchIndex
+) -> None:
+    index_client.create_index(full_index)
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "running shoes", "price": 1.0},
+            {"id": "2", "title": "other things", "price": 2.0},
+        ]
+    )
+    # Inflected forms reduce to the same stem.
+    for term in ["run", "runs", "running"]:
+        found = list(search_client.search(search_text=term))
+        assert [doc["id"] for doc in found] == ["1"], f"term {term!r}"
+    # "the" is an English stopword: it matches nothing.
+    assert list(search_client.search(search_text="the")) == []
+
+
+def test_search_fuzzy_matches_typos(
+    index_client: SearchIndexClient, search_client: SearchClient, full_index: SearchIndex
+) -> None:
+    index_client.create_index(full_index)
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "azure emulator", "price": 1.0},
+            {"id": "2", "title": "other things", "price": 2.0},
+        ]
+    )
+    # Typos within edit distance 1 of the indexed stem "emul".
+    for term in ["emu~", "omul~", "emul~2"]:
+        found = list(search_client.search(search_text=term))
+        assert [doc["id"] for doc in found] == ["1"], f"term {term!r}"
+    # Unrelated terms match nothing, even fuzzy.
+    assert list(search_client.search(search_text="zzz~")) == []
+
+
+def test_search_scores_rank_by_relevance(
+    index_client: SearchIndexClient, search_client: SearchClient, full_index: SearchIndex
+) -> None:
+    index_client.create_index(full_index)
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "azure azure azure", "price": 1.0},
+            {"id": "2", "title": "azure", "price": 2.0},
+        ]
+    )
+    found = list(search_client.search(search_text="azure"))
+    assert [doc["id"] for doc in found] == ["1", "2"]
+    scores = [doc["@search.score"] for doc in found]
+    assert all(score > 0 for score in scores)
+    assert scores[0] >= scores[1]
+
+
+def test_search_highlights(
+    index_client: SearchIndexClient, search_client: SearchClient, full_index: SearchIndex
+) -> None:
+    index_client.create_index(full_index)
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "Azure Search Rocks", "price": 1.0},
+            {"id": "2", "title": "Other things", "price": 2.0},
+        ]
+    )
+    found = list(search_client.search(search_text="azure", highlight_fields="title"))
+    assert len(found) == 1
+    assert found[0]["@search.highlights"] == {"title": ["<em>Azure</em> Search Rocks"]}
+
+    found = list(
+        search_client.search(
+            search_text="azure",
+            highlight_fields="title",
+            highlight_pre_tag="<b>",
+            highlight_post_tag="</b>",
+        )
+    )
+    assert found[0]["@search.highlights"] == {"title": ["<b>Azure</b> Search Rocks"]}
+
+    # Highlighting an unknown field is rejected explicitly.
+    with pytest.raises(HttpResponseError) as exc_info:
+        list(search_client.search(search_text="azure", highlight_fields="missing"))
+    assert exc_info.value.status_code == 400
+
+
+def test_search_fields_weights_boost_scores(priced_docs: SearchClient) -> None:
+    plain = list(priced_docs.search(search_text="red"))
+    assert len(plain) == 1
+    plain_score = plain[0]["@search.score"]
+    boosted = list(priced_docs.search(search_text="red", search_fields=["title^10"]))
+    assert len(boosted) == 1
+    assert boosted[0]["@search.score"] > plain_score
+
+
+def test_search_filter_in_operator(priced_docs: SearchClient) -> None:
+    found = list(priced_docs.search(search_text="*", filter="price in (5.0, 500.0)"))
+    assert {doc["id"] for doc in found} == {"1", "3"}
+    found = list(priced_docs.search(search_text="*", filter="price in (1.0, 2.0)"))
+    assert found == []
+
+
+def test_search_filter_string_functions(priced_docs: SearchClient) -> None:
+    found = list(priced_docs.search(search_text="*", filter="startswith(title, 'cheap')"))
+    assert [doc["id"] for doc in found] == ["1"]
+    found = list(priced_docs.search(search_text="*", filter="endswith(title, 'blue')"))
+    assert [doc["id"] for doc in found] == ["2"]
+    found = list(priced_docs.search(search_text="*", filter="contains(title, 'ens')"))
+    assert [doc["id"] for doc in found] == ["3"]
+    found = list(priced_docs.search(search_text="*", filter="title in ('cheap red', 'other')"))
+    assert [doc["id"] for doc in found] == ["1"]
+
+
+def test_search_orderby_nulls_first_ascending_last_descending(
+    index_client: SearchIndexClient, search_client: SearchClient, full_index: SearchIndex
+) -> None:
+    index_client.create_index(full_index)
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "priced", "price": 10.0},
+            {"id": "2", "title": "unpriced"},
+            {"id": "3", "title": "cheap", "price": 1.0},
+        ]
+    )
+    found = list(search_client.search(search_text="*", order_by="price asc"))
+    assert [doc["id"] for doc in found] == ["2", "3", "1"]
+    found = list(search_client.search(search_text="*", order_by="price desc"))
+    assert [doc["id"] for doc in found] == ["1", "3", "2"]
+
+
+def test_alias_resolves_for_search_and_documents(
+    clean_emulator: str,
+    index_client: SearchIndexClient,
+    search_client: SearchClient,
+    full_index: SearchIndex,
+) -> None:
+    index_client.create_index(full_index)
+    search_client.upload_documents(documents=[{"id": "1", "title": "hello"}])
+    index_client.create_alias(SearchAlias(name="al", indexes=[INDEX_NAME]))
+
+    alias_client = SearchClient(
+        endpoint=clean_emulator,
+        index_name="al",
+        credential=CREDENTIAL,
+        api_version=API_VERSION,
+    )
+    found = list(alias_client.search(search_text="hello"))
+    assert [doc["id"] for doc in found] == ["1"]
+    doc = alias_client.get_document(key="1")
+    assert doc["id"] == "1"
+    assert alias_client.get_document_count() == 1
+
+
+def test_suggest_and_autocomplete_infix(
+    index_client: SearchIndexClient, search_client: SearchClient
+) -> None:
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchField(name="title", type=SearchFieldDataType.String, searchable=True),
+            ],
+            suggesters=[SearchSuggester(name="sg", source_fields=["title"])],
+        )
+    )
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "Boston Harbor Hotel"},
+            {"id": "2", "title": "Portland Airport Inn"},
+        ]
+    )
+    # "rbor" is an infix (not a prefix) of "Harbor".
+    suggestions = search_client.suggest(search_text="rbor", suggester_name="sg")
+    assert [doc["id"] for doc in suggestions] == ["1"]
+    # "osto" is an infix of "Boston".
+    completions = search_client.autocomplete(search_text="osto", suggester_name="sg")
+    assert [item.text for item in completions] == ["Boston"]
+
+
+def test_analyze_text_with_analyzer(index_client: SearchIndexClient, created_index: SearchIndex) -> None:
+    result = index_client.analyze_text(
+        INDEX_NAME, AnalyzeTextOptions(text="Running tests", analyzer_name="standard.lucene")
+    )
+    assert [token.token for token in result.tokens] == ["run", "test"]
+
+
+def test_analyze_text_keyword_and_whitespace_analyzers(
+    index_client: SearchIndexClient, created_index: SearchIndex
+) -> None:
+    result = index_client.analyze_text(
+        INDEX_NAME, AnalyzeTextOptions(text="Running Tests", analyzer_name="keyword")
+    )
+    assert [token.token for token in result.tokens] == ["Running Tests"]
+    result = index_client.analyze_text(
+        INDEX_NAME, AnalyzeTextOptions(text="Running tests", analyzer_name="whitespace")
+    )
+    assert [token.token for token in result.tokens] == ["Running", "tests"]
+
+
+def test_search_order_by_score(
+    index_client: SearchIndexClient, search_client: SearchClient, full_index: SearchIndex
+) -> None:
+    index_client.create_index(full_index)
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "azure azure azure", "price": 1.0},
+            {"id": "2", "title": "azure", "price": 2.0},
+        ]
+    )
+    found = list(search_client.search(search_text="azure", order_by="@search.score desc"))
+    assert [doc["id"] for doc in found] == ["1", "2"]
+    found = list(search_client.search(search_text="azure", order_by="@search.score asc"))
+    assert [doc["id"] for doc in found] == ["2", "1"]
+
+
+def test_search_select_star(priced_docs: SearchClient) -> None:
+    found = list(priced_docs.search(search_text="*", select=["*"]))
+    assert len(found) == 3
+    for doc in found:
+        assert {"id", "title", "price", "tags"} <= set(doc)
+
+
+def test_search_fuzzy_default_distance_two(
+    index_client: SearchIndexClient, search_client: SearchClient, full_index: SearchIndex
+) -> None:
+    index_client.create_index(full_index)
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "azure emulator", "price": 1.0},
+            {"id": "2", "title": "other things", "price": 2.0},
+        ]
+    )
+    # A bare `~` uses the default edit distance 2 (matching Azure): "eamu"
+    # is two edits from the indexed stem "emul".
+    found = list(search_client.search(search_text="eamu~"))
+    assert [doc["id"] for doc in found] == ["1"]
+    assert list(search_client.search(search_text="eamu~1")) == []
+
+
+def test_alias_conflicts_with_index_name(
+    index_client: SearchIndexClient, full_index: SearchIndex
+) -> None:
+    index_client.create_index(full_index)
+    # An alias cannot take the name of an existing index.
+    with pytest.raises(HttpResponseError) as exc_info:
+        index_client.create_alias(SearchAlias(name=INDEX_NAME, indexes=[INDEX_NAME]))
+    assert exc_info.value.status_code == 409
+    # An index cannot take the name of an existing alias.
+    index_client.create_alias(SearchAlias(name="al", indexes=[INDEX_NAME]))
+    with pytest.raises(HttpResponseError) as exc_info:
+        index_client.create_index(
+            SearchIndex(
+                name="al",
+                fields=[SearchField(name="id", type=SearchFieldDataType.String, key=True)],
+            )
+        )
+    assert exc_info.value.status_code == 409

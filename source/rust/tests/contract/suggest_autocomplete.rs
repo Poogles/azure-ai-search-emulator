@@ -393,3 +393,46 @@ async fn autocomplete_requires_auth() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["error"]["code"], "AuthenticationFailed");
 }
+
+#[tokio::test]
+async fn autocomplete_matches_infix() {
+    let app = app();
+    let (status, _) = create_suggester_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+    seed(&app).await;
+
+    // "osto" is an infix (not a prefix) of "Boston"/"boston".
+    let (status, body) = call(
+        app.clone(),
+        autocomplete_request("items", json!({"search": "osto", "suggesterName": "sg"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let texts: Vec<&str> = body["value"]
+        .as_array()
+        .map(|items| items.iter().filter_map(|c| c["text"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(texts.contains(&"Boston"), "expected Boston in {texts:?}");
+    assert!(texts.contains(&"boston"), "expected boston in {texts:?}");
+}
+
+#[tokio::test]
+async fn suggest_matches_infix() {
+    let app = app();
+    let (status, _) = create_suggester_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+    seed(&app).await;
+
+    // "rbor" is an infix of "Harbor" (doc 1).
+    let (status, body) = call(
+        app,
+        suggest_request("items", json!({"search": "rbor", "suggesterName": "sg"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<&str> = body["value"]
+        .as_array()
+        .map(|items| items.iter().filter_map(|d| d["id"].as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(ids, vec!["1"]);
+}

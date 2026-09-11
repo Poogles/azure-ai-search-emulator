@@ -3,6 +3,7 @@
 
 use axum::http::StatusCode;
 use serde_json::json;
+use tower::ServiceExt;
 
 use super::common::*;
 
@@ -162,6 +163,63 @@ async fn update_alias_name_mismatch_returns_400() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "InvalidAlias");
+}
+
+#[tokio::test]
+async fn update_alias_rejects_empty_indexes() {
+    let app = app();
+    // PUT validates like POST: an empty `indexes` array is rejected.
+    let (status, body) = call(
+        app,
+        alias_request(
+            "PUT",
+            "alias1",
+            Some(json!({"name": "alias1", "indexes": []})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "InvalidAlias");
+}
+
+#[tokio::test]
+async fn alias_and_index_names_share_a_namespace() {
+    let app = app();
+    let (status, _) = create_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // An alias cannot take the name of an existing index (POST or PUT).
+    let (status, body) = call(app.clone(), create_alias_request("items", "items")).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "AliasAlreadyExists");
+    let (status, body) = call(
+        app.clone(),
+        alias_request(
+            "PUT",
+            "items",
+            Some(json!({"name": "items", "indexes": ["items"]})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "AliasAlreadyExists");
+
+    // An index cannot take the name of an existing alias (POST or PUT).
+    let (status, _) = call(app.clone(), create_alias_request("alias1", "items")).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = call(
+        app.clone(),
+        post_index_request("alias1", Some(API_KEY), Some(API_VERSION)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "IndexAlreadyExists");
+    let (status, _) = call(
+        app,
+        put_index_request("alias1", Some(API_KEY), Some(API_VERSION)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
 }
 
 #[tokio::test]
@@ -629,4 +687,54 @@ async fn knowledge_base_unknown_subroute_returns_404() {
     let uri = format!("/knowledgebases('base1')/nope?api-version={API_VERSION}");
     let (status, _) = call(app, request("GET", &uri, Some(API_KEY), None)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn alias_resolves_for_search_and_document_routes() {
+    let app = app();
+    let (status, _) = create_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        upload_request(
+            "items",
+            json!([{"@search.action": "upload", "document": {"id": "1", "title": "hello"}}]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(app.clone(), create_alias_request("alias1", "items")).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Search via the alias name resolves to the target index.
+    let (status, body) = call(
+        app.clone(),
+        search_request("alias1", json!({"search": "hello"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["value"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["value"][0]["id"], "1");
+
+    // Single-document lookup via the alias.
+    let uri = format!("/indexes('alias1')/docs('1')?api-version={API_VERSION}");
+    let (status, body) = call(app.clone(), request("GET", &uri, Some(API_KEY), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["id"], "1");
+
+    // Document count via the alias.
+    let uri = format!("/indexes('alias1')/docs/$count?api-version={API_VERSION}");
+    let response = must(
+        app.clone()
+            .oneshot(request("GET", &uri, Some(API_KEY), None))
+            .await,
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // An alias pointing at a missing index behaves like the missing index.
+    let (status, _) = call(app.clone(), create_alias_request("dangling", "missing")).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = call(app, search_request("dangling", json!({"search": "*"}))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "ResourceNotFound");
 }

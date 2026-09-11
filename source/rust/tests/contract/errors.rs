@@ -84,3 +84,40 @@ async fn error_body_is_azure_compatible() {
     assert!(error["message"].is_string());
     assert_eq!(error.as_object().map(serde_json::Map::len), Some(2));
 }
+
+#[tokio::test]
+async fn newer_api_version_accepted_by_floor() {
+    let app = app();
+    // Newer than the configured 2024-07-01: accepted by the floor rule.
+    let (status, _) = call(
+        app.clone(),
+        put_index_request("items", Some(API_KEY), Some("2026-04-01")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    // Between configured versions: accepted.
+    let (status, _) = call(
+        app.clone(),
+        put_index_request("other", Some(API_KEY), Some("2024-10-01-preview")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    // Below the floor: still rejected.
+    let (status, body) = call(
+        app.clone(),
+        put_index_request("items", Some(API_KEY), Some("2020-06-30")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "ApiVersionUnsupported");
+    // Well-shaped but calendrically impossible dates are rejected too.
+    for version in ["2024-13-01", "2024-07-32"] {
+        let (status, body) = call(
+            app.clone(),
+            put_index_request("items", Some(API_KEY), Some(version)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "version {version}");
+        assert_eq!(body["error"]["code"], "ApiVersionUnsupported");
+    }
+}

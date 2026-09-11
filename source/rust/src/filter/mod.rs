@@ -2,7 +2,8 @@
 //!
 //! Supports the operator set required by the supported-operations matrix:
 //! `and` / `or` / `not` with parentheses, `eq` / `ne` / `gt` / `ge` / `lt` /
-//! `le` on string, numeric, and boolean values, and collection filtering with
+//! `le` / `in` on string, numeric, and boolean values, the string functions
+//! `startswith` / `endswith` / `contains`, and collection filtering with
 //! `any` / `all`. Anything else is rejected with a clear parse error.
 //!
 //! The parser produces an internal expression tree ([`FilterExpr`]) that is
@@ -52,6 +53,25 @@ pub enum FilterValue {
     Null,
 }
 
+/// A string function supported in filter expressions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringFunc {
+    StartsWith,
+    EndsWith,
+    Contains,
+}
+
+impl StringFunc {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "startswith" => Some(Self::StartsWith),
+            "endswith" => Some(Self::EndsWith),
+            "contains" => Some(Self::Contains),
+            _ => None,
+        }
+    }
+}
+
 /// The internal filter expression tree.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilterExpr {
@@ -62,6 +82,18 @@ pub enum FilterExpr {
         field: String,
         op: FilterOp,
         value: FilterValue,
+    },
+    /// `field in (value, ...)` membership test.
+    In {
+        field: String,
+        values: Vec<FilterValue>,
+    },
+    /// `startswith(field, 'prefix')` / `endswith(field, 'suffix')` /
+    /// `contains(field, 'substring')` (ordinal, case-sensitive).
+    StringFunc {
+        func: StringFunc,
+        field: String,
+        arg: String,
     },
     Any {
         field: String,
@@ -86,28 +118,28 @@ impl FilterExpr {
             FilterExpr::Or(clauses) => clauses.iter().any(|c| c.matches(fields)),
             FilterExpr::Not(inner) => !inner.matches(fields),
             FilterExpr::Compare { field, op, value } => {
-                let Some(actual) = resolve_path(fields, field) else {
-                    // A missing field (or missing path segment) compares like `null`.
-                    return null_matches(*op, value);
+                compare_field_values(&resolve_paths(fields, field), *op, value)
+            }
+            FilterExpr::In { field, values } => {
+                let resolved = resolve_paths(fields, field);
+                if resolved.is_empty() {
+                    // A missing field matches only a list containing `null`.
+                    return values.iter().any(value_is_null);
+                }
+                flatten_values(&resolved)
+                    .iter()
+                    .any(|item| values.iter().any(|value| values_equal(item, value)))
+            }
+            FilterExpr::StringFunc { func, field, arg } => {
+                let is_match = |text: &str| match func {
+                    StringFunc::StartsWith => text.starts_with(arg.as_str()),
+                    StringFunc::EndsWith => text.ends_with(arg.as_str()),
+                    StringFunc::Contains => text.contains(arg.as_str()),
                 };
-                if actual.is_null() {
-                    return null_matches(*op, value);
-                }
-                if actual.is_array() {
-                    // Collection field compared to a scalar: `eq` matches when
-                    // any element equals the value, `ne` when no element does.
-                    match op {
-                        FilterOp::Eq => actual.as_array().is_some_and(|items| {
-                            items.iter().any(|item| values_equal(item, value))
-                        }),
-                        FilterOp::Ne => actual.as_array().is_some_and(|items| {
-                            !items.iter().any(|item| values_equal(item, value))
-                        }),
-                        _ => false,
-                    }
-                } else {
-                    compare(actual, *op, value)
-                }
+                flatten_values(&resolve_paths(fields, field))
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .any(is_match)
             }
             FilterExpr::Any { field, inner } => fields
                 .get(field)
@@ -122,15 +154,88 @@ impl FilterExpr {
 }
 
 /// Resolves a field path (`Address/StateProvince`, or a plain field name)
-/// against a document's field map, walking into complex-type objects.
-fn resolve_path<'a>(fields: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
+/// against a document's field map, walking into complex-type objects. When a
+/// segment resolves to a JSON array (a collection field or a
+/// collection-of-complex field), the remaining path is resolved against every
+/// element, so a collection-of-complex path yields one value per element. A
+/// plain (non-collection) path yields at most one value.
+fn resolve_paths<'a>(fields: &'a Map<String, Value>, path: &str) -> Vec<&'a Value> {
     let mut segments = path.split('/');
-    let first = segments.next()?;
-    let mut current = fields.get(first)?;
+    let Some(first) = segments.next() else {
+        return Vec::new();
+    };
+    let mut current = match fields.get(first) {
+        Some(value) => vec![value],
+        None => return Vec::new(),
+    };
     for segment in segments {
-        current = current.as_object()?.get(segment)?;
+        let mut next = Vec::new();
+        for value in current {
+            match value {
+                Value::Array(items) => {
+                    for item in items {
+                        if let Some(sub) = item.as_object().and_then(|o| o.get(segment)) {
+                            next.push(sub);
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(sub) = value.as_object().and_then(|o| o.get(segment)) {
+                        next.push(sub);
+                    }
+                }
+            }
+        }
+        current = next;
     }
-    Some(current)
+    current
+}
+
+/// Flattens resolved path values one level: a single collection field becomes
+/// its elements; anything else passes through unchanged.
+fn flatten_values<'a>(values: &[&'a Value]) -> Vec<&'a Value> {
+    if let [Value::Array(items)] = values {
+        items.iter().collect()
+    } else {
+        values.to_vec()
+    }
+}
+
+/// Evaluates a comparison against the values a field path resolved to:
+/// - no values (a missing field or path): compares like `null`;
+/// - a single scalar (or explicit `null`): a direct comparison;
+/// - otherwise (a collection field, or a path through a collection):
+///   `eq`/`in`-style matching when any value equals, `ne` when none does,
+///   and ordering operators when any value satisfies them.
+fn compare_field_values(values: &[&Value], op: FilterOp, expected: &FilterValue) -> bool {
+    if values.is_empty() {
+        return null_matches(op, expected);
+    }
+    if values.len() == 1 && !values[0].is_array() {
+        let actual = values[0];
+        if actual.is_null() {
+            return null_matches(op, expected);
+        }
+        return compare(actual, op, expected);
+    }
+    let flat = flatten_values(values);
+    if matches!(expected, FilterValue::Null) {
+        let has_null = flat.iter().any(|value| value.is_null());
+        return match op {
+            FilterOp::Eq => has_null,
+            FilterOp::Ne => !has_null,
+            _ => false,
+        };
+    }
+    match op {
+        // Collection field compared to a scalar: `eq` matches when any
+        // element equals the value, `ne` when no element does.
+        FilterOp::Eq => flat.iter().any(|item| values_equal(item, expected)),
+        FilterOp::Ne => !flat.iter().any(|item| values_equal(item, expected)),
+        _ => flat
+            .iter()
+            .any(|item| !item.is_null() && compare(item, op, expected)),
+    }
 }
 
 fn value_is_null(value: &FilterValue) -> bool {
@@ -243,6 +348,28 @@ pub fn validate(expr: &FilterExpr, definition: &IndexDefinition) -> Result<(), S
             }
             Ok(())
         }
+        FilterExpr::In { field, .. } => {
+            require_filterable(field, definition)?;
+            Ok(())
+        }
+        FilterExpr::StringFunc { func, field, .. } => {
+            let field_def = require_filterable(field, definition)?;
+            if field_def.field_type != "Edm.String"
+                && field_def.field_type != "Edm.Collection(Edm.String)"
+            {
+                let name = match func {
+                    StringFunc::StartsWith => "startswith",
+                    StringFunc::EndsWith => "endswith",
+                    StringFunc::Contains => "contains",
+                };
+                return Err(format!(
+                    "Filter function {name} on field {field:?} requires a string field; \
+                     field type is {:?}.",
+                    field_def.field_type
+                ));
+            }
+            Ok(())
+        }
         FilterExpr::Any { field, inner } | FilterExpr::All { field, inner } => {
             let field_def = require_filterable(field, definition)?;
             if !is_collection_type(&field_def.field_type) {
@@ -251,7 +378,16 @@ pub fn validate(expr: &FilterExpr, definition: &IndexDefinition) -> Result<(), S
                 ));
             }
             match inner.as_ref() {
-                FilterExpr::Compare { .. } => Ok(()),
+                FilterExpr::Compare { field: inner_field, .. } => {
+                    if inner_field.contains('/') {
+                        return Err(format!(
+                            "any/all on field {field:?} must contain a single comparison on the \
+                             lambda variable; paths into the element (e.g. {inner_field:?}) are \
+                             not supported."
+                        ));
+                    }
+                    Ok(())
+                }
                 _ => Err(format!(
                     "any/all on field {field:?} must contain a single comparison on the lambda variable."
                 )),
@@ -562,12 +698,96 @@ impl Parser {
                 }),
             };
         }
+        // Function calls: `startswith(field, 'prefix')`, `endswith(field,
+        // 'suffix')`, `contains(field, 'substring')`.
+        if matches!(self.peek(), Some(Token::LParen)) {
+            return self.parse_function_call(&first);
+        }
+        // Membership test: `field in (value, ...)`.
+        if self.peek_ident_is("in") {
+            self.next();
+            return self.parse_in_list(&first);
+        }
         let op = self.parse_op()?;
         let value = self.parse_value()?;
         Ok(FilterExpr::Compare {
             field: first,
             op,
             value,
+        })
+    }
+
+    /// Parses a string-function call after the function name: `(field,
+    /// 'literal')`.
+    fn parse_function_call(&mut self, name: &str) -> Result<FilterExpr, String> {
+        let Some(func) = StringFunc::parse(name) else {
+            return Err(format!(
+                "Unsupported filter function {name:?}; supported functions: \
+                 startswith, endswith, contains."
+            ));
+        };
+        self.next(); // Consume '('.
+        let field = self.expect_ident("field name")?;
+        match self.next() {
+            Some(Token::Comma) => {}
+            other => {
+                return Err(format!(
+                    "Expected ',' after filter function field name, found {}.",
+                    describe_token(other.as_ref())
+                ))
+            }
+        }
+        let arg = match self.next() {
+            Some(Token::String(text)) => text,
+            other => {
+                return Err(format!(
+                    "Expected a string literal as the filter function argument, found {}.",
+                    describe_token(other.as_ref())
+                ))
+            }
+        };
+        match self.next() {
+            Some(Token::RParen) => {}
+            other => {
+                return Err(format!(
+                    "Expected ')' after filter function argument, found {}.",
+                    describe_token(other.as_ref())
+                ))
+            }
+        }
+        Ok(FilterExpr::StringFunc { func, field, arg })
+    }
+
+    /// Parses an `in` value list after the field name and `in` keyword:
+    /// `(value, ...)`.
+    fn parse_in_list(&mut self, field: &str) -> Result<FilterExpr, String> {
+        match self.next() {
+            // Consume '(' (the `in` keyword was already consumed).
+            Some(Token::LParen) => {}
+            other => {
+                return Err(format!(
+                    "Expected '(' after 'in', found {}.",
+                    describe_token(other.as_ref())
+                ))
+            }
+        }
+        let mut values = Vec::new();
+        loop {
+            values.push(self.parse_value()?);
+            match self.next() {
+                Some(Token::Comma) => {}
+                Some(Token::RParen) => break,
+                other => {
+                    return Err(format!(
+                        "Expected ',' or ')' in 'in' value list, found {}.",
+                        describe_token(other.as_ref())
+                    ))
+                }
+            }
+        }
+        Ok(FilterExpr::In {
+            field: field.to_owned(),
+            values,
         })
     }
 
@@ -854,13 +1074,108 @@ mod tests {
             "(price eq 5",
             "price eq 5)",
             "price eq 5 and",
-            "price in (1, 2)",
+            "price in 5",
+            "price in (5",
+            "price in (5,)",
+            "price in ()",
             "bogus price eq 5",
             "price eq 'unterminated",
             "price eq 5 5",
+            "nonsense(title, 'x')",
+            "startswith(title)",
+            "startswith(title, 5)",
         ] {
             assert!(parse_filter(input).is_err(), "expected error for {input:?}");
         }
+    }
+
+    #[test]
+    fn parses_and_evaluates_in_operator() {
+        assert!(matches(
+            &parse_ok("price in (5, 10, 15)"),
+            &[("price", json!(10))]
+        ));
+        assert!(!matches(
+            &parse_ok("price in (5, 10, 15)"),
+            &[("price", json!(7))]
+        ));
+        assert!(matches(
+            &parse_ok("title in ('a', 'b')"),
+            &[("title", json!("b"))]
+        ));
+        assert!(!matches(
+            &parse_ok("title in ('a', 'b')"),
+            &[("title", json!("c"))]
+        ));
+        assert!(matches(
+            &parse_ok("active in (true, false)"),
+            &[("active", json!(false))]
+        ));
+        // Collections: any element in the list matches.
+        assert!(matches(
+            &parse_ok("tags in ('red', 'blue')"),
+            &[("tags", json!(["green", "blue"]))]
+        ));
+        assert!(!matches(
+            &parse_ok("tags in ('red', 'blue')"),
+            &[("tags", json!(["green"]))]
+        ));
+        // Missing fields match only lists containing null.
+        assert!(matches(&parse_ok("title in ('a', null)"), &[]));
+        assert!(!matches(&parse_ok("title in ('a', 'b')"), &[]));
+        // Combines with logical operators.
+        assert!(matches(
+            &parse_ok("price in (1, 2) or title eq 'x'"),
+            &[("title", json!("x")), ("price", json!(9))]
+        ));
+    }
+
+    #[test]
+    fn parses_and_evaluates_string_functions() {
+        assert!(matches(
+            &parse_ok("startswith(title, 'hel')"),
+            &[("title", json!("hello world"))]
+        ));
+        assert!(!matches(
+            &parse_ok("startswith(title, 'hel')"),
+            &[("title", json!("say hello"))]
+        ));
+        assert!(matches(
+            &parse_ok("endswith(title, 'rld')"),
+            &[("title", json!("hello world"))]
+        ));
+        assert!(!matches(
+            &parse_ok("endswith(title, 'rld')"),
+            &[("title", json!("worldly"))]
+        ));
+        assert!(matches(
+            &parse_ok("contains(title, 'lo wo')"),
+            &[("title", json!("hello world"))]
+        ));
+        assert!(!matches(
+            &parse_ok("contains(title, 'lo wo')"),
+            &[("title", json!("hello"))]
+        ));
+        // Matching is ordinal and case-sensitive.
+        assert!(!matches(
+            &parse_ok("startswith(title, 'HEL')"),
+            &[("title", json!("hello"))]
+        ));
+        // Collections: any matching element satisfies the function.
+        assert!(matches(
+            &parse_ok("contains(tags, 'ed')"),
+            &[("tags", json!(["green", "red"]))]
+        ));
+        assert!(!matches(
+            &parse_ok("contains(tags, 'ed')"),
+            &[("tags", json!(["blue"]))]
+        ));
+        // Missing fields and non-strings never match.
+        assert!(!matches(&parse_ok("contains(title, 'x')"), &[]));
+        assert!(!matches(
+            &parse_ok("startswith(price, '1')"),
+            &[("price", json!(10))]
+        ));
     }
 
     #[test]
@@ -878,6 +1193,19 @@ mod tests {
         assert!(validate(&parse_ok("title any x eq 'a'"), &definition).is_err());
         // Valid.
         assert!(validate(&parse_ok("price gt 1 and tags any x eq 'a'"), &definition).is_ok());
+        // `in` on a filterable field is valid; on unknown/non-filterable
+        // fields it is rejected like any other comparison.
+        assert!(validate(&parse_ok("price in (1, 2)"), &definition).is_ok());
+        assert!(validate(&parse_ok("tags in ('a', 'b')"), &definition).is_ok());
+        assert!(validate(&parse_ok("missing in (1, 2)"), &definition).is_err());
+        assert!(validate(&parse_ok("locked in (1, 2)"), &definition).is_err());
+        // String functions on string fields are valid.
+        assert!(validate(&parse_ok("startswith(title, 'a')"), &definition).is_ok());
+        assert!(validate(&parse_ok("contains(tags, 'a')"), &definition).is_ok());
+        // String functions on non-string fields are rejected.
+        assert!(validate(&parse_ok("startswith(price, '1')"), &definition).is_err());
+        assert!(validate(&parse_ok("endswith(active, 'x')"), &definition).is_err());
+        assert!(validate(&parse_ok("contains(missing, 'x')"), &definition).is_err());
     }
 
     fn hotels_definition() -> IndexDefinition {
@@ -934,5 +1262,67 @@ mod tests {
         assert!(validate(&parse_ok("Address/Country eq 'USA'"), &definition).is_err());
         // Path through a non-complex field.
         assert!(validate(&parse_ok("id/City eq 'x'"), &definition).is_err());
+        // Paths into a lambda element are rejected explicitly.
+        assert!(validate(&parse_ok("tags/any(t: t/City eq 'x')"), &definition).is_err());
+    }
+
+    fn collection_complex_definition() -> IndexDefinition {
+        IndexDefinition::from_json(json!({
+            "name": "hotels",
+            "fields": [
+                {"name": "id", "type": "Edm.String", "key": true},
+                {
+                    "name": "Rooms",
+                    "type": "Edm.Collection(Edm.ComplexType)",
+                    "fields": [
+                        {"name": "Type", "type": "Edm.String", "filterable": true},
+                        {"name": "Rate", "type": "Edm.Double", "filterable": true}
+                    ]
+                }
+            ]
+        }))
+        .unwrap_or_else(|e| panic!("valid definition: {e}"))
+    }
+
+    #[test]
+    fn parses_and_evaluates_collection_of_complex_paths() {
+        // A direct path through a collection-of-complex field matches when any
+        // element satisfies the comparison.
+        let expr = parse_ok("Rooms/Type eq 'suite'");
+        assert!(matches(
+            &expr,
+            &[("Rooms", json!([{"Type": "standard"}, {"Type": "suite"}]))]
+        ));
+        assert!(!matches(&expr, &[("Rooms", json!([{"Type": "standard"}]))]));
+        assert!(matches(
+            &parse_ok("Rooms/Type ne 'suite'"),
+            &[("Rooms", json!([{"Type": "standard"}]))]
+        ));
+        // Ordering through a collection is existential.
+        assert!(matches(
+            &parse_ok("Rooms/Rate gt 100"),
+            &[("Rooms", json!([{"Rate": 50}, {"Rate": 150}]))]
+        ));
+        assert!(!matches(
+            &parse_ok("Rooms/Rate gt 100"),
+            &[("Rooms", json!([{"Rate": 50}]))]
+        ));
+        // String functions and `in` through a collection.
+        assert!(matches(
+            &parse_ok("startswith(Rooms/Type, 'sui')"),
+            &[("Rooms", json!([{"Type": "suite"}]))]
+        ));
+        assert!(matches(
+            &parse_ok("Rooms/Type in ('suite', 'loft')"),
+            &[("Rooms", json!([{"Type": "suite"}]))]
+        ));
+        assert!(!matches(
+            &parse_ok("Rooms/Type in ('suite', 'loft')"),
+            &[("Rooms", json!([{"Type": "standard"}]))]
+        ));
+        // Validation accepts filterable collection-of-complex subfield paths.
+        let definition = collection_complex_definition();
+        assert!(validate(&parse_ok("Rooms/Type eq 'suite'"), &definition).is_ok());
+        assert!(validate(&parse_ok("Rooms/Rate gt 100"), &definition).is_ok());
     }
 }

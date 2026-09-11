@@ -1,6 +1,6 @@
 ---
 status: complete
-status_last_reviewed: 2026-09-10
+status_last_reviewed: 2026-09-11
 ---
 
 # Known Differences from Azure AI Search
@@ -16,22 +16,25 @@ Differences fall into two categories:
 
 | Azure behaviour                                       | Emulator behaviour                | Rationale                                                                                           |
 |:------------------------------------------------------|:----------------------------------|:----------------------------------------------------------------------------------------------------|
-| `searchMode` (`any` vs `all`)                         | Rejected                          | Search always uses AND semantics; `searchMode` is rejected explicitly rather than silently ignored. |
-| Highlighting (`highlight`, pre/post tags)             | Rejected                          | No highlight fragments are produced.                                                                |
-| Scoring profiles, parameters, statistics              | Rejected                          | Scoring is a constant placeholder (see below).                                                      |
+| Scoring profiles, parameters, statistics              | Rejected                          | Scoring is BM25 (see below); custom scoring profiles are not applied.                               |
 | Semantic queries                                      | Rejected                          | No model inference in the emulator (initial design non-goal).                                       |
 | Vectorizer (`kind: "text"`) queries                   | Rejected (`400 UnsupportedQuery`) | No vectorizer in the emulator; callers must supply raw vectors.                                     |
 | Quantized vector types (`Collection(Edm.Half)`, etc.) | Rejected (`400 InvalidIndex`)     | Quantization is an optimisation not needed for a test double.                                       |
-| `queryType` other than `simple` (e.g. `full`/Lucene)  | Rejected                          | Only simple-query semantics are implemented.                                                        |
+| `queryType` other than `simple` (e.g. `full`/Lucene)  | Rejected                          | Only simple-query semantics are implemented (plus trailing-`~` fuzzy terms).                        |
 
 ## Silently different (operation succeeds, result may differ from Azure)
 
 ### Relevance and scoring
 
-- `@search.score` is `1.0` for every full-text result. Azure computes a relevance score.
-- Full-text results are ordered by the index key field, not by relevance. Azure orders by score (then by its own tie-breaks).
-- `sessionId` is accepted but inert: Azure uses it to maintain consistent scoring across a user session; the emulator's deterministic ordering and constant scoring make it irrelevant.
-- **Rationale:** deterministic ordering makes tests stable and independent of index contents; real relevance ranking is not needed for a test double. Test assertions must not assume relevance ordering or score values.
+- `@search.score` is the Tantivy BM25 relevance score (higher = more relevant). The formula differs from Azure's internal scoring, so test assertions must check ordering and relative ranking, not exact score equality.
+- Full-text results are ordered by score descending, with the index key field as the deterministic tie-breaker. Azure orders by score (then by its own tie-breaks).
+- `sessionId` is accepted but inert: Azure uses it to maintain consistent scoring across a user session; the emulator's deterministic tie-breaking makes it irrelevant.
+- **Rationale:** BM25 ranking matches Azure's ordering direction (most relevant first) while staying deterministic; real Azure score values are an implementation detail tests must not depend on.
+
+### Highlighting
+
+- `highlight` (a searchable field or list of fields) returns an `@search.highlights` object per matched document: each requested field with a query-term match maps to its highlighted fragments (the whole field value with matches wrapped in `highlightPreTag`/`highlightPostTag`, default `<em>`/`</em>`). Only searchable fields may be highlighted; unknown or non-searchable fields are rejected with `400 InvalidQuery`.
+- Fragments are whole field values, not Azure's sentence-window excerpts; phrase queries highlight their individual terms. Test assertions should check for the wrapped term, not fragment boundaries.
 
 ### Vector search scoring and ranking (Phase 2.1)
 
@@ -45,23 +48,25 @@ Differences fall into two categories:
 
 ### Query matching
 
-- **Simple** query semantics with `+`/`-` modifiers and `"quoted phrases"`: a multi-term search matches when every required analyzer token matches at least one searchable string field (AND). Azure simple queries additionally support proximity behaviour and more modifiers.
-- Tokenization uses Tantivy's default English analyzer: lowercasing and punctuation splitting, **no stemming and no stopword removal**. Azure uses its own analyzers (e.g. the basic English analyzer stems and can drop stopwords), so `running` does not match `run` in the emulator, and `the` is a matchable term.
-- `POST /search.analyze` always uses Tantivy's default analyzer regardless of the `analyzerName` or `field` parameters (accepted but inert). Token offsets and positions are accurate for the default analyzer.
+- **Simple** query semantics with `+`/`-` modifiers, `"quoted phrases"`, and Lucene-style fuzzy terms (`term~` for the default edit distance 2 like Azure, `term~N` for an explicit distance 0-2; distances above 2 are rejected explicitly). A multi-term search combines required clauses with AND (`searchMode=all`) or OR (`searchMode=any`). When `searchMode` is omitted the emulator uses AND; Azure defaults to OR.
+- Unlike Azure (which only lowercases fuzzy terms, bypassing analysis), the emulator analyzes fuzzy terms with the English analyzer, so `emulator~` matches the stemmed form and a stopword-only fuzzy term matches nothing. Fuzzy matches do not produce highlight fragments (highlighting matches analyzed query terms exactly).
+- Tokenization uses an English analyzer: lowercasing, punctuation splitting, English stopword removal, and English stemming — approximating Azure's basic English analyzer. `running` matches `run`; `the` is a stopword and matches nothing (a stopword-only query returns no documents).
+- `searchFields` weights (`field^N`, with a finite positive `N`) scale the field's BM25 contribution to `@search.score`.
+- `POST /search.analyze` uses the English analyzer, except `keyword` (the whole input as one verbatim token) and `whitespace` (whitespace split without lowercasing or stemming), which tokenize as Azure documents them. An explicit `analyzer` (`analyzerName` alias accepted) must be a known analyzer name and `field` (`fieldName` alias accepted) must exist in the index schema. Unknown analyzers/fields are rejected with `400 InvalidRequest`.
 - **Rationale:** whole-token, case-insensitive matching covers the assertions our tests make; e2e assertions deliberately use whole-token search terms so they would also pass against Azure.
 
 ### Autocomplete and suggest
 
-- Autocomplete and suggest use **case-insensitive prefix matching** of the search text against the whitespace-separated words of the suggester's search fields. Azure uses its full suggester algorithm (analyzing infix matching with scoring, fuzzy matching, and `searchMode` behaviour).
+- Autocomplete and suggest use **case-insensitive prefix or infix matching** of the search text against the whitespace-separated words of the suggester's search fields. Azure uses its full suggester algorithm (analyzing infix matching with scoring, fuzzy matching, and `searchMode` behaviour).
 - Autocomplete returns distinct completed terms (`text` + `queryPlusText`); suggest returns the matching documents (all fields) plus an `@search.text` field carrying the first matched word.
 - Results are ordered by index key (deterministic), not by relevance; `top` (default 5) limits the count.
 - The suggester's `searchMode` is accepted but inert, as are the other options the SDKs support on these routes (`filter`, `select`, `searchFields`, `orderby`, fuzzy matching, highlight tags, `autocompleteMode`, `minimumCoverage`). In particular a `filter` does not narrow suggestions — test assertions must not rely on it.
-- **Rationale:** prefix matching covers the assertions the reference samples make (a term that prefixes a field word); real suggester scoring and infix matching are out of scope for a test double.
+- **Rationale:** substring matching covers the assertions the reference samples make (a term that prefixes a field word); real suggester scoring is out of scope for a test double.
 
 ### Filter matching
 
-- Only the documented operator set (`and`/`or`/`not`, parentheses, `eq`/`ne`/`gt`/`ge`/`lt`/`le`, `any`/`all` in both the space-separated and `field/any(var: body)` lambda forms); anything else (e.g. `in`, string functions, `search.ismatch`) is rejected with `400 InvalidQuery` rather than approximated.
-- String comparisons are ordinal and case-sensitive; Azure can be configured otherwise. Type mismatches and missing fields never match.
+- The documented operator set (`and`/`or`/`not`, parentheses, `eq`/`ne`/`gt`/`ge`/`lt`/`le`, `in` with a parenthesized value list, the string functions `startswith`/`endswith`/`contains`, `any`/`all` in both the space-separated and `field/any(var: body)` lambda forms); anything else (e.g. other string/date functions, `search.ismatch`) is rejected with `400 InvalidQuery` rather than approximated.
+- String comparisons and string functions are ordinal and case-sensitive; Azure can be configured otherwise. Type mismatches and missing fields never match.
 - **Rationale:** explicit rejection beats silently wrong result sets; test filters stay within the supported set.
 
 ### Searchable field coverage
@@ -72,13 +77,13 @@ Differences fall into two categories:
 ### Facets, ordering, projection
 
 - Facet counts are exact (computed over the in-memory result set); Azure returns approximate counts at scale.
-- Missing values sort last regardless of direction; Azure sorts nulls first in ascending order.
-- `searchFields` weights (`field^2`) are accepted but inert (scoring is constant).
-- **Rationale:** deterministic, exact behaviour suits a test double; assertions must not depend on Azure's scale approximations or null ordering.
+- Missing values sort first in ascending order and last in descending order (matching Azure); the key field is the final tie-breaker for determinism.
+- **Rationale:** deterministic, exact behaviour suits a test double; assertions must not depend on Azure's scale approximations.
 
 ### Pagination
 
 - Continuation tokens embed a `state_version` that is bumped on every document mutation; following a token after the index changed returns `400` (stale token) and the search must be restarted. Azure tokens remain valid across mutations (results may shift).
+- A continuation token encapsulates the result-set state: its `skip`/`filter`/`orderby` win over request parameters, so later pages may send only `{continuation}` (plus a page size) and stay on the same result set. `top` remains a per-request page size. An empty page (e.g. `top=0`) ends the sequence with no further token. Tokens are URL-safe base64 so `@odata.nextLink` survives query-string transport.
 - The pinned Python SDK drops the opaque `continuation` property when re-POSTing `@search.nextPageParameters`, so SDK paging advances via `skip` and does not get staleness detection; direct HTTP clients that preserve `continuation` do.
 - **Rationale:** fail-fast staleness beats silently shifted pages in tests; SDK paging still terminates correctly via `skip`.
 
@@ -94,8 +99,8 @@ Differences fall into two categories:
 
 ### API versions
 
-- Only the versions listed in `EMULATOR_API_VERSIONS` (default `2024-07-01`) are accepted; Azure accepts a wide range of versions with version-specific behaviour. There is no version adapter: behaviour is identical across all accepted versions.
-- **Rationale:** one supported version is sufficient for the pinned SDKs; unsupported versions fail explicitly rather than guessing.
+- Acceptance is floor-based: any well-formed version on or after the earliest version in `EMULATOR_API_VERSIONS` (default `2024-07-01`) is accepted, so newer SDK defaults keep working without reconfiguration. Versions below the floor, malformed ones, and well-shaped but impossible dates (e.g. `2024-13-01`) are rejected explicitly. There is no version adapter: behaviour is identical across all accepted versions.
+- **Rationale:** floor acceptance keeps the pinned and reference-sample SDKs working as Azure ships new versions; unsupported versions fail explicitly rather than guessing.
 
 ### Synonym maps
 
@@ -105,13 +110,15 @@ Differences fall into two categories:
 
 ### Index aliases
 
-- Aliases are stored, echoed, and managed (create/update/get/list/delete) but **do not resolve**: search and document routes do not accept an alias name in place of an index name. Azure resolves aliases to their target index; the emulator returns `404` for an alias name on those routes.
+- Aliases are stored, echoed, and managed (create/update/get/list/delete), and **resolve on the data plane**: search, document upload/lookup/count, suggest, autocomplete, and analyze-text accept an alias name anywhere an index name is accepted, operating on the alias target (the first entry of its `indexes` array). An alias pointing at a missing index behaves like the missing index (`404 ResourceNotFound`).
+- Index management routes (`PUT`/`DELETE /indexes('name')`) do not resolve aliases.
+- Index and alias names share one namespace: creating an index named like an existing alias (or an alias named like an existing index) is `409`, since the alias would otherwise shadow the index on the data plane.
 - Etags are opaque counter strings, not Azure's hex entity tags.
-- **Rationale:** the CRUD surface is implemented so samples and clients that manage aliases work unchanged; alias resolution in the query path is out of scope for a test double.
+- **Rationale:** resolution is a name substitution before dispatch, so alias-backed tests exercise the same code paths as direct index tests.
 
 ### Collection-of-complex fields
 
-- `Edm.Collection(Edm.ComplexType)` fields accept arrays of objects and full-text index searchable string subfields across all elements. Filters use the same `Address/State` path syntax as single complex types; OData lambda shapes (`Address/any(a: ...)`) are not specially handled for complex collections.
+- `Edm.Collection(Edm.ComplexType)` fields accept arrays of objects and full-text index searchable string subfields across all elements. Filters use the same `Address/State` path syntax as single complex types, with any-element semantics (a direct path matches when any element satisfies the comparison); ordering through a collection is existential. Lambda bodies that address subfields of the element (e.g. `Rooms/any(r: r/Type eq 'x')`) are rejected explicitly — use a direct path instead.
 - **Rationale:** the schema and document surface is implemented so indexes with collection-of-complex fields round-trip; complex-collection lambda evaluation is out of scope.
 
 ### Knowledge sources, knowledge bases, and agentic retrieval
@@ -136,6 +143,10 @@ Differences fall into two categories:
 ## Not differences (deliberately Azure-compatible)
 
 - Error structure: `{"error": {"code", "message"}}` with Azure status codes (`401`, `400`, `404`, `409`, `500`).
-- Response envelopes: `@odata.context`, `@odata.count` (with `count=true`), `@search.facets` (present only when facets requested; omitted, not null, otherwise), `@search.score` per document, `{"value": [...]}` lists, per-document indexing results (`key`/`status`/`statusCode`/`errorMessage`).
+- Response envelopes: `@odata.context`, `@odata.count` (with `count=true`), `@search.facets` (present only when facets requested; omitted, not null, otherwise), `@search.score` per document, `@search.highlights` per document (only when highlighting was requested and the document matched), `{"value": [...]}` lists, per-document indexing results (`key`/`status`/`statusCode`/`errorMessage`).
+- Ranking direction: BM25 results order by score descending (most relevant first), like Azure; nulls sort first ascending / last descending, like Azure.
+- `searchMode` (`all`/`any`), field boosts (`field^N`), fuzzy terms (`term~`), stemming/stopwords, `highlight`, `in`, and string functions behave as Azure documents them (subject to the default-mode and single-analyzer notes above).
+- Alias names resolve to their target index on data-plane routes.
+- API versions on or after the configured floor are accepted.
 - SDK wire format: routes (`/docs/search.index`, `/docs/search.post.search`), the `{"value": [...]}` batch envelope, and top-level-spread document actions as sent by the pinned Python SDK (fixtures in `source/tests/python/fixtures/`).
 - Index-not-found (`404 ResourceNotFound`) is distinguished from an empty index (successful search with zero results).

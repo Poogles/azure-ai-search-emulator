@@ -216,3 +216,104 @@ async fn filter_odata_lambda_any_all() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "InvalidQuery");
 }
+
+#[tokio::test]
+async fn filter_in_operator_matches_list_members() {
+    let app = app_with_priced_docs().await;
+    let (status, body) = call(
+        app.clone(),
+        search_request(
+            "items",
+            json!({"search": "*", "filter": "price in (5.0, 500.0)"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["value"].as_array().map(Vec::len), Some(2));
+    assert_eq!(body["value"][0]["id"], "1");
+    assert_eq!(body["value"][1]["id"], "3");
+
+    // No member matches.
+    let (status, body) = call(
+        app,
+        search_request(
+            "items",
+            json!({"search": "*", "filter": "price in (1.0, 2.0)"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["value"].as_array().map(Vec::len), Some(0));
+}
+
+#[tokio::test]
+async fn filter_string_functions_match_substrings() {
+    let app = app();
+    // A dedicated index: `title` and `tags` are filterable here (the shared
+    // definition leaves `title` unfilterable).
+    let uri = format!("/indexes?api-version={API_VERSION}");
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            &uri,
+            Some(API_KEY),
+            Some(json!({
+                "name": "books",
+                "fields": [
+                    {"name": "id", "type": "Edm.String", "key": true},
+                    {"name": "title", "type": "Edm.String", "searchable": true, "filterable": true},
+                    {"name": "tags", "type": "Edm.Collection(Edm.String)", "filterable": true},
+                    {"name": "pages", "type": "Edm.Int32", "filterable": true}
+                ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        upload_request(
+            "books",
+            json!([
+                {"@search.action": "upload", "document": {"id": "1", "title": "hello world", "tags": ["red", "green"], "pages": 100}},
+                {"@search.action": "upload", "document": {"id": "2", "title": "goodbye moon", "tags": ["blue"], "pages": 200}}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    for (filter, expected) in [
+        ("startswith(title, 'hello')", vec!["1"]),
+        ("endswith(title, 'moon')", vec!["2"]),
+        ("contains(title, 'o w')", vec!["1"]),
+        ("contains(tags, 'een')", vec!["1"]),
+        ("title in ('hello world', 'other')", vec!["1"]),
+        ("startswith(title, 'zzz')", vec![]),
+    ] {
+        let (status, body) = call(
+            app.clone(),
+            search_request("books", json!({"search": "*", "filter": filter})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "filter {filter:?}");
+        let ids: Vec<&str> = body["value"]
+            .as_array()
+            .map(|items| items.iter().filter_map(|d| d["id"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(ids, expected, "filter {filter:?}");
+    }
+
+    // String functions on non-string fields are rejected explicitly, as are
+    // unsupported functions.
+    for filter in ["startswith(pages, '1')", "length(title) gt 2"] {
+        let (status, body) = call(
+            app.clone(),
+            search_request("books", json!({"search": "*", "filter": filter})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "filter {filter:?}");
+        assert_eq!(body["error"]["code"], "InvalidQuery");
+    }
+}

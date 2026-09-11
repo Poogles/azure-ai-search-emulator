@@ -6,13 +6,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE as BASE64_URL_SAFE};
 use base64::Engine as _;
 use serde_json::{Map, Value};
 
 use crate::error::ApiError;
 use crate::filter::{self, FilterExpr};
-use crate::query::{parse_search_text, FullTextQuery, QueryError, SearchEngine};
+use crate::query::{
+    parse_search_text, Clause, FullTextQuery, QueryError, SearchEngine, SearchMode,
+};
 use crate::storage::{
     Document, FieldDefinition, IndexDefinition, Storage, StorageError, Suggester,
 };
@@ -90,6 +92,8 @@ pub enum ActionKind {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SearchQuery {
     pub search: Option<String>,
+    /// How multi-term required clauses combine (`searchMode`).
+    pub search_mode: SearchMode,
     pub count: bool,
     pub top: Option<u64>,
     pub skip: u64,
@@ -101,7 +105,12 @@ pub struct SearchQuery {
     pub orderby_raw: Option<String>,
     pub select: Vec<String>,
     pub facets: Vec<Facet>,
-    pub search_fields: Vec<String>,
+    pub search_fields: Vec<SearchField>,
+    /// Fields to highlight (`highlight`); empty means no highlighting.
+    pub highlight_fields: Vec<String>,
+    /// Tags wrapping highlighted terms (`highlightPreTag` / `highlightPostTag`).
+    pub highlight_pre_tag: String,
+    pub highlight_post_tag: String,
     pub continuation: Option<String>,
     /// Parsed `vectorQueries` entries (wire shape; SDK key aliases already
     /// resolved).
@@ -110,6 +119,14 @@ pub struct SearchQuery {
     /// to the vector query identity.
     pub vector_queries_raw: Option<Value>,
     pub vector_filter_mode: VectorFilterMode,
+}
+
+/// One parsed `searchFields` entry: a field name with its score boost from an
+/// optional `field^N` weight (default `1.0`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchField {
+    pub name: String,
+    pub boost: f32,
 }
 
 /// One parsed `vectorQueries[]` entry: a raw-vector kNN query over one or
@@ -167,9 +184,15 @@ pub struct OrderBy {
 pub struct SearchOutcome {
     pub total: u64,
     pub documents: Vec<Document>,
-    /// Per-document `@search.score` values keyed by document key. Absent
-    /// keys default to `1.0` (the full-text-only score).
+    /// Per-document `@search.score` values keyed by document key: BM25
+    /// relevance scores for full-text matches (higher is more relevant),
+    /// emulator-defined similarity scores for vector matches, best-score-wins
+    /// for hybrid matches. Absent keys default to `1.0` at serialization.
     pub scores: BTreeMap<String, f32>,
+    /// Per-document `@search.highlights` values keyed by document key: each
+    /// maps a highlight field to its highlighted fragments. Empty when no
+    /// `highlight` fields were requested.
+    pub highlights: BTreeMap<String, BTreeMap<String, Vec<String>>>,
     /// The `@search.facets` object, when facets were requested.
     pub facets: Option<Value>,
     /// Whether more results exist beyond the returned page.
@@ -243,6 +266,20 @@ impl NamedResource {
         map.insert("@odata.etag".to_owned(), Value::String(self.etag.clone()));
         Value::Object(map)
     }
+
+    /// The alias target: the first entry of the stored `indexes` array.
+    /// Returns `None` when the resource has no usable target (only aliases
+    /// carry an `indexes` array; other resources always return `None`).
+    #[must_use]
+    pub fn target_index(&self) -> Option<String> {
+        self.raw
+            .get("indexes")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+    }
 }
 
 /// Service-level storage for a collection of named resources, keyed by name
@@ -311,6 +348,12 @@ impl ResourceStore {
         self.lock_read().values().cloned().collect()
     }
 
+    /// Returns `true` when a resource with the given name exists.
+    #[must_use]
+    fn contains(&self, name: &str) -> bool {
+        self.lock_read().contains_key(name)
+    }
+
     /// Deletes a resource by name.
     ///
     /// # Errors
@@ -354,11 +397,13 @@ impl ResourceStore {
     }
 }
 
-/// A continuation token: the opaque `base64(json{filter, orderby, skip,
-/// state_version, vector_query_hash?})` value carried in `@odata.nextLink`
-/// and returned by the client in the `continuation` request parameter.
-/// `vector_query_hash` binds the token to the `vectorQueries` +
-/// `vectorFilterMode` identity when vector search is active.
+/// A continuation token: the opaque URL-safe `base64(json{filter, orderby,
+/// skip, state_version, vector_query_hash?})` value carried in
+/// `@odata.nextLink` and returned by the client in the `continuation` request
+/// parameter. URL-safe encoding keeps the token intact inside query strings
+/// (`+`/`/` would otherwise be mangled); decoding still accepts the legacy
+/// standard alphabet. `vector_query_hash` binds the token to the
+/// `vectorQueries` + `vectorFilterMode` identity when vector search is active.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContinuationToken {
     pub filter: Option<String>,
@@ -376,7 +421,7 @@ impl ContinuationToken {
         // empty object (which decodes but carries no paging state) rather than
         // panicking in request handling.
         let json = serde_json::to_string(self).unwrap_or_default();
-        BASE64.encode(json)
+        BASE64_URL_SAFE.encode(json)
     }
 
     /// # Errors
@@ -384,8 +429,9 @@ impl ContinuationToken {
     /// Returns an error string when the token is not valid base64 JSON with
     /// the expected shape.
     pub fn decode(raw: &str) -> Result<Self, String> {
-        let bytes = BASE64
+        let bytes = BASE64_URL_SAFE
             .decode(raw.as_bytes())
+            .or_else(|_| BASE64.decode(raw.as_bytes()))
             .map_err(|e| format!("continuation token is not valid base64: {e}"))?;
         let text = String::from_utf8(bytes)
             .map_err(|e| format!("continuation token is not valid UTF-8: {e}"))?;
@@ -463,6 +509,15 @@ impl SearchService {
     pub fn create_index(&self, raw: &Value) -> Result<Value, ApiError> {
         let definition = parse_index_definition(raw)?;
         validate_schema(&definition, self.max_vector_dimension)?;
+        // Index and alias names share the data-plane namespace (aliases
+        // resolve where index names are accepted), so neither may shadow the
+        // other.
+        if self.aliases.contains(&definition.name) {
+            return Err(ApiError::conflict(
+                "IndexAlreadyExists",
+                format!("An alias with name {:?} already exists.", definition.name),
+            ));
+        }
         match self.storage.create_index(&definition) {
             Ok(()) => {
                 if let Err(e) = self
@@ -503,6 +558,12 @@ impl SearchService {
     pub fn create_or_update_index(&self, raw: &Value) -> Result<Value, ApiError> {
         let definition = parse_index_definition(raw)?;
         validate_schema(&definition, self.max_vector_dimension)?;
+        if self.aliases.contains(&definition.name) {
+            return Err(ApiError::conflict(
+                "IndexAlreadyExists",
+                format!("An alias with name {:?} already exists.", definition.name),
+            ));
+        }
         let replaced = self.storage.get_index(&definition.name).is_some();
         self.storage.upsert_index(&definition);
         // Replacing an index discards its documents, so rebuild the search index.
@@ -708,14 +769,36 @@ impl SearchService {
     ///
     /// # Errors
     ///
-    /// Returns [`ApiError::conflict`] if an alias with the same name exists.
+    /// Returns [`ApiError::conflict`] if an alias with the same name exists,
+    /// or if an index with the same name exists (the two share the data-plane
+    /// namespace, so neither may shadow the other).
     pub fn create_alias(&self, name: &str, raw: &Value) -> Result<NamedResource, ApiError> {
+        self.reject_alias_index_collision(name)?;
         self.aliases.create(name, raw, "AliasAlreadyExists")
     }
 
     /// Creates or replaces an index alias.
-    pub fn create_or_update_alias(&self, name: &str, raw: &Value) -> NamedResource {
-        self.aliases.create_or_update(name, raw)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::conflict`] if an index with the same name exists.
+    pub fn create_or_update_alias(
+        &self,
+        name: &str,
+        raw: &Value,
+    ) -> Result<NamedResource, ApiError> {
+        self.reject_alias_index_collision(name)?;
+        Ok(self.aliases.create_or_update(name, raw))
+    }
+
+    fn reject_alias_index_collision(&self, name: &str) -> Result<(), ApiError> {
+        if self.storage.get_index(name).is_some() {
+            return Err(ApiError::conflict(
+                "AliasAlreadyExists",
+                format!("An index with name {name:?} already exists."),
+            ));
+        }
+        Ok(())
     }
 
     /// Returns a clone of the alias with the given name.
@@ -884,102 +967,136 @@ impl SearchService {
     ) -> Result<Vec<IndexingResultItem>, ApiError> {
         let definition = self.require_index(index)?;
         let key_name = key_field_name(&definition);
-        let mut results = Vec::with_capacity(actions.len());
-        let mut upserts: Vec<Document> = Vec::new();
-        let mut deletes: Vec<String> = Vec::new();
+        // The final state of each key is its *last* action in the batch: a key
+        // appears in at most one of the outcome sets, so the search engine,
+        // the vector indexes, and storage converge on the same outcome.
+        let mut batch = DocumentBatch::new(actions.len());
 
         for action in actions {
-            let key = action
-                .document
-                .get(&key_name)
-                .and_then(key_display)
-                .unwrap_or_default();
-            match action.kind {
-                ActionKind::Upload => match validate_document(&definition, &action.document) {
-                    Ok(doc) => {
-                        upserts.push(doc);
-                        results.push(ok_result(key, 201));
-                    }
-                    Err(message) => results.push(fail_result(key, 400, message)),
-                },
-                ActionKind::Merge => match self.merge_one(&definition, &key_name, &action.document)
-                {
-                    MergeOutcome::Applied(doc) => {
-                        upserts.push(doc);
-                        results.push(ok_result(key, 200));
-                    }
-                    MergeOutcome::Missing => results.push(fail_result(
-                        key.clone(),
-                        404,
-                        format!("Document with key {key:?} was not found in index {index:?}."),
-                    )),
-                    MergeOutcome::Invalid(message) => results.push(fail_result(key, 400, message)),
-                },
-                ActionKind::MergeOrUpload => {
-                    match self.merge_one(&definition, &key_name, &action.document) {
-                        MergeOutcome::Applied(doc) => {
-                            upserts.push(doc);
-                            results.push(ok_result(key, 200));
-                        }
-                        MergeOutcome::Missing => {
-                            match validate_document(&definition, &action.document) {
-                                Ok(doc) => {
-                                    upserts.push(doc);
-                                    results.push(ok_result(key, 201));
-                                }
-                                Err(message) => results.push(fail_result(key, 400, message)),
-                            }
-                        }
-                        MergeOutcome::Invalid(message) => {
-                            results.push(fail_result(key, 400, message));
-                        }
-                    }
-                }
-                ActionKind::Delete => {
-                    if self
-                        .storage
-                        .get_document(index, &key)
-                        .map_err(|e| ApiError::not_found(e.to_string()))?
-                        .is_some()
-                    {
-                        deletes.push(key.clone());
-                        results.push(ok_result(key, 200));
-                    } else {
-                        results.push(fail_result(
-                            key.clone(),
-                            404,
-                            format!("Document with key {key:?} was not found in index {index:?}."),
-                        ));
-                    }
-                }
-            }
+            self.apply_document_action(&definition, index, &key_name, &action, &mut batch)?;
         }
 
-        if !upserts.is_empty() || !deletes.is_empty() {
-            // Apply engine changes first (borrow), then move the documents
-            // into storage, so storage is untouched if the engine rejects the
-            // batch.
-            if let Err(e) = self.apply_engine_changes(index, &upserts, &deletes) {
-                return Err(engine_error(index, e));
+        if !batch.upserts.is_empty() || !batch.deletes.is_empty() {
+            // The per-key sets are disjoint (last action wins), so every
+            // backend converges on the same outcome. Engine changes apply
+            // first so storage is untouched if the engine rejects the batch.
+            // All mutations target the resolved index name so aliases write
+            // through to their target.
+            let upserts: Vec<Document> = batch.upserts.into_values().collect();
+            let deletes: Vec<String> = batch.deletes.into_iter().collect();
+            if let Err(e) = self.apply_engine_changes(&definition.name, &upserts, &deletes) {
+                return Err(engine_error(&definition.name, e));
             }
             if let Err(message) = self.apply_vector_changes(&definition, &upserts, &deletes) {
                 return Err(ApiError::internal(format!(
-                    "Vector indexing failed for index {index:?}: {message}"
+                    "Vector indexing failed for index {:?}: {message}",
+                    definition.name
                 )));
             }
             if !upserts.is_empty() {
                 self.storage
-                    .put_documents(index, upserts)
+                    .put_documents(&definition.name, upserts)
                     .map_err(|e| ApiError::not_found(e.to_string()))?;
             }
             if !deletes.is_empty() {
                 self.storage
-                    .delete_documents(index, &deletes)
+                    .delete_documents(&definition.name, &deletes)
                     .map_err(|e| ApiError::not_found(e.to_string()))?;
             }
             self.bump_state_version();
         }
-        Ok(results)
+        Ok(batch.results)
+    }
+
+    /// Applies one document action to the batch's per-key working sets,
+    /// appending its per-action result. Merge and delete observe keys upserted
+    /// earlier in the same batch, so in-batch sequences (upload-then-delete,
+    /// upload-then-merge) resolve in request order with the last action
+    /// winning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] if the index does not exist.
+    fn apply_document_action(
+        &self,
+        definition: &IndexDefinition,
+        index: &str,
+        key_name: &str,
+        action: &DocumentAction,
+        batch: &mut DocumentBatch,
+    ) -> Result<(), ApiError> {
+        let key = action
+            .document
+            .get(key_name)
+            .and_then(key_display)
+            .unwrap_or_default();
+        match action.kind {
+            ActionKind::Upload => match validate_document(definition, &action.document) {
+                Ok(doc) => {
+                    batch.record_upsert(doc);
+                    batch.results.push(ok_result(key, 201));
+                }
+                Err(message) => batch.results.push(fail_result(key, 400, message)),
+            },
+            ActionKind::Merge => {
+                match self.merge_one(definition, key_name, &action.document, &batch.upserts) {
+                    MergeOutcome::Applied(doc) => {
+                        batch.record_upsert(doc);
+                        batch.results.push(ok_result(key, 200));
+                    }
+                    MergeOutcome::Missing => batch.results.push(fail_result(
+                        key.clone(),
+                        404,
+                        format!("Document with key {key:?} was not found in index {index:?}."),
+                    )),
+                    MergeOutcome::Invalid(message) => {
+                        batch.results.push(fail_result(key, 400, message));
+                    }
+                }
+            }
+            ActionKind::MergeOrUpload => {
+                match self.merge_one(definition, key_name, &action.document, &batch.upserts) {
+                    MergeOutcome::Applied(doc) => {
+                        batch.record_upsert(doc);
+                        batch.results.push(ok_result(key, 200));
+                    }
+                    MergeOutcome::Missing => {
+                        match validate_document(definition, &action.document) {
+                            Ok(doc) => {
+                                batch.record_upsert(doc);
+                                batch.results.push(ok_result(key, 201));
+                            }
+                            Err(message) => batch.results.push(fail_result(key, 400, message)),
+                        }
+                    }
+                    MergeOutcome::Invalid(message) => {
+                        batch.results.push(fail_result(key, 400, message));
+                    }
+                }
+            }
+            ActionKind::Delete => {
+                // A key upserted earlier in the same batch counts as present,
+                // so upload-then-delete resolves to "deleted".
+                let present = batch.upserts.contains_key(&key)
+                    || self
+                        .storage
+                        .get_document(&definition.name, &key)
+                        .map_err(|e| ApiError::not_found(e.to_string()))?
+                        .is_some();
+                if present {
+                    batch.deletes.insert(key.clone());
+                    batch.upserts.remove(&key);
+                    batch.results.push(ok_result(key, 200));
+                } else {
+                    batch.results.push(fail_result(
+                        key.clone(),
+                        404,
+                        format!("Document with key {key:?} was not found in index {index:?}."),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn apply_engine_changes(
@@ -1069,22 +1186,32 @@ impl SearchService {
         definition: &IndexDefinition,
         key_name: &str,
         document: &Value,
+        pending: &BTreeMap<String, Document>,
     ) -> MergeOutcome {
         let Some(key) = document.get(key_name).and_then(key_display) else {
             return MergeOutcome::Invalid(format!(
                 "Document is missing the key field {key_name:?}."
             ));
         };
-        match self.storage.get_document(&definition.name, &key) {
-            Ok(Some(existing)) => match merge_fields(&existing, document) {
+        // A key upserted earlier in the same batch merges against the pending
+        // document, so in-batch upload-then-merge sees the upload.
+        let existing = if let Some(doc) = pending.get(&key) {
+            Some(doc.clone())
+        } else {
+            match self.storage.get_document(&definition.name, &key) {
+                Ok(doc) => doc,
+                Err(e) => return MergeOutcome::Invalid(e.to_string()),
+            }
+        };
+        match existing {
+            Some(existing) => match merge_fields(&existing, document) {
                 Some(merged) => match validate_document(definition, &merged) {
                     Ok(doc) => MergeOutcome::Applied(doc),
                     Err(message) => MergeOutcome::Invalid(message),
                 },
                 None => MergeOutcome::Invalid("Merge document must be a JSON object.".to_owned()),
             },
-            Ok(None) => MergeOutcome::Missing,
-            Err(e) => MergeOutcome::Invalid(e.to_string()),
+            None => MergeOutcome::Missing,
         }
     }
 
@@ -1127,11 +1254,12 @@ impl SearchService {
         }
 
         let search = obj.get("search").and_then(Value::as_str).map(str::to_owned);
-        if let Some(text) = &search {
-            parse_search_text(text).map_err(|e| {
-                ApiError::bad_request("InvalidQuery", format!("Invalid search text: {e}"))
-            })?;
-        }
+        // The search text itself is parsed once, in `prepare_full_text` when
+        // the search runs; malformed text surfaces there as `400 InvalidQuery`.
+        // `searchMode`: `all` (AND, the emulator default) or `any` (OR).
+        // When omitted the emulator uses AND; Azure defaults to OR (see
+        // `docs/known_differences.md`).
+        let search_mode = parse_search_mode(obj)?;
         let (count, top, skip) = parse_paging_options(obj)?;
 
         let filter_raw = obj.get("filter").and_then(Value::as_str).map(str::to_owned);
@@ -1176,8 +1304,12 @@ impl SearchService {
             .and_then(Value::as_str)
             .map(str::to_owned);
 
+        let (highlight_fields, highlight_pre_tag, highlight_post_tag) =
+            parse_highlight_options(obj, &definition)?;
+
         Ok(SearchQuery {
             search,
+            search_mode,
             count,
             top,
             skip,
@@ -1188,6 +1320,9 @@ impl SearchService {
             select,
             facets,
             search_fields,
+            highlight_fields,
+            highlight_pre_tag,
+            highlight_post_tag,
             continuation,
             vector_queries,
             vector_queries_raw,
@@ -1216,21 +1351,13 @@ impl SearchService {
         let (skip, filter, orderby) =
             self.resolve_paging(query, &definition, current_vector_hash)?;
 
-        let mut full_text = match &query.search {
-            Some(text) => parse_search_text(text).map_err(|e| {
-                ApiError::bad_request("InvalidQuery", format!("Invalid search text: {e}"))
-            })?,
-            None => FullTextQuery::default(),
-        };
-        if !query.search_fields.is_empty() {
-            full_text.fields = Some(query.search_fields.clone());
-        }
+        let full_text = prepare_full_text(query)?;
         let vector_active = !query.vector_queries.is_empty();
         let full_text_active = !full_text.is_match_all();
 
         let documents = self
             .storage
-            .get_documents(index)
+            .get_documents(&definition.name)
             .map_err(|e| ApiError::not_found(e.to_string()))?;
         let doc_fields: BTreeMap<&str, &Map<String, Value>> = documents
             .iter()
@@ -1244,21 +1371,22 @@ impl SearchService {
         };
 
         // Full-text side: skipped only for vector-only searches (a match-all
-        // query would otherwise drag every document into the union with
-        // score 1.0). The top-level filter always applies here.
-        let full_text_keys = if full_text_active || !vector_active {
-            self.full_text_side_keys(index, &full_text, filter.as_ref(), &doc_fields)?
+        // query would otherwise drag every document into the union). The
+        // top-level filter always applies here. Scores are BM25 relevance
+        // scores from the query engine.
+        let full_text_scores = if full_text_active || !vector_active {
+            self.full_text_side_scores(&definition.name, &full_text, filter.as_ref(), &doc_fields)?
         } else {
-            BTreeSet::new()
+            BTreeMap::new()
         };
 
-        // Hybrid merge: union, best score wins (full-text contributes 1.0).
+        // Hybrid merge: union, best score wins.
         let mut merged: BTreeMap<String, f32> = vector_scores;
-        for key in full_text_keys {
+        for (key, score) in full_text_scores {
             merged
                 .entry(key)
-                .and_modify(|score| *score = score.max(1.0))
-                .or_insert(1.0);
+                .and_modify(|best| *best = best.max(score))
+                .or_insert(score);
         }
         let doc_map: BTreeMap<&str, &Document> = documents
             .iter()
@@ -1268,7 +1396,7 @@ impl SearchService {
             .into_iter()
             .filter_map(|(key, score)| doc_map.get(key.as_str()).map(|doc| ((*doc).clone(), score)))
             .collect();
-        order_scored(&mut scored, &orderby, vector_active);
+        order_scored(&mut scored, &orderby);
 
         let total = u64::try_from(scored.len()).unwrap_or(u64::MAX);
         let matched: Vec<Document> = scored.iter().map(|(doc, _)| doc.clone()).collect();
@@ -1284,13 +1412,19 @@ impl SearchService {
             .and_then(|t| usize::try_from(t).ok())
             .unwrap_or(usize::MAX);
         let page: Vec<(Document, f32)> = scored.into_iter().skip(skip_usize).take(take).collect();
-        let has_more =
-            u64::try_from(skip_usize.saturating_add(page.len())).unwrap_or(u64::MAX) < total;
+        // An empty page ends the sequence even when more documents exist
+        // (e.g. `top=0`): otherwise the next token would encode the same skip
+        // and a token-following client would loop forever on empty pages.
+        let has_more = !page.is_empty()
+            && u64::try_from(skip_usize.saturating_add(page.len())).unwrap_or(u64::MAX) < total;
         let next_skip = u64::try_from(skip_usize.saturating_add(page.len())).unwrap_or(u64::MAX);
         let page_scores: BTreeMap<String, f32> = page
             .iter()
             .map(|(doc, score)| (doc.key.clone(), *score))
             .collect();
+        // Highlight fragments for the returned page, when `highlight`
+        // fields were requested.
+        let highlights = page_highlights(query, &full_text, &page);
         // Vectors with `retrievable: false` are searchable but omitted from
         // the response unless explicitly selected (same as Azure).
         let hidden: BTreeSet<&str> = definition
@@ -1314,15 +1448,18 @@ impl SearchService {
             total,
             documents,
             scores: page_scores,
+            highlights,
             facets,
             has_more,
             next_skip,
         })
     }
 
-    /// Resolves the effective `(skip, filter, orderby)` for a search: a
-    /// continuation token is authoritative and must reference the current
-    /// document state as well as the request's vector-query identity.
+    /// Resolves the effective `(skip, filter, orderby)` for a search. When a
+    /// continuation token is present it encapsulates the result-set state, so
+    /// its `skip`/`filter`/`orderby` win over the request parameters: paging
+    /// can never mix states mid-sequence. The token must also reference the
+    /// current document state as well as the request's vector-query identity.
     ///
     /// # Errors
     ///
@@ -1355,20 +1492,13 @@ impl SearchService {
                 "Vector query changed during paging; restart the search.",
             ));
         }
-        let filter = match &query.filter {
-            Some(expr) => Some(expr.clone()),
-            None => match &token.filter {
-                Some(raw) => Some(parse_filter_option(raw)?),
-                None => None,
-            },
+        let filter = match &token.filter {
+            Some(raw) => Some(parse_filter_option(raw)?),
+            None => None,
         };
-        let orderby = if query.orderby.is_empty() {
-            match &token.orderby {
-                Some(raw) => parse_orderby(&Value::String(raw.clone()), definition)?.0,
-                None => Vec::new(),
-            }
-        } else {
-            query.orderby.clone()
+        let orderby = match &token.orderby {
+            Some(raw) => parse_orderby(&Value::String(raw.clone()), definition)?.0,
+            None => Vec::new(),
         };
         Ok((token.skip, filter, orderby))
     }
@@ -1426,38 +1556,43 @@ impl SearchService {
         scores
     }
 
-    /// Full-text side of [`SearchService::search`]: matching keys with the
-    /// top-level filter applied.
+    /// Full-text side of [`SearchService::search`]: matching keys with BM25
+    /// scores, with the top-level filter applied.
     ///
     /// # Errors
     ///
     /// Returns an [`ApiError`] when the query engine fails.
-    fn full_text_side_keys(
+    fn full_text_side_scores(
         &self,
         index: &str,
         full_text: &FullTextQuery,
         filter: Option<&FilterExpr>,
         doc_fields: &BTreeMap<&str, &Map<String, Value>>,
-    ) -> Result<BTreeSet<String>, ApiError> {
-        let matched_keys = self
+    ) -> Result<BTreeMap<String, f32>, ApiError> {
+        let matched_scores = self
             .engine
             .search(index, full_text)
             .map_err(|e| engine_error(index, e))?;
-        let mut keys = BTreeSet::new();
-        for key in matched_keys {
+        let mut scored = BTreeMap::new();
+        for (key, score) in matched_scores {
             let passes = filter.is_none_or(|expr| {
                 doc_fields
                     .get(key.as_str())
                     .is_some_and(|fields| expr.matches(fields))
             });
             if passes {
-                keys.insert(key);
+                scored.insert(key, score);
             }
         }
-        Ok(keys)
+        Ok(scored)
     }
 
-    /// Builds the continuation token for the next page, if one exists.
+    /// Builds the continuation token for the next page, if one exists. The
+    /// token carries the effective paging state: when the request continued a
+    /// previous token, that token's filter/orderby propagate forward (they
+    /// are authoritative); otherwise the request's values start the sequence.
+    /// This keeps clients that send only `{continuation}` on later pages on
+    /// the same result set.
     #[must_use]
     pub fn next_continuation(
         &self,
@@ -1467,14 +1602,21 @@ impl SearchService {
         if !outcome.has_more {
             return None;
         }
+        let (filter, orderby) = match &query.continuation {
+            Some(raw) => match ContinuationToken::decode(raw) {
+                Ok(token) => (token.filter, token.orderby),
+                Err(_) => (query.filter_raw.clone(), query.orderby_raw.clone()),
+            },
+            None => (query.filter_raw.clone(), query.orderby_raw.clone()),
+        };
         let vector_query_hash = query
             .vector_queries_raw
             .as_ref()
             .map(|raw| vector_query_hash(raw, query.vector_filter_mode.as_str()));
         Some(
             ContinuationToken {
-                filter: query.filter_raw.clone(),
-                orderby: query.orderby_raw.clone(),
+                filter,
+                orderby,
                 skip: outcome.next_skip,
                 state_version: self.state_version(),
                 vector_query_hash,
@@ -1483,10 +1625,10 @@ impl SearchService {
         )
     }
 
-    /// Runs an autocomplete query: case-insensitive prefix matching of the
-    /// search text against the whitespace-separated words of the suggester's
-    /// search fields. Returns up to `top` distinct completions, ordered by
-    /// first appearance (documents in key order, then field order).
+    /// Runs an autocomplete query: case-insensitive prefix or infix matching
+    /// of the search text against the whitespace-separated words of the
+    /// suggester's search fields. Returns up to `top` distinct completions,
+    /// ordered by first appearance (documents in key order, then field order).
     ///
     /// # Errors
     ///
@@ -1501,8 +1643,8 @@ impl SearchService {
     ) -> Result<Vec<AutocompleteCompletion>, ApiError> {
         let (documents, suggester) = self.suggester_documents(index, suggester_name)?;
         let search = search_text.trim();
-        let prefix = search.to_lowercase();
-        if prefix.is_empty() {
+        let needle = search.to_lowercase();
+        if needle.is_empty() {
             return Err(ApiError::bad_request(
                 "InvalidQuery",
                 "The autocomplete search text must be a non-empty string.",
@@ -1513,17 +1655,16 @@ impl SearchService {
         let mut completions = Vec::new();
         for document in &documents {
             for field_name in &suggester.search_fields {
-                let Some(value) = resolve_field_value(&document.fields, field_name) else {
-                    continue;
-                };
-                for word in field_words(value) {
-                    if word.to_lowercase().starts_with(&prefix) && seen.insert(word.clone()) {
-                        completions.push(AutocompleteCompletion {
-                            query_plus_text: format!("{search} {word}"),
-                            text: word,
-                        });
-                        if completions.len() >= limit {
-                            return Ok(completions);
+                for value in resolve_field_values(&document.fields, field_name) {
+                    for word in field_words(value) {
+                        if word.to_lowercase().contains(&needle) && seen.insert(word.clone()) {
+                            completions.push(AutocompleteCompletion {
+                                query_plus_text: format!("{search} {word}"),
+                                text: word,
+                            });
+                            if completions.len() >= limit {
+                                return Ok(completions);
+                            }
                         }
                     }
                 }
@@ -1533,9 +1674,9 @@ impl SearchService {
     }
 
     /// Runs a suggest query: a document matches when any whitespace-separated
-    /// word of the suggester's search fields starts with the search text
-    /// (case-insensitive). Returns up to `top` matching documents in key
-    /// order, each with the first matched word.
+    /// word of the suggester's search fields contains the search text
+    /// (case-insensitive prefix or infix match). Returns up to `top` matching
+    /// documents in key order, each with the first matched word.
     ///
     /// # Errors
     ///
@@ -1549,8 +1690,8 @@ impl SearchService {
         top: u64,
     ) -> Result<Vec<Suggestion>, ApiError> {
         let (documents, suggester) = self.suggester_documents(index, suggester_name)?;
-        let prefix = search_text.trim().to_lowercase();
-        if prefix.is_empty() {
+        let needle = search_text.trim().to_lowercase();
+        if needle.is_empty() {
             return Err(ApiError::bad_request(
                 "InvalidQuery",
                 "The suggest search text must be a non-empty string.",
@@ -1561,12 +1702,14 @@ impl SearchService {
         for document in &documents {
             let mut matched = None;
             for field_name in &suggester.search_fields {
-                let Some(value) = resolve_field_value(&document.fields, field_name) else {
-                    continue;
-                };
-                for word in field_words(value) {
-                    if word.to_lowercase().starts_with(&prefix) {
-                        matched = Some(word);
+                for value in resolve_field_values(&document.fields, field_name) {
+                    for word in field_words(value) {
+                        if word.to_lowercase().contains(&needle) {
+                            matched = Some(word);
+                            break;
+                        }
+                    }
+                    if matched.is_some() {
                         break;
                     }
                 }
@@ -1632,18 +1775,78 @@ impl SearchService {
     }
 
     fn require_index(&self, name: &str) -> Result<IndexDefinition, ApiError> {
+        let resolved = self.resolve_index_name(name);
         self.storage
-            .get_index(name)
+            .get_index(&resolved)
             .ok_or_else(|| ApiError::not_found(format!("Index {name:?} was not found.")))
     }
 
-    /// Validates that the index exists, returning an error if not.
+    /// Resolves an index name through the alias table: when `name` is an
+    /// alias, returns its target index (the first entry of the alias's
+    /// `indexes` array); otherwise returns `name` unchanged. Data-plane
+    /// routes (search, documents, suggest, autocomplete, analyze) accept an
+    /// alias name anywhere an index name is accepted.
+    fn resolve_index_name(&self, name: &str) -> String {
+        let Ok(alias) = self.aliases.get(name, "Alias") else {
+            return name.to_owned();
+        };
+        alias.target_index().unwrap_or_else(|| name.to_owned())
+    }
+
+    /// Analyzer names accepted by the analyze-text endpoint. `keyword` and
+    /// `whitespace` tokenize as Azure documents them (single verbatim token;
+    /// whitespace split without lowercasing); every other listed analyzer
+    /// maps to the emulator's English analyzer (lowercasing, punctuation
+    /// splitting, English stopword removal, English stemming). Unknown names
+    /// are rejected explicitly rather than silently mapped.
+    const KNOWN_ANALYZERS: &'static [&'static str] = &[
+        "standard",
+        "standard.lucene",
+        "standard.asciiFolding",
+        "keyword",
+        "whitespace",
+        "simple",
+        "classic",
+        "stop",
+        "en.microsoft",
+        "en.lucene",
+    ];
+
+    /// Validates analyze-text parameters against the index schema: `field`,
+    /// when given, must exist in the schema; `analyzer`, when given, must be
+    /// a known analyzer name (see [`SearchService::KNOWN_ANALYZERS`]).
     ///
     /// # Errors
     ///
-    /// Returns an [`ApiError`] if the index does not exist.
-    pub fn require_index_public(&self, name: &str) -> Result<(), ApiError> {
-        self.require_index(name).map(|_| ())
+    /// Returns an [`ApiError`] (`404` for a missing index, `400
+    /// InvalidRequest` for an unknown field or analyzer).
+    pub fn validate_analyze(
+        &self,
+        index: &str,
+        analyzer: Option<&str>,
+        field: Option<&str>,
+    ) -> Result<(), ApiError> {
+        let definition = self.require_index(index)?;
+        if let Some(name) = analyzer {
+            if !Self::KNOWN_ANALYZERS.contains(&name) {
+                return Err(ApiError::bad_request(
+                    "InvalidRequest",
+                    format!(
+                        "Unknown analyzer {name:?}; supported analyzers: {}.",
+                        Self::KNOWN_ANALYZERS.join(", ")
+                    ),
+                ));
+            }
+        }
+        if let Some(name) = field {
+            if definition.field_path(name).is_none() {
+                return Err(ApiError::bad_request(
+                    "InvalidRequest",
+                    format!("Analyze field {name:?} does not exist in index {index:?}."),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1652,6 +1855,33 @@ enum MergeOutcome {
     Applied(Document),
     Missing,
     Invalid(String),
+}
+
+/// Working state for one document batch: the per-key final outcome (a key
+/// appears in at most one of `upserts` / `deletes` — its last action in the
+/// batch wins) plus the per-action results in request order.
+struct DocumentBatch {
+    upserts: BTreeMap<String, Document>,
+    deletes: BTreeSet<String>,
+    results: Vec<IndexingResultItem>,
+}
+
+impl DocumentBatch {
+    fn new(capacity: usize) -> Self {
+        Self {
+            upserts: BTreeMap::new(),
+            deletes: BTreeSet::new(),
+            results: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Records an upsert in the batch's final per-key state: the document
+    /// lands in `upserts` and any earlier delete for the same key is
+    /// superseded.
+    fn record_upsert(&mut self, doc: Document) {
+        self.deletes.remove(&doc.key);
+        self.upserts.insert(doc.key.clone(), doc);
+    }
 }
 
 fn ok_result(key: String, status_code: u16) -> IndexingResultItem {
@@ -1684,35 +1914,40 @@ fn merge_fields(existing: &Document, update: &Value) -> Option<Value> {
 }
 
 /// Orders scored `(document, score)` pairs: by `orderby` when given,
-/// otherwise by score descending with the key field as tie-breaker when
-/// vector search is active. Without either, the input (key) order is
-/// preserved, matching the historical full-text-only behaviour.
-fn order_scored(scored: &mut [(Document, f32)], orderby: &[OrderBy], vector_active: bool) {
-    if !orderby.is_empty() {
-        scored.sort_by(|a, b| compare_scored(a, b, orderby));
-    } else if vector_active {
+/// otherwise by score descending with the key field as tie-breaker so ranking
+/// is deterministic. Match-all (unscored) queries carry equal scores, so they
+/// stay in key order via the tie-breaker.
+fn order_scored(scored: &mut [(Document, f32)], orderby: &[OrderBy]) {
+    if orderby.is_empty() {
         scored.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.key.cmp(&b.0.key))
         });
+    } else {
+        scored.sort_by(|a, b| compare_scored(a, b, orderby));
     }
 }
 
 /// Compares two scored `(document, score)` pairs by the `orderby` clauses,
 /// with the key field as the final tie-breaker so ordering is deterministic.
-/// Missing values sort last regardless of direction.
+/// Missing values sort first in ascending order and last in descending order,
+/// matching Azure's null ordering.
 fn compare_scored(
     a: &(Document, f32),
     b: &(Document, f32),
     orderby: &[OrderBy],
 ) -> std::cmp::Ordering {
     for clause in orderby {
-        let ordering = compare_field(&a.0, &b.0, &clause.field);
-        let ordering = if clause.descending {
-            ordering.reverse()
+        let ordering = if clause.field == "@search.score" {
+            let ordering = a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal);
+            if clause.descending {
+                ordering.reverse()
+            } else {
+                ordering
+            }
         } else {
-            ordering
+            compare_field(&a.0, &b.0, &clause.field, clause.descending)
         };
         if ordering != std::cmp::Ordering::Equal {
             return ordering;
@@ -1721,13 +1956,33 @@ fn compare_scored(
     a.0.key.cmp(&b.0.key)
 }
 
-fn compare_field(a: &Document, b: &Document, field: &str) -> std::cmp::Ordering {
+fn compare_field(a: &Document, b: &Document, field: &str, descending: bool) -> std::cmp::Ordering {
     let (av, bv) = (a.fields.get(field), b.fields.get(field));
     match (av, bv) {
         (None, None) => std::cmp::Ordering::Equal,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (Some(av), Some(bv)) => compare_values(av, bv),
+        // Azure sorts nulls first in ascending order (last in descending).
+        (None, Some(_)) => {
+            if descending {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            }
+        }
+        (Some(_), None) => {
+            if descending {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        }
+        (Some(av), Some(bv)) => {
+            let ordering = compare_values(av, bv);
+            if descending {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        }
     }
 }
 
@@ -1875,7 +2130,8 @@ fn string_items(value: &Value, name: &str) -> Result<Vec<String>, ApiError> {
 }
 
 /// Parses an `orderby` value: comma-separated `field [asc|desc]` clauses (or
-/// a JSON array of clauses). Every field must exist and be marked `sortable`.
+/// a JSON array of clauses). Every field must exist and be marked `sortable`,
+/// except the pseudo-field `@search.score`, which orders by relevance score.
 /// Returns the parsed clauses and a canonical raw string for continuation
 /// tokens.
 fn parse_orderby(
@@ -1921,6 +2177,15 @@ fn parse_orderby(
                 ))
             }
         };
+        // `@search.score` is not a schema field: it orders by relevance score
+        // (the default ranking when no `orderby` is given).
+        if field == "@search.score" {
+            clauses.push(OrderBy {
+                field: field.to_owned(),
+                descending,
+            });
+            continue;
+        }
         let field_def = definition.field(field).ok_or_else(|| {
             ApiError::bad_request(
                 "InvalidQuery",
@@ -1947,10 +2212,15 @@ fn parse_orderby(
 }
 
 /// Parses a `select` value: comma-separated field names (or a JSON array),
-/// each of which must exist in the schema.
+/// each of which must exist in the schema. The special `*` selects every
+/// field, exactly like omitting `select`.
 fn parse_select(value: &Value, definition: &IndexDefinition) -> Result<Vec<String>, ApiError> {
+    let items = string_items(value, "select")?;
+    if items.iter().any(|item| item == "*") {
+        return Ok(Vec::new());
+    }
     let mut fields = Vec::new();
-    for part in string_items(value, "select")? {
+    for part in items {
         if definition.field(&part).is_none() {
             return Err(ApiError::bad_request(
                 "InvalidQuery",
@@ -1970,87 +2240,150 @@ fn parse_select(value: &Value, definition: &IndexDefinition) -> Result<Vec<Strin
 /// optionally followed by `,count:N` (or `,top:N`) to limit the number of
 /// returned facet values. Named fields must exist and be marked `facetable`.
 fn parse_facets(value: &Value, definition: &IndexDefinition) -> Result<Vec<Facet>, ApiError> {
+    // A single string is split on commas, with `count:N` / `top:N` fragments
+    // re-attached to the preceding facet (so `"tags,count:1"` limits the
+    // `tags` facet); array entries keep their inner commas intact.
+    let entries: Vec<String> = match value {
+        Value::String(text) => split_facet_string(text),
+        _ => string_items(value, "facets")?,
+    };
     let mut facets = Vec::new();
-    for part in string_items(value, "facets")? {
-        let mut pieces = part.split(',');
-        let name = pieces.next().unwrap_or("").trim();
-        let mut limit = None;
-        for option in pieces {
-            let option = option.trim();
-            let Some((key, arg)) = option.split_once(':') else {
-                return Err(ApiError::bad_request(
-                    "InvalidQuery",
-                    format!(
-                        "Invalid facet option {option:?} in {part:?}; expected 'count:N' or 'top:N'."
-                    ),
-                ));
-            };
-            let count: u64 = arg.trim().parse().map_err(|_| {
-                ApiError::bad_request(
-                    "InvalidQuery",
-                    format!(
-                        "Invalid facet option {option:?} in {part:?}; the count must be a non-negative integer."
-                    ),
-                )
-            })?;
-            let n = usize::try_from(count).unwrap_or(usize::MAX);
-            match key {
-                "count" | "top" => limit = Some(n),
-                other => {
-                    return Err(ApiError::bad_request(
-                        "InvalidQuery",
-                        format!(
-                            "Unsupported facet option {other:?} in {part:?}; supported options: count:N, top:N."
-                        ),
-                    ))
-                }
-            }
-        }
-        if name == "*" {
-            for field in &definition.fields {
-                if field.facetable {
-                    facets.push(Facet {
-                        field: field.name.clone(),
-                        limit,
-                    });
-                }
-            }
-        } else if name == "$count" {
-            if limit.is_some() {
-                return Err(ApiError::bad_request(
-                    "InvalidQuery",
-                    format!("The $count facet does not take options (got {part:?})."),
-                ));
-            }
-            facets.push(Facet {
-                field: "$count".to_owned(),
-                limit: None,
-            });
-        } else {
-            let field_def = definition.field(name).ok_or_else(|| {
-                ApiError::bad_request(
-                    "InvalidQuery",
-                    format!("facets references unknown field {name:?}."),
-                )
-            })?;
-            if !field_def.facetable {
-                return Err(ApiError::bad_request(
-                    "InvalidQuery",
-                    format!(
-                        "Field {name:?} is not facetable; mark it \"facetable\": true in the index schema."
-                    ),
-                ));
-            }
-            facets.push(Facet {
-                field: name.to_owned(),
-                limit,
-            });
-        }
+    for part in entries {
+        parse_facet_entry(&part, definition, &mut facets)?;
     }
     if facets.is_empty() {
         return Err(ApiError::bad_request("InvalidQuery", "facets is empty."));
     }
     Ok(facets)
+}
+
+/// Splits a single-string `facets` value on commas, re-attaching `count:N` /
+/// `top:N` fragments to the preceding facet entry. A leading option with no
+/// facet passes through and is rejected as an unknown field downstream.
+fn split_facet_string(text: &str) -> Vec<String> {
+    let mut entries: Vec<String> = Vec::new();
+    for part in text.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let is_option = part
+            .split_once(':')
+            .is_some_and(|(key, _)| matches!(key.trim(), "count" | "top"));
+        if is_option {
+            if let Some(last) = entries.last_mut() {
+                last.push_str(", ");
+                last.push_str(part);
+                continue;
+            }
+        }
+        entries.push(part.to_owned());
+    }
+    entries
+}
+
+/// Parses one facet entry (a field name, `$count`, or `*`, optionally with
+/// `,count:N` / `,top:N` limits) against the index schema.
+fn parse_facet_entry(
+    part: &str,
+    definition: &IndexDefinition,
+    facets: &mut Vec<Facet>,
+) -> Result<(), ApiError> {
+    let mut pieces = part.split(',');
+    let name = pieces.next().unwrap_or("").trim();
+    let mut limit = None;
+    for option in pieces {
+        let option = option.trim();
+        let Some((key, arg)) = option.split_once(':') else {
+            return Err(ApiError::bad_request(
+                "InvalidQuery",
+                format!(
+                    "Invalid facet option {option:?} in {part:?}; expected 'count:N' or 'top:N'."
+                ),
+            ));
+        };
+        let count: u64 = arg.trim().parse().map_err(|_| {
+            ApiError::bad_request(
+                "InvalidQuery",
+                format!(
+                    "Invalid facet option {option:?} in {part:?}; the count must be a non-negative integer."
+                ),
+            )
+        })?;
+        let n = usize::try_from(count).unwrap_or(usize::MAX);
+        match key {
+            "count" | "top" => limit = Some(n),
+            other => {
+                return Err(ApiError::bad_request(
+                    "InvalidQuery",
+                    format!(
+                        "Unsupported facet option {other:?} in {part:?}; supported options: count:N, top:N."
+                    ),
+                ))
+            }
+        }
+    }
+    if name == "*" {
+        for field in &definition.fields {
+            if field.facetable {
+                facets.push(Facet {
+                    field: field.name.clone(),
+                    limit,
+                });
+            }
+        }
+    } else if name == "$count" {
+        if limit.is_some() {
+            return Err(ApiError::bad_request(
+                "InvalidQuery",
+                format!("The $count facet does not take options (got {part:?})."),
+            ));
+        }
+        facets.push(Facet {
+            field: "$count".to_owned(),
+            limit: None,
+        });
+    } else {
+        let field_def = definition.field(name).ok_or_else(|| {
+            ApiError::bad_request(
+                "InvalidQuery",
+                format!("facets references unknown field {name:?}."),
+            )
+        })?;
+        if !field_def.facetable {
+            return Err(ApiError::bad_request(
+                "InvalidQuery",
+                format!(
+                    "Field {name:?} is not facetable; mark it \"facetable\": true in the index schema."
+                ),
+            ));
+        }
+        facets.push(Facet {
+            field: name.to_owned(),
+            limit,
+        });
+    }
+    Ok(())
+}
+
+/// Parses the `searchMode` option (`search_mode` SDK alias accepted): `all`
+/// (AND, the default) or `any` (OR).
+///
+/// # Errors
+///
+/// Returns an [`ApiError`] (`400 InvalidQuery`) when the value is present but
+/// not one of the two supported modes.
+fn parse_search_mode(obj: &Map<String, Value>) -> Result<SearchMode, ApiError> {
+    match obj.get("searchMode").or_else(|| obj.get("search_mode")) {
+        None | Some(Value::Null) => Ok(SearchMode::default()),
+        Some(Value::String(mode)) => {
+            SearchMode::parse(mode).map_err(|e| ApiError::bad_request("InvalidQuery", e))
+        }
+        Some(_) => Err(ApiError::bad_request(
+            "InvalidQuery",
+            "searchMode must be 'all' or 'any'.",
+        )),
+    }
 }
 
 /// Parses the `count`/`top`/`skip` paging options: `top`/`skip` must be
@@ -2333,15 +2666,39 @@ fn parse_vector_query_vector(
 
 /// Parses a `searchFields` value: comma-separated field names (or a JSON
 /// array), optionally weighted (`field^2`). Fields must exist and be marked
-/// `searchable`. Weights are accepted but inert (scoring is a constant
-/// placeholder).
+/// `searchable`. Weights must be finite positive numbers and scale the
+/// field's BM25 contribution to `@search.score`.
 fn parse_search_fields(
     value: &Value,
     definition: &IndexDefinition,
-) -> Result<Vec<String>, ApiError> {
+) -> Result<Vec<SearchField>, ApiError> {
     let mut fields = Vec::new();
     for part in string_items(value, "searchFields")? {
-        let name = part.split('^').next().unwrap_or("").trim();
+        let (name_part, weight) = match part.split_once('^') {
+            None => (part.as_str(), 1.0),
+            Some((name, raw_weight)) => {
+                let weight: f32 = raw_weight.trim().parse().map_err(|_| {
+                    ApiError::bad_request(
+                        "InvalidQuery",
+                        format!(
+                            "Invalid searchFields weight in {part:?}; \
+                             expected a positive number (e.g. 'field^2')."
+                        ),
+                    )
+                })?;
+                if !weight.is_finite() || weight <= 0.0 {
+                    return Err(ApiError::bad_request(
+                        "InvalidQuery",
+                        format!(
+                            "Invalid searchFields weight in {part:?}; \
+                             expected a finite positive number."
+                        ),
+                    ));
+                }
+                (name, weight)
+            }
+        };
+        let name = name_part.trim();
         let field_def = definition.field_path(name).ok_or_else(|| {
             ApiError::bad_request(
                 "InvalidQuery",
@@ -2362,7 +2719,10 @@ fn parse_search_fields(
                 format!("Field {name:?} is a vector field and cannot be used in searchFields."),
             ));
         }
-        fields.push(name.to_owned());
+        fields.push(SearchField {
+            name: name.to_owned(),
+            boost: weight,
+        });
     }
     if fields.is_empty() {
         return Err(ApiError::bad_request(
@@ -2371,6 +2731,56 @@ fn parse_search_fields(
         ));
     }
     Ok(fields)
+}
+
+/// Parses the `highlight` / `highlightPreTag` / `highlightPostTag` options.
+/// Highlight fields must exist and be marked `searchable`. Tags default to
+/// `<em>` / `</em>` (the Azure defaults).
+fn parse_highlight_options(
+    obj: &Map<String, Value>,
+    definition: &IndexDefinition,
+) -> Result<(Vec<String>, String, String), ApiError> {
+    let highlight_value = obj.get("highlight");
+    let fields = match highlight_value {
+        None | Some(Value::Null) => Vec::new(),
+        Some(value) => {
+            let mut fields = Vec::new();
+            for part in string_items(value, "highlight")? {
+                let field_def = definition.field_path(&part).ok_or_else(|| {
+                    ApiError::bad_request(
+                        "InvalidQuery",
+                        format!("highlight references unknown field {part:?}."),
+                    )
+                })?;
+                if !field_def.searchable {
+                    return Err(ApiError::bad_request(
+                        "InvalidQuery",
+                        format!(
+                            "Field {part:?} is not searchable; only searchable fields can be highlighted."
+                        ),
+                    ));
+                }
+                fields.push(part);
+            }
+            if fields.is_empty() {
+                return Err(ApiError::bad_request("InvalidQuery", "highlight is empty."));
+            }
+            fields
+        }
+    };
+    let tag = |key: &str, default: &str| -> Result<String, ApiError> {
+        match obj.get(key) {
+            None | Some(Value::Null) => Ok(default.to_owned()),
+            Some(Value::String(tag)) => Ok(tag.clone()),
+            Some(_) => Err(ApiError::bad_request(
+                "InvalidQuery",
+                format!("{key} must be a string."),
+            )),
+        }
+    };
+    let pre_tag = tag("highlightPreTag", "<em>")?;
+    let post_tag = tag("highlightPostTag", "</em>")?;
+    Ok((fields, pre_tag, post_tag))
 }
 
 fn key_field_name(definition: &IndexDefinition) -> String {
@@ -2389,19 +2799,98 @@ fn key_display(value: &Value) -> Option<String> {
 }
 
 /// Resolves a field path (`Address/City`, or a plain field name) against a
-/// document's field map, walking into complex-type objects.
-fn resolve_field_value<'a>(fields: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
+/// document's field map, walking into complex-type objects. When a segment
+/// resolves to a JSON array (a collection field or a collection-of-complex
+/// field), the remaining path is resolved against every element, so a
+/// collection-of-complex path yields one value per element. A plain
+/// (non-collection) path yields at most one value.
+fn resolve_field_values<'a>(fields: &'a Map<String, Value>, path: &str) -> Vec<&'a Value> {
     let mut segments = path.split('/');
-    let first = segments.next()?;
-    let mut current = fields.get(first)?;
+    let Some(first) = segments.next() else {
+        return Vec::new();
+    };
+    let mut current = match fields.get(first) {
+        Some(value) => vec![value],
+        None => return Vec::new(),
+    };
     for segment in segments {
-        current = current.as_object()?.get(segment)?;
+        let mut next = Vec::new();
+        for value in current {
+            match value {
+                Value::Array(items) => {
+                    for item in items {
+                        if let Some(sub) = item.as_object().and_then(|o| o.get(segment)) {
+                            next.push(sub);
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(sub) = value.as_object().and_then(|o| o.get(segment)) {
+                        next.push(sub);
+                    }
+                }
+            }
+        }
+        current = next;
     }
-    Some(current)
+    current
+}
+
+/// Builds the engine-level full-text query for a search: parses the search
+/// text and applies the request's `searchMode` and `searchFields` (names plus
+/// `field^N` boosts).
+///
+/// # Errors
+///
+/// Returns an [`ApiError`] (`400 InvalidQuery`) when the search text is
+/// malformed.
+fn prepare_full_text(query: &SearchQuery) -> Result<FullTextQuery, ApiError> {
+    let mut full_text = match &query.search {
+        Some(text) => parse_search_text(text).map_err(|e| {
+            ApiError::bad_request("InvalidQuery", format!("Invalid search text: {e}"))
+        })?,
+        None => FullTextQuery::default(),
+    };
+    full_text.mode = query.search_mode;
+    if !query.search_fields.is_empty() {
+        full_text.fields = Some(query.search_fields.iter().map(|f| f.name.clone()).collect());
+        full_text.boosts = query
+            .search_fields
+            .iter()
+            .map(|f| (f.name.clone(), f.boost))
+            .collect();
+    }
+    Ok(full_text)
+}
+
+/// Computes a page's `@search.highlights` value: one entry per document with
+/// a query-term match in a requested highlight field. Empty when no
+/// `highlight` fields were requested.
+fn page_highlights(
+    query: &SearchQuery,
+    full_text: &FullTextQuery,
+    page: &[(Document, f32)],
+) -> BTreeMap<String, BTreeMap<String, Vec<String>>> {
+    if query.highlight_fields.is_empty() {
+        return BTreeMap::new();
+    }
+    let terms = highlight_query_terms(full_text);
+    page.iter()
+        .filter_map(|(doc, _)| {
+            let fields = highlight_document(
+                doc,
+                &query.highlight_fields,
+                &terms,
+                &query.highlight_pre_tag,
+                &query.highlight_post_tag,
+            );
+            (!fields.is_empty()).then(|| (doc.key.clone(), fields))
+        })
+        .collect()
 }
 
 /// Extracts the whitespace-separated words of a string (or collection of
-/// string) field value, for suggester prefix matching.
+/// string) field value, for suggester matching.
 fn field_words(value: &Value) -> Vec<String> {
     match value {
         Value::String(text) => text.split_whitespace().map(str::to_owned).collect(),
@@ -2412,6 +2901,101 @@ fn field_words(value: &Value) -> Vec<String> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Collects the analyzed query terms from a full-text query's required
+/// clauses (terms, fuzzy terms, and phrase tokens), for highlight matching.
+/// Excluded clauses never highlight.
+fn highlight_query_terms(query: &FullTextQuery) -> BTreeSet<String> {
+    let mut terms = BTreeSet::new();
+    for clause in &query.required {
+        match clause {
+            Clause::Term(term) | Clause::FuzzyTerm { term, .. } => {
+                terms.extend(crate::query::analyze(term));
+            }
+            Clause::Phrase(phrase) => {
+                terms.extend(crate::query::analyze(phrase));
+            }
+        }
+    }
+    terms
+}
+
+/// Wraps the words of `text` that match the analyzed query `terms` with the
+/// highlight tags, preserving the original text (including spacing and
+/// casing). Matching is analyzer-aware, so inflected forms highlight. Returns
+/// `None` when no word matches.
+fn highlight_text(
+    text: &str,
+    terms: &BTreeSet<String>,
+    pre_tag: &str,
+    post_tag: &str,
+) -> Option<String> {
+    if terms.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    let mut matched = false;
+    // `split_inclusive` keeps each word glued to its trailing whitespace so
+    // the original spacing is preserved.
+    for segment in text.split_inclusive(|c: char| c.is_whitespace()) {
+        let split = segment
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(segment.len());
+        let (word, rest) = segment.split_at(split);
+        if !word.is_empty()
+            && crate::query::analyze(word)
+                .iter()
+                .any(|token| terms.contains(token))
+        {
+            out.push_str(pre_tag);
+            out.push_str(word);
+            out.push_str(post_tag);
+            matched = true;
+        } else {
+            out.push_str(word);
+        }
+        out.push_str(rest);
+    }
+    matched.then_some(out)
+}
+
+/// Computes a document's `@search.highlights` value: one entry per highlight
+/// field that contains a query term, each with the highlighted fragments (one
+/// per matching string value).
+fn highlight_document(
+    doc: &Document,
+    fields: &[String],
+    terms: &BTreeSet<String>,
+    pre_tag: &str,
+    post_tag: &str,
+) -> BTreeMap<String, Vec<String>> {
+    let mut out = BTreeMap::new();
+    for field in fields {
+        // A highlight path may resolve to several values (a collection field
+        // or a path through a collection-of-complex field); every string
+        // value with a query-term match contributes a fragment.
+        let mut strings: Vec<&str> = Vec::new();
+        for value in resolve_field_values(&doc.fields, field) {
+            match value {
+                Value::String(text) => strings.push(text.as_str()),
+                Value::Array(items) => {
+                    strings.extend(items.iter().filter_map(Value::as_str));
+                }
+                _ => {}
+            }
+        }
+        let mut fragments = Vec::new();
+        for text in strings {
+            if let Some(fragment) = highlight_text(text, terms, pre_tag, post_tag) {
+                fragments.push(fragment);
+            }
+        }
+        if !fragments.is_empty() {
+            out.insert(field.clone(), fragments);
+        }
+    }
+    out
 }
 
 /// Maps a query-engine failure onto an Azure-compatible [`ApiError`].
@@ -2972,9 +3556,6 @@ fn type_ok(inner: &str, value: &Value) -> bool {
 /// Search request options that are not implemented and must be rejected with
 /// an explicit error.
 const UNSUPPORTED_SEARCH_OPTIONS: &[&str] = &[
-    "highlight",
-    "highlightPreTag",
-    "highlightPostTag",
     "scoringProfile",
     "scoringParameters",
     "scoringStatistics",
@@ -2987,7 +3568,6 @@ const UNSUPPORTED_SEARCH_OPTIONS: &[&str] = &[
     "semanticErrorHandling",
     "semanticMaxWaitInMilliseconds",
     "debug",
-    "searchMode",
 ];
 
 #[cfg(test)]
@@ -3587,12 +4167,55 @@ mod tests {
         // Non-searchable field in searchFields.
         let api_error = err(service.parse_search("items", &json!({"searchFields": "price"})));
         assert_eq!(api_error.code, "InvalidQuery");
-        // Unsupported option.
-        let api_error = err(service.parse_search("items", &json!({"highlight": "title"})));
-        assert_eq!(api_error.code, "UnsupportedQuery");
+        // Bad searchFields weight.
+        let api_error = err(service.parse_search("items", &json!({"searchFields": "title^many"})));
+        assert_eq!(api_error.code, "InvalidQuery");
+        let api_error = err(service.parse_search("items", &json!({"searchFields": "title^0"})));
+        assert_eq!(api_error.code, "InvalidQuery");
+        // Highlight on an unknown or non-searchable field is rejected.
+        let api_error = err(service.parse_search("items", &json!({"highlight": "missing"})));
+        assert_eq!(api_error.code, "InvalidQuery");
+        let api_error = err(service.parse_search("items", &json!({"highlight": "price"})));
+        assert_eq!(api_error.code, "InvalidQuery");
+        // Invalid searchMode.
+        let api_error = err(service.parse_search("items", &json!({"searchMode": "both"})));
+        assert_eq!(api_error.code, "InvalidQuery");
         // Bad filter syntax.
         let api_error = err(service.parse_search("items", &json!({"filter": "price eq"})));
         assert_eq!(api_error.code, "InvalidQuery");
+    }
+
+    #[test]
+    fn parse_search_accepts_search_mode_highlight_and_weights() {
+        let service = service();
+        ok(service.create_index(&index_body()));
+        let query = ok(service.parse_search(
+            "items",
+            &json!({
+                "search": "hello",
+                "searchMode": "any",
+                "searchFields": "title^2",
+                "highlight": "title",
+                "highlightPreTag": "<b>",
+                "highlightPostTag": "</b>",
+            }),
+        ));
+        assert_eq!(query.search_mode, crate::query::SearchMode::Any);
+        assert_eq!(query.search_fields.len(), 1);
+        assert_eq!(query.search_fields[0].name, "title");
+        assert!(
+            (query.search_fields[0].boost - 2.0).abs() < f32::EPSILON,
+            "expected boost 2.0, got {}",
+            query.search_fields[0].boost
+        );
+        assert_eq!(query.highlight_fields, vec!["title".to_owned()]);
+        assert_eq!(query.highlight_pre_tag, "<b>");
+        assert_eq!(query.highlight_post_tag, "</b>");
+        // Defaults: AND mode, unit boosts, <em> tags.
+        let query = ok(service.parse_search("items", &json!({"highlight": "title"})));
+        assert_eq!(query.search_mode, crate::query::SearchMode::All);
+        assert_eq!(query.highlight_pre_tag, "<em>");
+        assert_eq!(query.highlight_post_tag, "</em>");
     }
 
     #[test]
@@ -3845,5 +4468,256 @@ mod tests {
             },
         ));
         assert_eq!(outcome.total, 100);
+    }
+
+    #[test]
+    fn batch_last_action_wins_for_repeated_keys() {
+        let service = service();
+        ok(service.create_index(&index_body()));
+        upload(
+            &service,
+            vec![json!({"id": "1", "title": "one", "price": 1.0})],
+        );
+
+        // Upload-then-delete of a new key in one batch: the document is gone
+        // from storage and from the search engine alike.
+        let results = ok(service.index_documents(
+            "items",
+            vec![
+                DocumentAction {
+                    kind: ActionKind::Upload,
+                    document: json!({"id": "2", "title": "two", "price": 2.0}),
+                },
+                DocumentAction {
+                    kind: ActionKind::Delete,
+                    document: json!({"id": "2"}),
+                },
+            ],
+        ));
+        assert_eq!(
+            results.iter().map(|r| r.status_code).collect::<Vec<_>>(),
+            vec![201, 200]
+        );
+        assert_eq!(ok(service.count_documents("items")), 1);
+        let outcome = ok(service.search(
+            "items",
+            &SearchQuery {
+                search: Some("*".to_owned()),
+                ..Default::default()
+            },
+        ));
+        assert_eq!(outcome.total, 1);
+
+        // Delete-then-upload of an existing key: the upload wins.
+        let results = ok(service.index_documents(
+            "items",
+            vec![
+                DocumentAction {
+                    kind: ActionKind::Delete,
+                    document: json!({"id": "1"}),
+                },
+                DocumentAction {
+                    kind: ActionKind::Upload,
+                    document: json!({"id": "1", "title": "replaced", "price": 9.0}),
+                },
+            ],
+        ));
+        assert_eq!(
+            results.iter().map(|r| r.status_code).collect::<Vec<_>>(),
+            vec![200, 201]
+        );
+        assert_eq!(ok(service.get_document("items", "1"))["title"], "replaced");
+
+        // Upload-then-merge in one batch merges against the pending upload.
+        let results = ok(service.index_documents(
+            "items",
+            vec![
+                DocumentAction {
+                    kind: ActionKind::Upload,
+                    document: json!({"id": "3", "title": "three", "price": 3.0}),
+                },
+                DocumentAction {
+                    kind: ActionKind::Merge,
+                    document: json!({"id": "3", "price": 30.0}),
+                },
+            ],
+        ));
+        assert!(results.iter().all(|r| r.succeeded));
+        let merged = ok(service.get_document("items", "3"));
+        assert_eq!(merged["title"], "three");
+        assert_eq!(merged["price"], 30.0);
+    }
+
+    #[test]
+    fn continuation_only_request_preserves_filter_and_orderby() {
+        let service = service();
+        ok(service.create_index(&index_body()));
+        upload(
+            &service,
+            (1..=4)
+                .map(|i| json!({"id": i.to_string(), "title": "same", "price": f64::from(i)}))
+                .collect(),
+        );
+        let query = ok(service.parse_search(
+            "items",
+            &json!({"search": "*", "top": 1, "filter": "price ge 2", "orderby": "price desc"}),
+        ));
+        let outcome = ok(service.search("items", &query));
+        assert_eq!(outcome.documents[0].key, "4");
+        let token = service
+            .next_continuation(&query, &outcome)
+            .unwrap_or_else(|| panic!("expected a continuation token"));
+
+        // Later pages may send only the continuation (plus a page size): the
+        // result set stays filtered and ordered.
+        let next = SearchQuery {
+            search: Some("*".to_owned()),
+            top: Some(1),
+            continuation: Some(token),
+            ..Default::default()
+        };
+        let outcome = ok(service.search("items", &next));
+        assert_eq!(outcome.documents.len(), 1);
+        assert_eq!(outcome.documents[0].key, "3");
+        // The forwarded token still carries the filter/orderby raws, so a
+        // third continuation-only page stays on the same result set.
+        let token = service
+            .next_continuation(&next, &outcome)
+            .unwrap_or_else(|| panic!("expected a continuation token"));
+        let decoded =
+            ContinuationToken::decode(&token).unwrap_or_else(|e| panic!("token decodes: {e}"));
+        assert_eq!(decoded.filter.as_deref(), Some("price ge 2"));
+        assert_eq!(decoded.orderby.as_deref(), Some("price desc"));
+        let next = SearchQuery {
+            search: Some("*".to_owned()),
+            top: Some(1),
+            continuation: Some(token),
+            ..Default::default()
+        };
+        let outcome = ok(service.search("items", &next));
+        assert_eq!(outcome.documents.len(), 1);
+        assert_eq!(outcome.documents[0].key, "2");
+        assert!(!outcome.has_more);
+        assert!(service.next_continuation(&next, &outcome).is_none());
+    }
+
+    #[test]
+    fn continuation_tokens_are_url_safe_and_legacy_tokens_decode() {
+        let token = ContinuationToken {
+            filter: Some("price ge 2 and title ne 'x/y+z'".to_owned()),
+            orderby: Some("price desc".to_owned()),
+            skip: 7,
+            state_version: 3,
+            vector_query_hash: Some(u64::MAX),
+        };
+        // `+` and `/` would be mangled inside query strings; the URL-safe
+        // alphabet avoids them (padding `=` is query-safe).
+        let encoded = token.encode();
+        assert!(
+            !encoded.contains('+') && !encoded.contains('/'),
+            "token must be URL-safe: {encoded}"
+        );
+        assert_eq!(
+            ContinuationToken::decode(&encoded).unwrap_or_else(|e| panic!("token decodes: {e}")),
+            token
+        );
+        // Tokens minted before the URL-safe switch still decode.
+        let json = serde_json::to_string(&token).unwrap_or_else(|e| panic!("serializes: {e}"));
+        let legacy = BASE64.encode(json);
+        assert_eq!(
+            ContinuationToken::decode(&legacy).unwrap_or_else(|e| panic!("legacy decodes: {e}")),
+            token
+        );
+    }
+
+    #[test]
+    fn top_zero_returns_empty_page_without_continuation() {
+        let service = service();
+        ok(service.create_index(&index_body()));
+        upload(
+            &service,
+            vec![
+                json!({"id": "1", "title": "one"}),
+                json!({"id": "2", "title": "two"}),
+            ],
+        );
+        let query = ok(service.parse_search("items", &json!({"search": "*", "top": 0})));
+        let outcome = ok(service.search("items", &query));
+        assert_eq!(outcome.total, 2);
+        assert!(outcome.documents.is_empty());
+        assert!(!outcome.has_more);
+        assert!(service.next_continuation(&query, &outcome).is_none());
+    }
+
+    #[test]
+    fn select_star_returns_all_fields() {
+        let service = service();
+        ok(service.create_index(&index_body()));
+        upload(
+            &service,
+            vec![json!({"id": "1", "title": "one", "price": 1.5, "tags": ["a"]})],
+        );
+        let query = ok(service.parse_search("items", &json!({"search": "*", "select": "*"})));
+        // `*` behaves like omitting `select`: no projection is recorded.
+        assert!(query.select.is_empty());
+        let outcome = ok(service.search("items", &query));
+        assert_eq!(outcome.documents.len(), 1);
+        for field in ["id", "title", "price", "tags"] {
+            assert!(
+                outcome.documents[0].fields.contains_key(field),
+                "missing field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn orderby_search_score_orders_by_relevance() {
+        let service = service();
+        ok(service.create_index(&index_body()));
+        upload(
+            &service,
+            vec![
+                json!({"id": "1", "title": "azure azure azure"}),
+                json!({"id": "2", "title": "azure"}),
+            ],
+        );
+        let keys = |orderby: &str| {
+            let query =
+                ok(service.parse_search("items", &json!({"search": "azure", "orderby": orderby})));
+            ok(service.search("items", &query))
+                .documents
+                .iter()
+                .map(|d| d.key.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys("@search.score desc"), vec!["1", "2"]);
+        assert_eq!(keys("@search.score asc"), vec!["2", "1"]);
+    }
+
+    #[test]
+    fn facet_string_with_options_limits_values() {
+        let service = service();
+        ok(service.create_index(&index_body()));
+        upload(
+            &service,
+            vec![
+                json!({"id": "1", "title": "a", "tags": ["red", "blue"]}),
+                json!({"id": "2", "title": "b", "tags": ["red"]}),
+                json!({"id": "3", "title": "c", "tags": ["green"]}),
+            ],
+        );
+        // Options in the single-string form attach to the preceding facet.
+        let query =
+            ok(service.parse_search("items", &json!({"search": "*", "facets": "tags,count:1"})));
+        let outcome = ok(service.search("items", &query));
+        let Some(facets) = outcome.facets else {
+            panic!("expected facets in search outcome");
+        };
+        let Some(entries) = facets["tags"].as_array() else {
+            panic!("expected tags facet array");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["value"], "red");
+        assert_eq!(entries[0]["count"], 2);
     }
 }

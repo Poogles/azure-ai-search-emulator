@@ -70,6 +70,15 @@ public class E2ETests : EmulatorTestBase
     }
 
     [Fact]
+    public async Task NewerApiVersionAcceptedByFloor()
+    {
+        // Versions on or after the configured floor are accepted (floor-based
+        // acceptance, so newer SDK defaults keep working).
+        var (status, _) = await RawGetAsync($"{BaseUrl}/indexes?api-version=2026-04-01", apiKey: ApiKey);
+        Assert.Equal(200, status);
+    }
+
+    [Fact]
     public async Task ErrorBodyIsAzureStructured()
     {
         var (_, body) = await RawGetAsync($"{BaseUrl}/indexes?api-version={ApiVersion}", apiKey: null);

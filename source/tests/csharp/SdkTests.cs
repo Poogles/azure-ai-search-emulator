@@ -554,8 +554,6 @@ public class SdkTests : EmulatorTestBase
         var searchClient = await PricedDocsAsync();
         var cases = new[]
         {
-            new SearchOptions { SearchMode = SearchMode.Any },
-            new SearchOptions { HighlightFields = { "title" } },
             new SearchOptions { ScoringProfile = "profile" },
             new SearchOptions { SemanticSearch = new SemanticSearchOptions { SemanticConfigurationName = "config" } },
             new SearchOptions { QueryType = SearchQueryType.Full },
@@ -567,6 +565,15 @@ public class SdkTests : EmulatorTestBase
             Assert.Equal(400, ex.Status);
             Assert.Equal("UnsupportedQuery", ex.ErrorCode);
         }
+
+        // An invalid searchMode is a malformed query, not an unsupported option.
+        // (The SDK's SearchMode type cannot express invalid values, so this goes
+        // over raw HTTP.)
+        var (badStatus, badBody) = await RawPostAsync(
+            $"{BaseUrl}/indexes('{IndexName}')/docs/search.post.search?api-version={ApiVersion}",
+            """{"search": "*", "searchMode": "exact"}""");
+        Assert.Equal(400, badStatus);
+        AssertAzureError(badBody, "InvalidQuery");
     }
 
     [Fact]
@@ -711,5 +718,382 @@ public class SdkTests : EmulatorTestBase
         Assert.Empty(response.Response);
         Assert.Empty(response.Activity);
         Assert.Empty(response.References);
+    }
+    [Fact]
+    public async Task SearchModeAnyMatchesUnion()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(TestData.FullIndex());
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = "azure search", ["price"] = 1.0 },
+            new SearchDocument { ["id"] = "2", ["title"] = "local emulators", ["price"] = 2.0 },
+            new SearchDocument { ["id"] = "3", ["title"] = "unrelated", ["price"] = 3.0 },
+        });
+
+        // Default (all/AND): no document contains both terms.
+        var found = await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "azure emulators");
+        Assert.Empty(found);
+        // Explicit all: same AND semantics.
+        found = await RunSearch<SearchDocument>(
+            searchClient, new SearchOptions { SearchMode = SearchMode.All }, "azure emulators");
+        Assert.Empty(found);
+        // Any (OR): either term matches.
+        found = await RunSearch<SearchDocument>(
+            searchClient, new SearchOptions { SearchMode = SearchMode.Any }, "azure emulators");
+        Assert.Equal(new[] { "1", "2" }, found.Select(d => (string)d["id"]).OrderBy(x => x));
+    }
+
+    [Fact]
+    public async Task SearchStemmingAndStopwords()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(TestData.FullIndex());
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = "running shoes", ["price"] = 1.0 },
+            new SearchDocument { ["id"] = "2", ["title"] = "other things", ["price"] = 2.0 },
+        });
+
+        foreach (var term in new[] { "run", "runs", "running" })
+        {
+            var found = await RunSearch<SearchDocument>(searchClient, new SearchOptions(), term);
+            Assert.Equal(new[] { "1" }, found.Select(d => (string)d["id"]));
+        }
+        // "the" is an English stopword: it matches nothing.
+        Assert.Empty(await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "the"));
+    }
+
+    [Fact]
+    public async Task SearchFuzzyMatchesTypos()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(TestData.FullIndex());
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = "azure emulator", ["price"] = 1.0 },
+            new SearchDocument { ["id"] = "2", ["title"] = "other things", ["price"] = 2.0 },
+        });
+
+        foreach (var term in new[] { "emu~", "omul~", "emul~2" })
+        {
+            var found = await RunSearch<SearchDocument>(searchClient, new SearchOptions(), term);
+            Assert.Equal(new[] { "1" }, found.Select(d => (string)d["id"]));
+        }
+        Assert.Empty(await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "zzz~"));
+    }
+
+    [Fact]
+    public async Task SearchScoresRankByRelevance()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(TestData.FullIndex());
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = "azure azure azure", ["price"] = 1.0 },
+            new SearchDocument { ["id"] = "2", ["title"] = "azure", ["price"] = 2.0 },
+        });
+
+        var scored = await RunSearchWithScores<SearchDocument>(searchClient, new SearchOptions(), "azure");
+        Assert.Equal(new[] { "1", "2" }, scored.Select(p => (string)p.Document["id"]));
+        Assert.All(scored, p => Assert.True(p.Score > 0, $"expected a positive score, got {p.Score}"));
+        Assert.True(scored[0].Score >= scored[1].Score, "expected score ordering");
+    }
+
+    [Fact]
+    public async Task SearchHighlights()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(TestData.FullIndex());
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = "Azure Search Rocks", ["price"] = 1.0 },
+            new SearchDocument { ["id"] = "2", ["title"] = "Other things", ["price"] = 2.0 },
+        });
+
+        var response = await searchClient.SearchAsync<SearchDocument>(
+            "azure", new SearchOptions { HighlightFields = { "title" } });
+        var results = new List<SearchResult<SearchDocument>>();
+        await foreach (var item in response.Value.GetResultsAsync())
+        {
+            results.Add(item);
+        }
+        Assert.Single(results);
+        Assert.Equal(new[] { "<em>Azure</em> Search Rocks" }, results[0].Highlights["title"]);
+
+        response = await searchClient.SearchAsync<SearchDocument>(
+            "azure",
+            new SearchOptions
+            {
+                HighlightFields = { "title" },
+                HighlightPreTag = "<b>",
+                HighlightPostTag = "</b>",
+            });
+        results.Clear();
+        await foreach (var item in response.Value.GetResultsAsync())
+        {
+            results.Add(item);
+        }
+        Assert.Equal(new[] { "<b>Azure</b> Search Rocks" }, results[0].Highlights["title"]);
+
+        // Highlighting an unknown field is rejected explicitly.
+        var ex = await Assert.ThrowsAsync<RequestFailedException>(
+            async () => await RunSearch<SearchDocument>(
+                searchClient, new SearchOptions { HighlightFields = { "missing" } }, "azure"));
+        Assert.Equal(400, ex.Status);
+        Assert.Equal("InvalidQuery", ex.ErrorCode);
+    }
+
+    [Fact]
+    public async Task SearchFieldsWeightsBoostScores()
+    {
+        var searchClient = await PricedDocsAsync();
+        var plain = await RunSearchWithScores<SearchDocument>(searchClient, new SearchOptions(), "red");
+        Assert.Single(plain);
+        var boosted = await RunSearchWithScores<SearchDocument>(
+            searchClient, new SearchOptions { SearchFields = { "title^10" } }, "red");
+        Assert.Single(boosted);
+        Assert.True(boosted[0].Score > plain[0].Score,
+            $"boosted score {boosted[0].Score} should exceed plain score {plain[0].Score}");
+    }
+
+    [Fact]
+    public async Task SearchFilterInOperator()
+    {
+        var searchClient = await PricedDocsAsync();
+        var found = await RunSearch<SearchDocument>(
+            searchClient, new SearchOptions { Filter = "price in (5.0, 500.0)" }, "*");
+        Assert.Equal(new[] { "1", "3" }, found.Select(d => (string)d["id"]).OrderBy(x => x));
+        found = await RunSearch<SearchDocument>(
+            searchClient, new SearchOptions { Filter = "price in (1.0, 2.0)" }, "*");
+        Assert.Empty(found);
+    }
+
+    [Fact]
+    public async Task SearchFilterStringFunctions()
+    {
+        var searchClient = await PricedDocsAsync();
+        var found = await RunSearch<SearchDocument>(
+            searchClient, new SearchOptions { Filter = "startswith(title, 'cheap')" }, "*");
+        Assert.Equal(new[] { "1" }, found.Select(d => (string)d["id"]));
+        found = await RunSearch<SearchDocument>(
+            searchClient, new SearchOptions { Filter = "endswith(title, 'blue')" }, "*");
+        Assert.Equal(new[] { "2" }, found.Select(d => (string)d["id"]));
+        found = await RunSearch<SearchDocument>(
+            searchClient, new SearchOptions { Filter = "contains(title, 'ens')" }, "*");
+        Assert.Equal(new[] { "3" }, found.Select(d => (string)d["id"]));
+        found = await RunSearch<SearchDocument>(
+            searchClient, new SearchOptions { Filter = "title in ('cheap red', 'other')" }, "*");
+        Assert.Equal(new[] { "1" }, found.Select(d => (string)d["id"]));
+    }
+
+    [Fact]
+    public async Task SearchOrderByNulls()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(TestData.FullIndex());
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = "priced", ["price"] = 10.0 },
+            new SearchDocument { ["id"] = "2", ["title"] = "unpriced" },
+            new SearchDocument { ["id"] = "3", ["title"] = "cheap", ["price"] = 1.0 },
+        });
+
+        var found = await RunSearch<SearchDocument>(
+            searchClient, new SearchOptions { OrderBy = { "price asc" } }, "*");
+        Assert.Equal(new[] { "2", "3", "1" }, found.Select(d => (string)d["id"]));
+        found = await RunSearch<SearchDocument>(
+            searchClient, new SearchOptions { OrderBy = { "price desc" } }, "*");
+        Assert.Equal(new[] { "1", "3", "2" }, found.Select(d => (string)d["id"]));
+    }
+
+    [Fact]
+    public async Task AliasResolvesForSearchAndDocuments()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(TestData.FullIndex());
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = "hello" },
+        });
+        await indexClient.CreateAliasAsync(new SearchAlias("al", new[] { IndexName }));
+
+        var aliasClient = SearchClient("al");
+        var found = await RunSearch<SearchDocument>(aliasClient, new SearchOptions(), "hello");
+        Assert.Equal(new[] { "1" }, found.Select(d => (string)d["id"]));
+        var doc = (await aliasClient.GetDocumentAsync<SearchDocument>("1")).Value;
+        Assert.Equal("1", (string)doc["id"]);
+        Assert.Equal(1, (await aliasClient.GetDocumentCountAsync()).Value);
+    }
+
+    [Fact]
+    public async Task SuggestAndAutocompleteInfix()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(new SearchIndex(IndexName)
+        {
+            Fields =
+            {
+                new SearchField("id", SearchFieldDataType.String) { IsKey = true },
+                new SearchableField("title"),
+            },
+            Suggesters = { new SearchSuggester("sg", new[] { "title" }) },
+        });
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = "Boston Harbor Hotel" },
+            new SearchDocument { ["id"] = "2", ["title"] = "Portland Airport Inn" },
+        });
+
+        // "rbor" is an infix (not a prefix) of "Harbor".
+        var suggestions = (await searchClient.SuggestAsync<SearchDocument>("rbor", "sg", new SuggestOptions())).Value;
+        Assert.Equal(new[] { "1" }, suggestions.Results.Select(d => (string)d.Document["id"]));
+        // "osto" is an infix of "Boston".
+        var completions = (await searchClient.AutocompleteAsync("osto", "sg", new AutocompleteOptions())).Value;
+        Assert.Equal(new[] { "Boston" }, completions.Results.Select(c => c.Text));
+    }
+
+    [Fact]
+    public async Task AnalyzeTextWithAnalyzer()
+    {
+        var indexClient = IndexClient();
+        await indexClient.CreateIndexAsync(TestData.FullIndex());
+        var tokens = (await indexClient.AnalyzeTextAsync(
+            IndexName,
+            new AnalyzeTextOptions("Running tests") { AnalyzerName = "standard.lucene" })).Value
+            .Select(t => t.Token).ToList();
+        Assert.Equal(new[] { "run", "test" }, tokens);
+    }
+
+    [Fact]
+    public async Task AnalyzeTextKeywordAndWhitespaceAnalyzers()
+    {
+        var indexClient = IndexClient();
+        await indexClient.CreateIndexAsync(TestData.FullIndex());
+        var keyword = (await indexClient.AnalyzeTextAsync(
+            IndexName,
+            new AnalyzeTextOptions("Running Tests") { AnalyzerName = "keyword" })).Value
+            .Select(t => t.Token).ToList();
+        Assert.Equal(new[] { "Running Tests" }, keyword);
+        var whitespace = (await indexClient.AnalyzeTextAsync(
+            IndexName,
+            new AnalyzeTextOptions("Running tests") { AnalyzerName = "whitespace" })).Value
+            .Select(t => t.Token).ToList();
+        Assert.Equal(new[] { "Running", "tests" }, whitespace);
+    }
+
+    [Fact]
+    public async Task SearchOrderByScore()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(TestData.FullIndex());
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = "azure azure azure", ["price"] = 1.0 },
+            new SearchDocument { ["id"] = "2", ["title"] = "azure", ["price"] = 2.0 },
+        });
+
+        var found = await RunSearch<SearchDocument>(searchClient, new SearchOptions { OrderBy = { "@search.score desc" } }, "azure");
+        Assert.Equal(new[] { "1", "2" }, found.Select(d => (string)d["id"]));
+        found = await RunSearch<SearchDocument>(searchClient, new SearchOptions { OrderBy = { "@search.score asc" } }, "azure");
+        Assert.Equal(new[] { "2", "1" }, found.Select(d => (string)d["id"]));
+    }
+
+    [Fact]
+    public async Task SearchSelectStar()
+    {
+        var searchClient = await PricedDocsAsync();
+        var found = await RunSearch<SearchDocument>(searchClient, new SearchOptions { Select = { "*" } }, "*");
+        Assert.Equal(3, found.Count);
+        foreach (var doc in found)
+        {
+            Assert.True(doc.ContainsKey("id"));
+            Assert.True(doc.ContainsKey("title"));
+            Assert.True(doc.ContainsKey("price"));
+            Assert.True(doc.ContainsKey("tags"));
+        }
+    }
+
+    [Fact]
+    public async Task SearchFuzzyDefaultDistanceTwo()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(TestData.FullIndex());
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = "azure emulator", ["price"] = 1.0 },
+            new SearchDocument { ["id"] = "2", ["title"] = "other things", ["price"] = 2.0 },
+        });
+
+        // A bare `~` uses the default edit distance 2 (matching Azure).
+        var found = await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "eamu~");
+        Assert.Equal(new[] { "1" }, found.Select(d => (string)d["id"]));
+        Assert.Empty(await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "eamu~1"));
+    }
+
+    [Fact]
+    public async Task AliasConflictsWithIndexName()
+    {
+        var indexClient = IndexClient();
+        await indexClient.CreateIndexAsync(TestData.FullIndex(IndexName));
+
+        // An alias cannot take the name of an existing index.
+        var ex = await Assert.ThrowsAsync<RequestFailedException>(
+            () => indexClient.CreateAliasAsync(new SearchAlias(IndexName, new[] { IndexName })));
+        Assert.Equal(409, ex.Status);
+
+        // An index cannot take the name of an existing alias.
+        await indexClient.CreateAliasAsync(new SearchAlias("al", new[] { IndexName }));
+        ex = await Assert.ThrowsAsync<RequestFailedException>(
+            () => indexClient.CreateIndexAsync(TestData.FullIndex("al")));
+        Assert.Equal(409, ex.Status);
+    }
+
+    [Fact]
+    public async Task BatchLastActionWins()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(TestData.FullIndex());
+
+        // Upload-then-delete in one batch (over raw HTTP, which is the only
+        // wire shape that mixes actions): the document is gone.
+        var (status, body) = await RawPostAsync(
+            $"{BaseUrl}/indexes('{IndexName}')/docs/search.index?api-version={ApiVersion}",
+            """
+            {"value": [
+                {"@search.action": "upload", "id": "9", "title": "nine", "price": 9.0},
+                {"@search.action": "delete", "id": "9"}
+            ]}
+            """);
+        Assert.Equal(200, status);
+        Assert.Equal(0, (await searchClient.GetDocumentCountAsync()).Value);
+
+        // Delete-then-upload: the upload wins.
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = "one", ["price"] = 1.0 },
+        });
+        (status, _) = await RawPostAsync(
+            $"{BaseUrl}/indexes('{IndexName}')/docs/search.index?api-version={ApiVersion}",
+            """
+            {"value": [
+                {"@search.action": "delete", "id": "1"},
+                {"@search.action": "upload", "id": "1", "title": "replaced", "price": 2.0}
+            ]}
+            """);
+        Assert.Equal(200, status);
+        var doc = (await searchClient.GetDocumentAsync<SearchDocument>("1")).Value;
+        Assert.Equal("replaced", (string)doc["title"]);
     }
 }

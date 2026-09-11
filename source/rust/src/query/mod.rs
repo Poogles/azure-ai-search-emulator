@@ -7,33 +7,51 @@
 //!
 //! Semantics (see `docs/supported_operations.md`):
 //! - Token-based full-text match across `searchable: true` string fields,
-//!   using Tantivy's default (English) analyzer.
+//!   using an English analyzer (lowercasing, punctuation splitting, English
+//!   stopword removal, English stemming) approximating Azure's basic English
+//!   analyzer.
 //! - `*` or an empty search term matches all documents.
-//! - A multi-term search term matches a document when every required term
-//!   matches at least one searchable string field (Azure simple-query AND
-//!   semantics).
+//! - A multi-term search combines required clauses with AND (`searchMode=all`,
+//!   the emulator default) or OR (`searchMode=any`).
 //! - Simple-query boolean operators: `+term` (required, the default),
-//!   `-term` (excluded), and `"quoted phrases"`.
-//! - Field-specific search via [`FullTextQuery::fields`].
+//!   `-term` (excluded), `"quoted phrases"`, and Lucene-style fuzzy terms
+//!   (`term~` for the default edit distance 2, `term~1` for distance 1).
+//! - Field-specific search via [`FullTextQuery::fields`], with per-field
+//!   boosts from `searchFields` weights (`field^N`).
+//! - Results carry Tantivy BM25 relevance scores for ranking.
 //!
-//! The engine is responsible only for full-text matching. It returns the keys of
-//! the matching documents; the service layer resolves those keys back to the full
-//! stored documents, applies filters, ordering, projection, and paging.
+//! The engine returns matching keys with scores; the service layer resolves
+//! those keys back to the full stored documents, applies filters, ordering,
+//! projection, and paging.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 use tantivy::collector::TopDocs;
-use tantivy::query::{AllQuery, BooleanQuery, EmptyQuery, Occur, PhraseQuery, Query, TermQuery};
+use tantivy::query::{
+    AllQuery, BooleanQuery, BoostQuery, EmptyQuery, FuzzyTermQuery, Occur, PhraseQuery, Query,
+    TermQuery,
+};
 use tantivy::schema::Value as _;
-use tantivy::schema::{Field, IndexRecordOption, Schema, STORED, STRING, TEXT};
-use tantivy::tokenizer::{TokenStream, TokenizerManager};
+use tantivy::schema::{
+    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, STORED, STRING,
+};
+use tantivy::tokenizer::{
+    Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer,
+    TokenStream, TokenizerManager,
+};
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
 
 use crate::storage::{Document, FieldDefinition};
 
 /// Reserved Tantivy field name used to store each document's key.
 const KEY_FIELD_NAME: &str = "__aisearch_key";
+
+/// Name of the custom analyzer used for both indexing and querying: lowercase,
+/// punctuation splitting, English stopword removal, and English stemming. This
+/// approximates Azure's basic English analyzer (see
+/// `docs/known_differences.md`).
+const EMULATOR_TOKENIZER: &str = "aisearch_en";
 
 /// Heap budget (bytes) for each per-index Tantivy writer.
 const WRITER_HEAP_BYTES: usize = 50_000_000;
@@ -62,16 +80,42 @@ impl std::fmt::Display for QueryError {
 
 impl std::error::Error for QueryError {}
 
-/// Tokenizes search text with Tantivy's default analyzer, so query terms match
-/// the analyzed terms stored in the index (same lowercasing and punctuation
-/// splitting applied at index time). A hand-rolled whitespace split would
-/// diverge — e.g. `hello-world` would not match indexed `hello` + `world`.
+/// Builds the emulator's English analyzer: simple tokenization with
+/// lowercasing, English stopword removal, and English stemming. The same
+/// analyzer is used at index time (registered on every Tantivy index) and at
+/// query time (see [`analyze`]), so indexed and query terms always agree.
+fn emulator_analyzer() -> TextAnalyzer {
+    let stopwords = StopWordFilter::new(Language::English).unwrap_or_else(|| {
+        // The English stopword list is compiled in; this fallback is
+        // defensive and unreachable in practice.
+        StopWordFilter::remove(Vec::<String>::new())
+    });
+    TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(RemoveLongFilter::limit(40))
+        .filter(LowerCaser)
+        .filter(stopwords)
+        .filter(Stemmer::new(Language::English))
+        .build()
+}
+
+/// Text options for searchable fields: tokenized with the emulator analyzer,
+/// with positions (for phrase queries) and frequencies (for BM25 scoring).
+fn emulator_text_options() -> TextOptions {
+    TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer(EMULATOR_TOKENIZER)
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+    )
+}
+
+/// Tokenizes search text with the emulator analyzer, so query terms match the
+/// analyzed terms stored in the index (same lowercasing, punctuation
+/// splitting, stopword removal, and stemming applied at index time).
+/// A hand-rolled whitespace split would diverge — e.g. `hello-world` would
+/// not match indexed `hello` + `world`.
 #[must_use]
 pub fn analyze(text: &str) -> Vec<String> {
-    let manager = TokenizerManager::default();
-    let Some(mut analyzer) = manager.get("default") else {
-        return Vec::new();
-    };
+    let mut analyzer = emulator_analyzer();
     let mut stream = analyzer.token_stream(text);
     let mut tokens = Vec::new();
     while stream.advance() {
@@ -91,14 +135,11 @@ pub struct AnalyzeToken {
     pub position: usize,
 }
 
-/// Tokenizes text with Tantivy's default analyzer, returning structured tokens
+/// Tokenizes text with the emulator analyzer, returning structured tokens
 /// with offsets and positions (for the analyze-text endpoint).
 #[must_use]
 pub fn analyze_with_offsets(text: &str) -> Vec<AnalyzeToken> {
-    let manager = TokenizerManager::default();
-    let Some(mut analyzer) = manager.get("default") else {
-        return Vec::new();
-    };
+    let mut analyzer = emulator_analyzer();
     let mut stream = analyzer.token_stream(text);
     let mut tokens = Vec::new();
     while stream.advance() {
@@ -113,22 +154,111 @@ pub fn analyze_with_offsets(text: &str) -> Vec<AnalyzeToken> {
     tokens
 }
 
-/// One clause of a parsed simple query: a single term or a quoted phrase.
+/// Tokenizes text for the analyze-text endpoint under the requested
+/// analyzer name (already validated against the known-analyzer list):
+/// - `keyword`: the whole input as a single token (no analysis, case
+///   preserved), matching Azure's keyword analyzer.
+/// - `whitespace`: split on whitespace boundaries (no lowercasing, stemming,
+///   or stopword removal), matching Azure's whitespace analyzer.
+/// - anything else (`None` included): the emulator English analyzer (see
+///   [`analyze_with_offsets`]).
+#[must_use]
+pub fn analyze_with_offsets_and_analyzer(text: &str, analyzer: Option<&str>) -> Vec<AnalyzeToken> {
+    match analyzer {
+        Some("keyword") => {
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![AnalyzeToken {
+                    token: text.to_owned(),
+                    start_offset: 0,
+                    end_offset: text.len(),
+                    position: 0,
+                }]
+            }
+        }
+        Some("whitespace") => {
+            let mut tokens = Vec::new();
+            let mut offset = 0usize;
+            for (position, word) in text.split_whitespace().enumerate() {
+                let start = text[offset..].find(word).map_or(offset, |at| offset + at);
+                tokens.push(AnalyzeToken {
+                    token: word.to_owned(),
+                    start_offset: start,
+                    end_offset: start + word.len(),
+                    position,
+                });
+                offset = start + word.len();
+            }
+            tokens
+        }
+        _ => analyze_with_offsets(text),
+    }
+}
+
+/// The tokenizer manager pre-populated with the emulator analyzer, for
+/// contexts that resolve tokenizers by name.
+#[must_use]
+pub fn emulator_tokenizer_manager() -> TokenizerManager {
+    let manager = TokenizerManager::new();
+    manager.register(EMULATOR_TOKENIZER, emulator_analyzer());
+    manager
+}
+
+/// One clause of a parsed simple query: a single term, a quoted phrase, or a
+/// fuzzy term (`term~` / `term~N`, Lucene-style trailing-tilde syntax).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Clause {
     Term(String),
     Phrase(String),
+    FuzzyTerm { term: String, distance: u8 },
+}
+
+/// How multi-term required clauses combine: `All` (AND, every clause must
+/// match) or `Any` (OR, at least one clause must match). Mirrors Azure's
+/// `searchMode` (`all` / `any`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SearchMode {
+    /// Every required clause must match (AND). This is the emulator default
+    /// when `searchMode` is omitted; Azure defaults to `Any`.
+    #[default]
+    All,
+    /// At least one required clause must match (OR).
+    Any,
+}
+
+impl SearchMode {
+    /// Parses an Azure `searchMode` value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string for anything other than `all` / `any`
+    /// (case-insensitive).
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.to_ascii_lowercase().as_str() {
+            "all" => Ok(SearchMode::All),
+            "any" => Ok(SearchMode::Any),
+            other => Err(format!(
+                "Invalid searchMode {other:?}; supported values: 'all', 'any'."
+            )),
+        }
+    }
 }
 
 /// A parsed full-text query: required and excluded clauses, optionally
 /// restricted to a set of Azure field names.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct FullTextQuery {
     pub required: Vec<Clause>,
     pub excluded: Vec<Clause>,
     /// Azure field names to restrict the search to; `None` means all
     /// `searchable` string fields.
     pub fields: Option<Vec<String>>,
+    /// Per-field score boosts from `searchFields` weights (`field^N`);
+    /// absent entries mean boost `1.0`.
+    pub boosts: BTreeMap<String, f32>,
+    /// How required clauses combine.
+    pub mode: SearchMode,
 }
 
 impl FullTextQuery {
@@ -141,13 +271,17 @@ impl FullTextQuery {
 
 /// Parses a simple-query search text into required and excluded clauses.
 ///
-/// Supports `+term` (required; the default), `-term` (excluded), and
-/// `"quoted phrases"`. An empty text or `*` produces a match-all query.
+/// Supports `+term` (required; the default), `-term` (excluded), `"quoted
+/// phrases"`, and Lucene-style fuzzy terms (`term~` for the default edit
+/// distance 2, `term~N` for an explicit distance 0-2). An empty text or `*`
+/// produces a match-all query. Like the rest of the emulator pipeline, fuzzy
+/// terms are analyzed (lowercased, stemmed); Azure only lowercases fuzzy
+/// terms (see `docs/known_differences.md`).
 ///
 /// # Errors
 ///
-/// Returns an error string for an unterminated phrase or a `+`/`-` modifier
-/// with no term.
+/// Returns an error string for an unterminated phrase, a `+`/`-` modifier
+/// with no term, or an invalid fuzzy distance.
 pub fn parse_search_text(text: &str) -> Result<FullTextQuery, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() || trimmed == "*" {
@@ -211,7 +345,51 @@ fn read_clause(chars: &[char], pos: &mut usize) -> Result<Clause, String> {
     while *pos < chars.len() && !chars[*pos].is_whitespace() {
         *pos += 1;
     }
-    Ok(Clause::Term(chars[start..*pos].iter().collect()))
+    let raw: String = chars[start..*pos].iter().collect();
+    split_fuzzy_suffix(&raw)
+}
+
+/// Splits a raw term into a plain or fuzzy clause: a trailing `~` (the
+/// default edit distance 2, matching Azure) or `~N` (explicit distance 0-2)
+/// marks a fuzzy term.
+///
+/// # Errors
+///
+/// Returns an error string when the fuzzy distance exceeds 2 or no term
+/// precedes the `~` marker.
+fn split_fuzzy_suffix(raw: &str) -> Result<Clause, String> {
+    let Some(tilde) = raw.rfind('~') else {
+        return Ok(Clause::Term(raw.to_owned()));
+    };
+    let (stem, suffix) = raw.split_at(tilde);
+    // A `~` that is not a trailing marker (text follows that is not a
+    // 0-2 digit suffix) is part of the term itself.
+    let distance: u8 = match &suffix[1..] {
+        "" | "2" => 2,
+        "1" => 1,
+        "0" => 0,
+        other => {
+            if other.chars().all(|c| c.is_ascii_digit()) {
+                return Err(format!(
+                    "Invalid fuzzy distance {other:?} in search term {raw:?}; \
+                     supported distances are 0-2 (e.g. `term~`, `term~2`)."
+                ));
+            }
+            return Ok(Clause::Term(raw.to_owned()));
+        }
+    };
+    if stem.is_empty() {
+        return Err(format!(
+            "Search term {raw:?} has a fuzzy marker with no term."
+        ));
+    }
+    if distance == 0 {
+        return Ok(Clause::Term(stem.to_owned()));
+    }
+    Ok(Clause::FuzzyTerm {
+        term: stem.to_owned(),
+        distance,
+    })
 }
 
 /// A single Tantivy-backed search index.
@@ -248,6 +426,11 @@ impl SearchEngine {
     pub fn create_index(&self, name: &str, fields: &[FieldDefinition]) -> Result<(), QueryError> {
         let (schema, key_field, searchable) = build_schema(fields);
         let index = Index::create_in_ram(schema);
+        // Register the emulator analyzer so the schema's tokenizer name
+        // resolves at index time.
+        index
+            .tokenizers()
+            .register(EMULATOR_TOKENIZER, emulator_analyzer());
         let reader = index
             .reader()
             .map_err(|e| QueryError::Engine(e.to_string()))?;
@@ -373,8 +556,8 @@ impl SearchEngine {
         Ok(())
     }
 
-    /// Runs a full-text search, returning the keys of all matching documents as
-    /// a set for efficient lookup by the service layer.
+    /// Runs a full-text search, returning the matching document keys with
+    /// their BM25 relevance scores for ranking by the service layer.
     ///
     /// # Errors
     ///
@@ -384,7 +567,7 @@ impl SearchEngine {
         &self,
         name: &str,
         query: &FullTextQuery,
-    ) -> Result<BTreeSet<String>, QueryError> {
+    ) -> Result<BTreeMap<String, f32>, QueryError> {
         let guard = self
             .inner
             .read()
@@ -397,18 +580,18 @@ impl SearchEngine {
                 .searchable
                 .iter()
                 .filter(|(name, _)| names.contains(name))
-                .map(|(_, field)| *field)
-                .collect::<Vec<Field>>(),
+                .map(|(name, field)| (name.clone(), *field))
+                .collect::<Vec<(String, Field)>>(),
             None => engine
                 .searchable
                 .iter()
-                .map(|(_, field)| *field)
-                .collect::<Vec<Field>>(),
+                .map(|(name, field)| (name.clone(), *field))
+                .collect::<Vec<(String, Field)>>(),
         };
         // A non-match-all query cannot match when there are no searchable
         // fields in scope.
         if !query.is_match_all() && fields.is_empty() {
-            return Ok(BTreeSet::new());
+            return Ok(BTreeMap::new());
         }
         let tantivy_query = build_query(query, &fields);
         let searcher = engine.reader.searcher();
@@ -418,18 +601,21 @@ impl SearchEngine {
                 &TopDocs::with_limit(MAX_MATCHES).order_by_score(),
             )
             .map_err(|e| QueryError::Engine(e.to_string()))?;
-        let mut keys = BTreeSet::new();
-        for (_score, doc_address) in top_docs {
+        let mut scored = BTreeMap::new();
+        for (score, doc_address) in top_docs {
             if let Ok(doc) = searcher.doc::<TantivyDocument>(doc_address) {
                 if let Some(key) = doc
                     .get_first(engine.key_field)
                     .and_then(|value| value.as_str())
                 {
-                    keys.insert(key.to_owned());
+                    scored
+                        .entry(key.to_owned())
+                        .and_modify(|best: &mut f32| *best = best.max(score))
+                        .or_insert(score);
                 }
             }
         }
-        Ok(keys)
+        Ok(scored)
     }
 
     /// Clears all Tantivy indexes.
@@ -475,7 +661,7 @@ fn collect_searchable(
         } else if field.searchable && !field.is_vector_field() {
             // Vector fields require `searchable: true` per Azure but are not
             // full-text indexed (their values are numeric arrays).
-            let tantivy_field = builder.add_text_field(&path, TEXT);
+            let tantivy_field = builder.add_text_field(&path, emulator_text_options());
             searchable.push((path, tantivy_field));
         }
     }
@@ -520,14 +706,19 @@ fn resolve_doc_paths<'a>(fields: &'a Map<String, Value>, path: &str) -> Vec<&'a 
 
 /// Builds the Tantivy query for a [`FullTextQuery`]: match-all when the query
 /// has no clauses, otherwise a boolean combination where each required clause
-/// is `Must` and each excluded clause is `MustNot`. Each clause is an OR over
-/// the in-scope searchable fields (a term query per analyzer token, or a
-/// phrase query for quoted phrases). A clause that analyzes to no tokens
-/// (e.g. punctuation only) matches nothing.
-fn build_query(query: &FullTextQuery, fields: &[Field]) -> Box<dyn Query> {
+/// is `Must` (`searchMode=all`, the default) or `Should` (`searchMode=any`)
+/// and each excluded clause is `MustNot`. Each clause is an OR over the
+/// in-scope searchable fields (a term query per analyzer token, or a phrase
+/// query for quoted phrases). A clause that analyzes to no tokens (e.g. a
+/// stopword-only term, or punctuation only) matches nothing.
+fn build_query(query: &FullTextQuery, fields: &[(String, Field)]) -> Box<dyn Query> {
     if query.is_match_all() {
         return Box::new(AllQuery);
     }
+    let required_occur = match query.mode {
+        SearchMode::All => Occur::Must,
+        SearchMode::Any => Occur::Should,
+    };
     let mut clauses: Vec<(Occur, Box<dyn Query>)> =
         Vec::with_capacity(query.required.len() + query.excluded.len() + 1);
     // An exclusion-only query (no required clauses) starts from all documents
@@ -536,16 +727,34 @@ fn build_query(query: &FullTextQuery, fields: &[Field]) -> Box<dyn Query> {
         clauses.push((Occur::Must, Box::new(AllQuery)));
     }
     for clause in &query.required {
-        clauses.push((Occur::Must, clause_query(clause, fields)));
+        clauses.push((required_occur, clause_query(clause, fields, &query.boosts)));
     }
     for clause in &query.excluded {
-        clauses.push((Occur::MustNot, clause_query(clause, fields)));
+        clauses.push((Occur::MustNot, clause_query(clause, fields, &query.boosts)));
     }
     Box::new(BooleanQuery::new(clauses))
 }
 
+/// Looks up the score boost for a field (`1.0` when no weight was given).
+fn field_boost(boosts: &BTreeMap<String, f32>, field: &str) -> f32 {
+    boosts.get(field).copied().unwrap_or(1.0)
+}
+
+/// Wraps a per-field query in a boost when the field carries a weight.
+fn maybe_boost(query: Box<dyn Query>, boost: f32) -> Box<dyn Query> {
+    if (boost - 1.0).abs() < f32::EPSILON {
+        query
+    } else {
+        Box::new(BoostQuery::new(query, boost))
+    }
+}
+
 /// Builds the per-field OR query for a single clause.
-fn clause_query(clause: &Clause, fields: &[Field]) -> Box<dyn Query> {
+fn clause_query(
+    clause: &Clause,
+    fields: &[(String, Field)],
+    boosts: &BTreeMap<String, f32>,
+) -> Box<dyn Query> {
     match clause {
         Clause::Term(term) => {
             let tokens = analyze(term);
@@ -555,14 +764,33 @@ fn clause_query(clause: &Clause, fields: &[Field]) -> Box<dyn Query> {
             let mut term_clauses: Vec<(Occur, Box<dyn Query>)> =
                 Vec::with_capacity(tokens.len() * fields.len());
             for token in &tokens {
-                for field in fields {
+                for (name, field) in fields {
                     let term = Term::from_field_text(*field, token);
                     let query: Box<dyn Query> =
                         Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
-                    term_clauses.push((Occur::Should, query));
+                    term_clauses
+                        .push((Occur::Should, maybe_boost(query, field_boost(boosts, name))));
                 }
             }
             Box::new(BooleanQuery::new(term_clauses))
+        }
+        Clause::FuzzyTerm { term, distance } => {
+            let tokens = analyze(term);
+            if tokens.is_empty() {
+                return Box::new(EmptyQuery);
+            }
+            let mut fuzzy_clauses: Vec<(Occur, Box<dyn Query>)> =
+                Vec::with_capacity(tokens.len() * fields.len());
+            for token in &tokens {
+                for (name, field) in fields {
+                    let term = Term::from_field_text(*field, token);
+                    let query: Box<dyn Query> =
+                        Box::new(FuzzyTermQuery::new(term, *distance, true));
+                    fuzzy_clauses
+                        .push((Occur::Should, maybe_boost(query, field_boost(boosts, name))));
+                }
+            }
+            Box::new(BooleanQuery::new(fuzzy_clauses))
         }
         Clause::Phrase(phrase) => {
             let tokens = analyze(phrase);
@@ -570,12 +798,13 @@ fn clause_query(clause: &Clause, fields: &[Field]) -> Box<dyn Query> {
                 return Box::new(EmptyQuery);
             }
             let mut phrase_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(fields.len());
-            for field in fields {
+            for (name, field) in fields {
                 let terms = tokens
                     .iter()
                     .map(|token| Term::from_field_text(*field, token))
                     .collect();
-                phrase_clauses.push((Occur::Should, Box::new(PhraseQuery::new(terms))));
+                let query: Box<dyn Query> = Box::new(PhraseQuery::new(terms));
+                phrase_clauses.push((Occur::Should, maybe_boost(query, field_boost(boosts, name))));
             }
             Box::new(BooleanQuery::new(phrase_clauses))
         }
@@ -586,6 +815,7 @@ fn clause_query(clause: &Clause, fields: &[Field]) -> Box<dyn Query> {
 mod tests {
     use super::*;
     use serde_json::{Map, Value};
+    use std::collections::BTreeSet;
 
     fn fields() -> Vec<FieldDefinition> {
         vec![
@@ -681,11 +911,25 @@ mod tests {
     fn keys(engine: &SearchEngine, term: &str) -> Vec<String> {
         let query =
             parse_search_text(term).unwrap_or_else(|e| panic!("parse failed for {term:?}: {e}"));
-        engine
+        let mut keys: Vec<String> = engine
+            .search("items", &query)
+            .unwrap_or_else(|e| panic!("search failed: {e}"))
+            .into_keys()
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    fn scored(engine: &SearchEngine, term: &str) -> Vec<(String, f32)> {
+        let query =
+            parse_search_text(term).unwrap_or_else(|e| panic!("parse failed for {term:?}: {e}"));
+        let mut pairs: Vec<(String, f32)> = engine
             .search("items", &query)
             .unwrap_or_else(|e| panic!("search failed: {e}"))
             .into_iter()
-            .collect()
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        pairs
     }
 
     #[test]
@@ -758,14 +1002,17 @@ mod tests {
     }
 
     #[test]
-    fn analyze_uses_default_analyzer() {
+    fn analyze_uses_english_analyzer_with_stemming_and_stopwords() {
         assert_eq!(analyze("Hello  WORLD"), vec!["hello", "world"]);
         assert!(analyze("").is_empty());
         // Punctuation splits: the analyzer (not whitespace) defines tokens.
-        // The default analyzer does not stem or remove stopwords.
         assert_eq!(analyze("hello-world"), vec!["hello", "world"]);
-        assert_eq!(analyze("running"), vec!["running"]);
-        assert_eq!(analyze("the"), vec!["the"]);
+        // English stemming: inflected forms reduce to their stem.
+        assert_eq!(analyze("running"), vec!["run"]);
+        assert_eq!(analyze("searches"), vec!["search"]);
+        // English stopwords are removed.
+        assert!(analyze("the").is_empty());
+        assert_eq!(analyze("the quick fox"), vec!["quick", "fox"]);
     }
 
     #[test]
@@ -815,7 +1062,7 @@ mod tests {
         assert_eq!(
             engine
                 .search("items", &query)
-                .map(|k| k.into_iter().collect::<Vec<_>>()),
+                .map(|k| k.into_keys().collect::<Vec<_>>()),
             Ok(vec!["1".to_owned(), "2".to_owned()])
         );
         // Restricted to `body`: no match ("azure" only appears in titles).
@@ -834,7 +1081,7 @@ mod tests {
         assert_eq!(
             engine
                 .search("items", &scoped)
-                .map(|k| k.into_iter().collect::<Vec<_>>()),
+                .map(|k| k.into_keys().collect::<Vec<_>>()),
             Ok(vec!["1".to_owned(), "2".to_owned()])
         );
     }
@@ -855,5 +1102,159 @@ mod tests {
             ]
         );
         assert_eq!(query.excluded, vec![Clause::Term("d".to_owned())]);
+    }
+
+    #[test]
+    fn search_mode_any_matches_union() {
+        let engine = engine_with_docs();
+        // Default (all/AND): both terms must match.
+        assert_eq!(keys(&engine, "azure fox"), vec!["1"]);
+        // Any (OR): either term matches.
+        let mut any =
+            parse_search_text("azure fox").unwrap_or_else(|e| panic!("parse failed: {e}"));
+        any.mode = SearchMode::Any;
+        let mut keys: Vec<String> = engine
+            .search("items", &any)
+            .unwrap_or_else(|e| panic!("search failed: {e}"))
+            .into_keys()
+            .collect();
+        keys.sort();
+        assert_eq!(keys, vec!["1", "2"]);
+        // SearchMode parsing accepts both values case-insensitively.
+        assert_eq!(SearchMode::parse("all"), Ok(SearchMode::All));
+        assert_eq!(SearchMode::parse("ANY"), Ok(SearchMode::Any));
+        assert!(SearchMode::parse("both").is_err());
+    }
+
+    #[test]
+    fn stemming_matches_inflected_forms() {
+        let engine = engine_with_docs();
+        // "dogs" stems to "dog", matching the indexed "dogs".
+        assert_eq!(keys(&engine, "dog"), vec!["2"]);
+        assert_eq!(keys(&engine, "dogs"), vec!["2"]);
+        // "search" stems the same as indexed "Search".
+        assert_eq!(keys(&engine, "searches"), vec!["1"]);
+    }
+
+    #[test]
+    fn stopwords_do_not_match() {
+        let engine = engine_with_docs();
+        // "the" is an English stopword: removed at index and query time.
+        assert!(keys(&engine, "the").is_empty());
+        // A stopword-only query matches nothing (not everything).
+        let query = parse_search_text("the").unwrap_or_else(|e| panic!("parse failed: {e}"));
+        assert!(engine.search("items", &query).is_ok_and(|m| m.is_empty()));
+    }
+
+    #[test]
+    fn fuzzy_terms_match_within_edit_distance() {
+        let engine = engine_with_docs();
+        // "emulator" stems to the indexed "emul" (from "Emulators").
+        assert_eq!(keys(&engine, "emulator~"), vec!["2"]);
+        // One substitution away from indexed "fox" ("box" is also two away
+        // from indexed "dog", so the default distance matches both).
+        assert_eq!(keys(&engine, "box~1"), vec!["1"]);
+        assert_eq!(keys(&engine, "box~"), vec!["1", "2"]);
+        // One insertion away from indexed "fox" ("fo" is also two away from
+        // indexed "dog", so the default distance matches both).
+        assert_eq!(keys(&engine, "fo~1"), vec!["1"]);
+        assert_eq!(keys(&engine, "fo~"), vec!["1", "2"]);
+        // A bare `~` uses the default edit distance 2 (matching Azure): "qik"
+        // is two deletions away from indexed "quick".
+        assert_eq!(keys(&engine, "qik~"), vec!["1"]);
+        assert!(keys(&engine, "qik~1").is_empty());
+        // An unrelated term still matches nothing, even fuzzy.
+        assert!(keys(&engine, "zzz~").is_empty());
+        // Explicit distance suffixes parse ("~" defaults to 2).
+        let query = parse_search_text("emulator~").unwrap_or_else(|e| panic!("parse failed: {e}"));
+        assert_eq!(
+            query.required,
+            vec![Clause::FuzzyTerm {
+                term: "emulator".to_owned(),
+                distance: 2
+            }]
+        );
+        let query = parse_search_text("emulator~1").unwrap_or_else(|e| panic!("parse failed: {e}"));
+        assert_eq!(
+            query.required,
+            vec![Clause::FuzzyTerm {
+                term: "emulator".to_owned(),
+                distance: 1
+            }]
+        );
+        // Distance above 2 is rejected explicitly.
+        assert!(parse_search_text("emulator~3").is_err());
+        // A bare `~` with no term is rejected.
+        assert!(parse_search_text("~").is_err());
+    }
+
+    #[test]
+    fn analyze_endpoint_analyzers_tokenize() {
+        // The default (English) analyzer stems and drops stopwords.
+        assert_eq!(
+            analyze_with_offsets_and_analyzer("Running foxes", None)
+                .iter()
+                .map(|t| t.token.clone())
+                .collect::<Vec<_>>(),
+            vec!["run", "fox"]
+        );
+        // `keyword` emits the whole input as one verbatim token.
+        let tokens = analyze_with_offsets_and_analyzer("Running foxes", Some("keyword"));
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].token, "Running foxes");
+        assert_eq!(tokens[0].start_offset, 0);
+        assert_eq!(tokens[0].end_offset, "Running foxes".len());
+        assert!(analyze_with_offsets_and_analyzer("", Some("keyword")).is_empty());
+        // `whitespace` splits without lowercasing or stemming.
+        let tokens = analyze_with_offsets_and_analyzer("Running  foxes", Some("whitespace"));
+        assert_eq!(
+            tokens.iter().map(|t| t.token.clone()).collect::<Vec<_>>(),
+            vec!["Running", "foxes"]
+        );
+        assert_eq!(tokens[0].start_offset, 0);
+        assert_eq!(tokens[0].end_offset, "Running".len());
+        assert_eq!(tokens[1].start_offset, "Running  ".len());
+    }
+
+    #[test]
+    fn search_returns_positive_bm25_scores() {
+        let engine = engine_with_docs();
+        let pairs = scored(&engine, "azure");
+        assert_eq!(pairs.len(), 2);
+        for (_, score) in &pairs {
+            assert!(*score > 0.0, "BM25 scores must be positive, got {score}");
+        }
+    }
+
+    #[test]
+    fn field_boosts_change_scores_not_matches() {
+        let engine = engine_with_docs();
+        let plain = FullTextQuery {
+            required: vec![Clause::Term("azure".to_owned())],
+            ..Default::default()
+        };
+        let plain_scores = engine
+            .search("items", &plain)
+            .unwrap_or_else(|e| panic!("search failed: {e}"));
+        let boosted = FullTextQuery {
+            required: vec![Clause::Term("azure".to_owned())],
+            boosts: BTreeMap::from([("title".to_owned(), 2.0)]),
+            ..Default::default()
+        };
+        let boosted_scores = engine
+            .search("items", &boosted)
+            .unwrap_or_else(|e| panic!("search failed: {e}"));
+        // Same matches...
+        assert_eq!(
+            plain_scores.keys().collect::<BTreeSet<_>>(),
+            boosted_scores.keys().collect::<BTreeSet<_>>()
+        );
+        // ...but boosted scores are higher.
+        for key in plain_scores.keys() {
+            assert!(
+                boosted_scores[key] > plain_scores[key],
+                "boosted score for {key} should exceed plain score"
+            );
+        }
     }
 }

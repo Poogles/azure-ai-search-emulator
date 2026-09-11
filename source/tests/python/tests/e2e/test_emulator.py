@@ -111,6 +111,15 @@ def test_unsupported_api_version_returns_400(clean_emulator: str) -> None:
     assert json.loads(response.text())["error"]["code"] == "ApiVersionUnsupported"
 
 
+def test_newer_api_version_accepted_by_floor(clean_emulator: str) -> None:
+    """Versions on or after the configured floor are accepted (floor-based
+    acceptance, so newer SDK defaults keep working)."""
+    client = SearchIndexClient(
+        endpoint=clean_emulator, credential=CREDENTIAL, api_version="2026-04-01"
+    )
+    assert list(client.list_indexes()) == []
+
+
 def test_error_body_is_azure_structured(clean_emulator: str) -> None:
     url = f"{clean_emulator}/indexes?api-version={API_VERSION}"
     status, body = _raw_get(url, api_key=None)
@@ -316,3 +325,65 @@ def test_rag_style_vector_and_hybrid_flow(
         )
     )
     assert {doc["id"] for doc in found} == {"1", "2", "3"}
+
+
+def test_batch_last_action_wins(
+    clean_emulator: str,
+    index_client: SearchIndexClient,
+    search_client: SearchClient,
+    test_index: SearchIndex,
+) -> None:
+    """Actions in one batch apply in order with last-action-wins per key."""
+    index_client.create_index(test_index)
+    url = f"{clean_emulator}/indexes('{INDEX_NAME}')/docs/search.index?api-version={API_VERSION}"
+    status, body = _raw_post(
+        url,
+        {
+            "value": [
+                {"@search.action": "upload", "id": "9", "title": "nine"},
+                {"@search.action": "delete", "id": "9"},
+            ]
+        },
+    )
+    assert status == 200
+    assert [item["statusCode"] for item in body["value"]] == [201, 200]
+    assert search_client.get_document_count() == 0
+    assert list(search_client.search(search_text="nine")) == []
+
+
+def test_facet_string_form_options(
+    clean_emulator: str,
+    index_client: SearchIndexClient,
+    search_client: SearchClient,
+) -> None:
+    """Facet options in the single-string form attach to the preceding facet."""
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchField(
+                    name="tags",
+                    # Plain string: SearchFieldDataType.Collection() is
+                    # monkey-patched at runtime (see the SDK's _patch.py) and
+                    # invisible to mypy.
+                    type="Collection(Edm.String)",
+                    filterable=True,
+                    facetable=True,
+                ),
+            ],
+        )
+    )
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "tags": ["red", "blue"]},
+            {"id": "2", "tags": ["red"]},
+            {"id": "3", "tags": ["green"]},
+        ]
+    )
+    url = f"{clean_emulator}/indexes('{INDEX_NAME}')/docs/search.post.search?api-version={API_VERSION}"
+    status, body = _raw_post(url, {"search": "*", "facets": "tags,count:1"})
+    assert status == 200
+    entries = body["@search.facets"]["tags"]
+    assert len(entries) == 1
+    assert entries[0] == {"value": "red", "count": 2}

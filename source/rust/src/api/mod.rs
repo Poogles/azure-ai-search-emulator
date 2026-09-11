@@ -161,7 +161,7 @@ async fn create_or_update_index(
         let definition = parse_body(&body)?;
         validate_named_body(&name, &definition, "alias", "InvalidAlias")?;
         validate_alias(&definition)?;
-        let alias = state.service.create_or_update_alias(&name, &definition);
+        let alias = state.service.create_or_update_alias(&name, &definition)?;
         return Ok((StatusCode::CREATED, Json(alias.to_value())));
     }
     if raw_name.starts_with("knowledgesources(") {
@@ -642,19 +642,31 @@ async fn document_count(
 }
 
 /// `POST /indexes('{name}')/search.analyze` — Analyze Text. Tokenizes the
-/// provided text and returns the tokens with offsets and positions.
+/// provided text with the emulator's English analyzer and returns the tokens
+/// with offsets and positions. An explicit `analyzer` (`analyzerName` alias
+/// accepted) must be a known analyzer name and `field` (`fieldName` alias
+/// accepted) must exist in the index schema; both otherwise map to the same
+/// analyzer (see `docs/known_differences.md`).
 async fn analyze_text(
     State(state): State<AppState>,
     Path(raw_name): Path<String>,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let name = parse_index_name(&raw_name)?;
-    state.service.require_index_public(&name)?;
     let raw = parse_body(&body)?;
     let text = raw.get("text").and_then(Value::as_str).ok_or_else(|| {
         ApiError::bad_request("InvalidRequest", "The \"text\" field is required.")
     })?;
-    let tokens = crate::query::analyze_with_offsets(text);
+    let analyzer = raw
+        .get("analyzer")
+        .or_else(|| raw.get("analyzerName"))
+        .and_then(Value::as_str);
+    let field = raw
+        .get("field")
+        .or_else(|| raw.get("fieldName"))
+        .and_then(Value::as_str);
+    state.service.validate_analyze(&name, analyzer, field)?;
+    let tokens = crate::query::analyze_with_offsets_and_analyzer(text, analyzer);
     let token_values: Vec<Value> = tokens
         .iter()
         .map(|t| {
@@ -710,10 +722,20 @@ fn search_response(
         .iter()
         .map(|doc| {
             let mut entry = Map::new();
-            // Vector and hybrid searches carry per-document scores; plain
-            // full-text searches default to 1.0.
+            // Per-document BM25 relevance scores for full-text matches (best
+            // score wins for hybrid matches); absent keys default to 1.0
+            // (match-all queries carry no query to score against).
             let score = outcome.scores.get(&doc.key).copied().unwrap_or(1.0);
             entry.insert("@search.score".to_owned(), json!(score));
+            // Highlight fragments, only for documents with matches in the
+            // requested highlight fields.
+            if let Some(fields) = outcome.highlights.get(&doc.key) {
+                let highlights = fields
+                    .iter()
+                    .map(|(field, fragments)| (field.clone(), json!(fragments)))
+                    .collect();
+                entry.insert("@search.highlights".to_owned(), Value::Object(highlights));
+            }
             for (key, value) in &doc.fields {
                 if query.select.is_empty() || query.select.iter().any(|s| s == key) {
                     entry.insert(key.clone(), value.clone());

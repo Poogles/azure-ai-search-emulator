@@ -1,6 +1,6 @@
 ---
 status: complete
-status_last_reviewed: 2026-09-10
+status_last_reviewed: 2026-09-11
 ---
 
 # Supported Operations Matrix
@@ -17,7 +17,7 @@ Note on routes: the pinned SDK issues document operations against `/docs/search.
 
 ## Conventions
 
-- Every Azure-surface request requires a non-empty `api-key` header (any value is accepted; missing/empty → `401 AuthenticationFailed`) and an `api-version` query parameter (missing → `400 ApiVersionMissing`; not in `EMULATOR_API_VERSIONS` → `400 ApiVersionUnsupported`). Default supported version: `2024-07-01`.
+- Every Azure-surface request requires a non-empty `api-key` header (any value is accepted; missing/empty → `401 AuthenticationFailed`) and an `api-version` query parameter (missing → `400 ApiVersionMissing`; below the acceptance floor → `400 ApiVersionUnsupported`). Acceptance is floor-based: any well-formed version on or after the earliest version in `EMULATOR_API_VERSIONS` (default `2024-07-01`) is accepted; the message lists the configured versions.
 - All errors use the Azure structure: `{"error": {"code": "...", "message": "..."}}`.
 - Index names travel in OData path segments: `/indexes('name')`. A malformed segment → `400 InvalidIndexName`.
 
@@ -25,7 +25,7 @@ Note on routes: the pinned SDK issues document operations against `/docs/search.
 
 | Operation | SDK method | HTTP request | Success | Errors | Status |
 |-----------|-----------|--------------|---------|--------|--------|
-| Create index | `SearchIndexClient.create_index` | `POST /indexes?api-version=...` | `201` + echoed definition | `409 IndexAlreadyExists`, `400 InvalidIndex` | Supported |
+| Create index | `SearchIndexClient.create_index` | `POST /indexes?api-version=...` | `201` + echoed definition | `409 IndexAlreadyExists` (name taken by an index or an alias), `400 InvalidIndex` | Supported |
 | Create or update index | `SearchIndexClient.create_or_update_index` | `PUT /indexes('{name}')?api-version=...` | `201` + echoed definition | `400 InvalidIndex` | Supported (replaces the index and discards its documents) |
 | Get index | `SearchIndexClient.get_index` | `GET /indexes('{name}')?api-version=...` | `200` + stored definition | `404 ResourceNotFound` | Supported |
 | List indexes | `SearchIndexClient.list_indexes` | `GET /indexes?api-version=...` | `200 {"value": [...]}` (sorted by name) | — | Supported |
@@ -96,12 +96,12 @@ Validation (rejected with `400 InvalidSynonymMap`): missing/empty `name`, `forma
 
 ## Index aliases
 
-Service-level resource (not scoped to an index). Aliases are stored and echoed but **CRUD-only**: they do not resolve to indexes in search/document routes (see `docs/known_differences.md`).
+Service-level resource (not scoped to an index). Aliases are stored and echoed **and resolve on the data plane**: search, document upload/lookup/count, suggest, autocomplete, and analyze-text accept an alias name anywhere an index name is accepted (operating on the alias target: the first entry of its `indexes` array). Index management routes do not resolve aliases (see `docs/known_differences.md`).
 
 | Operation | SDK method | HTTP request | Success | Errors | Status |
 |-----------|-----------|--------------|---------|--------|--------|
-| Create alias | `SearchIndexClient.create_alias` | `POST /aliases?api-version=...` | `201` + the alias | `409 AliasAlreadyExists`, `400 InvalidAlias` | Supported |
-| Create or update alias | `SearchIndexClient.create_or_update_alias` | `PUT /aliases('{name}')?api-version=...` | `201` + the alias | `400 InvalidAlias` | Supported |
+| Create alias | `SearchIndexClient.create_alias` | `POST /aliases?api-version=...` | `201` + the alias | `409 AliasAlreadyExists` (name taken by an alias or an index), `400 InvalidAlias` | Supported |
+| Create or update alias | `SearchIndexClient.create_or_update_alias` | `PUT /aliases('{name}')?api-version=...` | `201` + the alias | `409 AliasAlreadyExists` (name taken by an index), `400 InvalidAlias` | Supported |
 | Get alias | `SearchIndexClient.get_alias` | `GET /aliases('{name}')?api-version=...` | `200` + the alias | `404 ResourceNotFound` | Supported |
 | List aliases | `SearchIndexClient.list_aliases` | `GET /aliases?api-version=...` | `200 {"value": [...]}` (sorted by name) | — | Supported |
 | Delete alias | `SearchIndexClient.delete_alias` | `DELETE /aliases('{name}')?api-version=...` | `204` | `404 ResourceNotFound` | Supported |
@@ -146,6 +146,7 @@ All batch operations use one route: `POST /indexes('{name}')/docs/search.index?a
 - `merge` applies a field-level merge: scalar fields are overwritten, collection fields are replaced wholesale. Merging a missing document reports a per-document `404`; valid actions in the same batch are still applied.
 - `mergeOrUpload` merges when the key exists (`200`) and uploads when it does not (`201`).
 - `delete` removes the document by key; deleting a missing document reports a per-document `404`. Deleted documents are immediately unsearchable.
+- Actions in one batch apply in request order with last-action-wins per key: a key uploaded and then deleted in the same batch is gone (merge/delete observe keys upserted earlier in the batch). Per-action results are still reported in request order.
 
 ### Batch wire formats
 
@@ -185,58 +186,59 @@ Route: `POST /indexes('{name}')/docs/search.post.search?api-version=...`.
 
 | Operation | SDK usage | Status |
 |-----------|-----------|--------|
-| Full-text search (simple) | `SearchClient.search(search_text=...)` | Supported |
-| Boolean operators | `+term`, `-term`, `"quoted phrases"` | Supported |
+| Full-text search (simple) | `SearchClient.search(search_text=...)` | Supported (English analyzer: lowercase, punctuation split, stopword removal, stemming) |
+| Boolean operators | `+term`, `-term`, `"quoted phrases"`, `term~` / `term~N` (fuzzy, default distance 2 like Azure) | Supported |
 | Match-all | `search_text="*"` or empty | Supported |
 | Result count | `search(count=True)` → `@odata.count` | Supported |
 | Paging | `top=`, `skip=` | Supported |
 | Continuation tokens | `by_page()` → `@odata.nextLink` + `@search.nextPageParameters` | Supported |
 | Count documents | `SearchClient.get_document_count()` (`/docs/$count`) | Supported (returns bare integer) |
-| Filters | `filter=` | Supported, including nested complex-type paths (`Address/StateProvince`; see Filter below) |
-| Ordering | `orderby=` | Supported (sortable top-level fields only) |
-| Projection | `select=` | Supported (top-level fields only) |
-| Facets | `facets=` | Supported (facetable fields only), with `count:N` / `top:N` limits and the special `$count` facet |
-| Field-specific search | `search_fields=` | Supported (searchable fields only, including nested paths such as `Address/City`; weights accepted but inert) |
-| Search modes | `search_mode=` | Unsupported (explicit `400 UnsupportedQuery`; AND semantics are fixed) |
-| Highlighting | `highlight_fields=`, pre/post tags | Unsupported (explicit) |
+| Filters | `filter=` | Supported, including `in`, `startswith`/`endswith`/`contains` and nested complex-type paths (`Address/StateProvince`; see Filter below) |
+| Ordering | `orderby=` | Supported (sortable top-level fields plus `@search.score`; nulls first ascending, last descending) |
+| Projection | `select=` | Supported (top-level fields only; `*` selects all fields) |
+| Facets | `facets=` | Supported (facetable fields only), with `count:N` / `top:N` limits (single-string and array forms) and the special `$count` facet |
+| Field-specific search | `search_fields=` | Supported (searchable fields only, including nested paths such as `Address/City`; `field^N` weights scale the field's BM25 score) |
+| Search modes | `search_mode=` (`all`/`any`) | Supported (`all`/AND is the emulator default when omitted; Azure defaults to `any`/OR) |
+| Highlighting | `highlight_fields=`, pre/post tags | Supported (searchable fields only; `@search.highlights` with whole-value fragments) |
 | Scoring profiles / parameters / statistics | `scoring_profile=`, ... | Unsupported (explicit) |
 | Semantic queries | `semantic=`, ... | Unsupported (explicit) |
 | Vector queries | `vector_queries=[VectorizedQuery(vector=..., fields=..., k_nearest_neighbors=..., exhaustive=...)]` | Supported (raw-vector kNN; `kind: "text"` vectorizer queries rejected with `400 UnsupportedQuery`) |
 | Vector + full-text hybrid | `search_text=` + `vector_queries=` together | Supported (union of both sides, best score wins; see Known differences) |
 | Vector filter mode | `vector_filter_mode=` (`preFilter`/`postFilter`) + top-level `filter=` | Supported (`postFilter` default; per-query `exhaustive=` supported; `weight=` accepted but inert) |
-| Suggest | `SearchClient.suggest(search_text=..., suggester_name=...)` (`/docs/search.post.suggest`) | Supported (prefix match against the suggester's fields; returns documents + `@search.text`) |
-| Autocomplete | `SearchClient.autocomplete(search_text=..., suggester_name=...)` (`/docs/search.post.autocomplete`) | Supported (prefix match against the suggester's fields; returns `text` + `queryPlusText`) |
-| Analyze text | `SearchIndexClient.analyze_text(...)` (`/search.analyze`) | Supported (Tantivy default analyzer; `analyzerName`/`field` accepted but inert) |
+| Suggest | `SearchClient.suggest(search_text=..., suggester_name=...)` (`/docs/search.post.suggest`) | Supported (prefix/infix match against the suggester's fields; returns documents + `@search.text`) |
+| Autocomplete | `SearchClient.autocomplete(search_text=..., suggester_name=...)` (`/docs/search.post.autocomplete`) | Supported (prefix/infix match against the suggester's fields; returns `text` + `queryPlusText`) |
+| Analyze text | `SearchIndexClient.analyze_text(...)` (`/search.analyze`) | Supported (English analyzer; `keyword`/`whitespace` tokenize as documented; `analyzer`/`field` validated) |
 | Service statistics | `SearchIndexClient.get_service_statistics()` (`/servicestats`) | Supported (static response: zero counters, default limits) |
 | `queryType` other than `simple` | — | Unsupported (explicit) |
 
-The full list of search options rejected with `400 UnsupportedQuery`: `searchMode`, `highlight`, `highlightPreTag`, `highlightPostTag`, `scoringProfile`, `scoringParameters`, `scoringStatistics`, `minimumCoverage`, `answers`, `captions`, `semantic`, `semanticConfiguration`, `semanticQuery`, `semanticErrorHandling`, `semanticMaxWaitInMilliseconds`, `debug`.
+The full list of search options rejected with `400 UnsupportedQuery`: `scoringProfile`, `scoringParameters`, `scoringStatistics`, `minimumCoverage`, `answers`, `captions`, `semantic`, `semanticConfiguration`, `semanticQuery`, `semanticErrorHandling`, `semanticMaxWaitInMilliseconds`, `debug`.
 
-Accepted but inert (silently ignored): `sessionId` (the emulator uses deterministic ordering, so session affinity is irrelevant), per-query `weight` (no weighted fusion; hybrid is union + max-score), and the index-schema `stored` property (no separate stored/retrievable enforcement beyond `retrievable`).
+Accepted but inert (silently ignored): `sessionId` (the emulator uses deterministic score + key tie-breaking, so session affinity is irrelevant), per-query `weight` (no weighted fusion; hybrid is union + max-score), and the index-schema `stored` property (no separate stored/retrievable enforcement beyond `retrievable`).
 
 ### Filter
 
-OData `$filter` with `and` / `or` / `not`, parentheses, `eq` / `ne` / `gt` / `ge` / `lt` / `le` on string, numeric, and boolean values, and collection filtering with `any` / `all` in both the space-separated form (`Tags any t eq 'x'`) and the standard OData lambda form (`Tags/any(t: t eq 'x')`, likewise `all`). Field references may be nested complex-type paths (`Address/StateProvince eq 'FL'`); each path must resolve through complex-type subfields and the final subfield must exist and be marked `filterable`. Invalid syntax, unknown fields, non-filterable fields, and incompatible operators (ordering on booleans or collections, `any`/`all` on non-collections) are rejected with `400 InvalidQuery`.
+OData `$filter` with `and` / `or` / `not`, parentheses, `eq` / `ne` / `gt` / `ge` / `lt` / `le`, `in` (`field in (value, ...)`), the string functions `startswith(field, 'prefix')` / `endswith(field, 'suffix')` / `contains(field, 'substring')` (ordinal, case-sensitive; string fields only), on string, numeric, and boolean values, and collection filtering with `any` / `all` in both the space-separated form (`Tags any t eq 'x'`) and the standard OData lambda form (`Tags/any(t: t eq 'x')`, likewise `all`). Field references may be nested complex-type paths (`Address/StateProvince eq 'FL'`), including paths through collection-of-complex fields (`Rooms/Type eq 'suite'`, with any-element semantics); each path must resolve through complex-type subfields and the final subfield must exist and be marked `filterable`. Lambda bodies that address subfields of the element are rejected. Invalid syntax, unknown fields, non-filterable fields, and incompatible operators (ordering on booleans or collections, `any`/`all` on non-collections, string functions on non-string fields, unsupported functions) are rejected with `400 InvalidQuery`.
 
 ### Ordering, projection, facets
 
-- `orderby`: comma-separated `field [asc|desc]` (or a JSON array). Every field must exist and be marked `sortable`. Missing values sort last; the key field is the final tie-breaker for determinism.
-- `select`: comma-separated field names (or a JSON array). Every field must exist. Only the selected fields are returned per document.
-- `facets`: comma-separated entries or `*` (or a JSON array). Each entry is a field name, optionally followed by `,count:N` (or `,top:N`) to limit the number of returned facet values (e.g. `Category,count:3`). Named fields must exist and be marked `facetable`; `*` expands to all facetable fields. The special `$count` entry reports the total number of documents in the filtered result set as a plain number. Unknown facet options are rejected with `400 InvalidQuery`. Counts are computed over the full filtered result set, ordered by count descending then value ascending.
+- `orderby`: comma-separated `field [asc|desc]` (or a JSON array). Every field must exist and be marked `sortable`; the pseudo-field `@search.score` orders by relevance score instead. Missing values sort first in ascending order and last in descending order (matching Azure); the key field is the final tie-breaker for determinism.
+- `select`: comma-separated field names (or a JSON array). Every field must exist. Only the selected fields are returned per document. The special `*` selects every field, like omitting `select`.
+- `facets`: comma-separated entries or `*` (or a JSON array). Each entry is a field name, optionally followed by `,count:N` (or `,top:N`) to limit the number of returned facet values (e.g. `Category,count:3`; in the single-string form the option attaches to the preceding facet). Named fields must exist and be marked `facetable`; `*` expands to all facetable fields. The special `$count` entry reports the total number of documents in the filtered result set as a plain number. Unknown facet options are rejected with `400 InvalidQuery`. Counts are computed over the full filtered result set, ordered by count descending then value ascending.
   - Note: the pinned Python SDK types `SearchDocumentsResult.facets` as `dict[str, list[FacetResult]]` and cannot deserialize the bare-number `$count` entry (the whole response falls back to a raw dict). The emulator's shape matches Azure; `$count` is therefore exercised over raw HTTP in `tests/e2e/test_emulator.py::test_search_facet_count`.
 
 ### Continuation tokens
 
-When more results exist beyond the returned page, the response includes `@odata.nextLink` (a URL with a `continuation` parameter) and `@search.nextPageParameters` (the next request: original body plus `continuation`, with `skip` advanced). The token is `base64(json{filter, orderby, skip, state_version, vector_query_hash?})`; `state_version` is incremented on every document mutation, and a stale token (index changed since issuance) returns `400 InvalidQuery`. An invalid token also returns `400 InvalidQuery`. When `vectorQueries` is present, the token additionally binds the `vectorQueries` + `vectorFilterMode` identity; changing them mid-paging returns `400 InvalidQuery`. The pinned SDK drops unknown properties when re-POSTing `nextPageParameters`, so paging state is additionally carried in the first-class `skip` property; SDK paging works, but staleness detection applies only when `continuation` is preserved.
+When more results exist beyond the returned page, the response includes `@odata.nextLink` (a URL with a `continuation` parameter) and `@search.nextPageParameters` (the next request: original body plus `continuation`, with `skip` advanced). The token is URL-safe `base64(json{filter, orderby, skip, state_version, vector_query_hash?})`; `state_version` is incremented on every document mutation, and a stale token (index changed since issuance) returns `400 InvalidQuery`. A continuation token encapsulates the result-set state: its `skip`/`filter`/`orderby` win over request parameters, so later pages may send only `{continuation}` (plus a page size) and stay on the same result set. `top` remains a per-request page size; an empty page (e.g. `top=0`) ends the sequence with no further token. An invalid token also returns `400 InvalidQuery`. When `vectorQueries` is present, the token additionally binds the `vectorQueries` + `vectorFilterMode` identity; changing them mid-paging returns `400 InvalidQuery`. The pinned SDK drops unknown properties when re-POSTing `nextPageParameters`, so paging state is additionally carried in the first-class `skip` property; SDK paging works, but staleness detection applies only when `continuation` is preserved.
 
 ### Search semantics
 
-- Token-based full-text match across `searchable: true` **string** fields (all of them, or the `searchFields` subset), using Tantivy's default (English) analyzer (lowercasing and punctuation splitting; no stemming, no stopword removal).
+- Token-based full-text match across `searchable: true` **string** fields (all of them, or the `searchFields` subset), using an English analyzer (lowercasing, punctuation splitting, English stopword removal, English stemming) approximating Azure's basic English analyzer.
 - `*` or an empty term matches all documents.
-- A multi-term search matches a document when **every** required analyzer token matches at least one searchable string field (AND semantics).
-- Simple-query boolean operators: `+term` (required, the default), `-term` (excluded), and `"quoted phrases"` (adjacent tokens). An exclusion-only query matches all documents except the excluded ones.
+- A multi-term search combines required clauses with AND (`searchMode=all`, the emulator default when omitted) or OR (`searchMode=any`); Azure defaults to OR.
+- Simple-query boolean operators: `+term` (required, the default), `-term` (excluded), `"quoted phrases"` (adjacent tokens), and fuzzy terms (`term~` for the default edit distance 2 like Azure, `term~N` for an explicit distance 0-2; larger distances rejected). An exclusion-only query matches all documents except the excluded ones. A clause that analyzes to no tokens (e.g. a stopword-only term) matches nothing.
+- `searchFields` weights (`field^N`, finite positive `N`) scale the field's BM25 contribution to `@search.score`; unknown/non-searchable fields and invalid weights are rejected with `400 InvalidQuery`.
 - Non-string fields are not full-text indexed; searching for a value that only appears in a numeric/boolean field matches nothing.
-- Results are ordered by key field (deterministic), not by relevance. `@search.score` is `1.0` for all full-text results. See `docs/known_differences.md`.
+- Results are ordered by BM25 score descending with the key field as tie-breaker (deterministic). `@search.score` is the BM25 relevance score (higher = more relevant); exact values differ from Azure's internal scoring, so assertions must check ordering, not equality. See `docs/known_differences.md`.
 - When `vectorQueries` is present (and no `orderby`), results are ordered by vector score descending with the key field as tie-breaker. `@search.score` is the similarity score for the query's metric: cosine similarity for `cosine`, the raw inner product for `dotProduct`, `1/(1+l2)` for `euclidean`. Hybrid (vector + full-text) results are the union of both sides, scored by the best (highest) score. `top`/`skip`/`count` apply to the merged set.
 - Newly indexed documents are immediately searchable (synchronous commit + reader reload per batch).
 - Matching is capped at 1,000,000 documents per search (local test-double scale).
@@ -249,7 +251,12 @@ When more results exist beyond the returned page, the response includes `@odata.
   "@odata.count": 2,
   "@search.facets": {"tags": [{"count": 2, "value": "red"}]},
   "value": [
-    {"@search.score": 1.0, "id": "1", "title": "hello world"}
+    {
+      "@search.score": 0.1823216,
+      "@search.highlights": {"title": ["<em>hello</em> world"]},
+      "id": "1",
+      "title": "hello world"
+    }
   ]
 }
 ```
@@ -257,6 +264,8 @@ When more results exist beyond the returned page, the response includes `@odata.
 `@odata.count` is present only when `count=true`. `@search.facets` is present
 only when facets were requested; it is omitted (not JSON null) otherwise, since
 an explicit null breaks the .NET SDK's `SearchResults` deserializer.
+`@search.highlights` is present only for documents with a highlight-field match
+(when `highlight` was requested).
 
 ### Autocomplete and suggest
 
@@ -268,7 +277,7 @@ Request body (as sent by the pinned Python SDK): `{"search": "...", "suggesterNa
 
 Other options the SDKs support on these routes (`filter`, `select`, `searchFields`, `orderby`, fuzzy matching, highlight tags, `autocompleteMode`, `minimumCoverage`) are accepted but inert (see `docs/known_differences.md`).
 
-Matching is case-insensitive prefix matching of the search text against the whitespace-separated words of the suggester's search fields (see `docs/known_differences.md`).
+Matching is case-insensitive prefix or infix matching of the search text against the whitespace-separated words of the suggester's search fields (see `docs/known_differences.md`).
 
 - Autocomplete response: `{"value": [{"text": "...", "queryPlusText": "..."}]}` — distinct completed terms, ordered by first appearance, limited by `top`.
 - Suggest response: `{"value": [{...document fields..., "@search.text": "..."}]}` — matching documents in key order, each with the first matched word in `@search.text`, limited by `top`.
@@ -280,7 +289,7 @@ Matching is case-insensitive prefix matching of the search text against the whit
 | Missing/empty `api-key` header on the Azure surface | `401 AuthenticationFailed` |
 | Any non-empty `api-key` | Accepted (compatibility mechanism, not a security boundary) |
 | Missing `api-version` query parameter | `400 ApiVersionMissing` |
-| `api-version` not in `EMULATOR_API_VERSIONS` | `400 ApiVersionUnsupported` (message lists supported versions) |
+| `api-version` below the acceptance floor (earliest `EMULATOR_API_VERSIONS`) or malformed | `400 ApiVersionUnsupported` (message lists configured versions) |
 
 `GET /health` and `POST /admin/reset` are outside the Azure surface and require no credentials.
 
@@ -297,12 +306,12 @@ Matching is case-insensitive prefix matching of the search text against the whit
 |--------|------|-------------|
 | `401` | `AuthenticationFailed` | Missing/empty `api-key` on the Azure surface |
 | `400` | `ApiVersionMissing` | No `api-version` query parameter |
-| `400` | `ApiVersionUnsupported` | `api-version` not supported |
+| `400` | `ApiVersionUnsupported` | `api-version` below the acceptance floor or malformed |
 | `400` | `InvalidIndex` | Malformed index definition, unsupported field type, wrong key count, duplicate field name, path/body name mismatch on `PUT` |
 | `400` | `InvalidIndexName` | Malformed `indexes('name')` path segment |
-| `400` | `InvalidRequest` | Missing or invalid JSON request body |
+| `400` | `InvalidRequest` | Missing or invalid JSON request body; analyze-text with an unknown `analyzer` or `field` |
 | `400` | `InvalidDocuments` | Document batch is not an array or `{"value": [...]}` object |
-| `400` | `InvalidQuery` | Search body is not a JSON object; `top`/`skip` not non-negative integers; invalid search text, filter, orderby, select, facets, or searchFields; stale or invalid continuation token; autocomplete/suggest missing `search`/`suggesterName`, empty search text, unknown suggester, or invalid `top` |
+| `400` | `InvalidQuery` | Search body is not a JSON object; `top`/`skip` not non-negative integers; invalid search text (incl. bad fuzzy distance), `searchMode`, filter (incl. `in`, string functions), orderby, select, facets, searchFields (incl. bad weights), or highlight options; stale or invalid continuation token; autocomplete/suggest missing `search`/`suggesterName`, empty search text, unknown suggester, or invalid `top` |
 | `400` | `InvalidSynonymMap` | Missing/empty synonym-map name, format other than `solr`, empty synonyms, malformed `synonymmaps('name')` path segment, path/body name mismatch on `PUT` |
 | `400` | `InvalidAlias` | Missing/empty alias name, missing/empty `indexes`, malformed `aliases('name')` path segment, path/body name mismatch on `PUT` |
 | `400` | `InvalidKnowledgeSource` | Missing/empty source name or `kind`, missing `searchIndexParameters.searchIndexName` for searchIndex sources, malformed `knowledgesources('name')` path segment, path/body name mismatch on `PUT` |
@@ -310,9 +319,9 @@ Matching is case-insensitive prefix matching of the search text against the whit
 | `400` | `UnsupportedQuery` | Unsupported search option or `queryType` |
 | `400` | `UnsupportedAction` | Unknown document action (only `upload`, `merge`, `mergeOrUpload`, `delete` are supported) |
 | `404` | `ResourceNotFound` | Get/delete/upload/search/autocomplete/suggest/get-document/retrieve on a missing index, document, synonym map, alias, knowledge source, or knowledge base |
-| `409` | `IndexAlreadyExists` | `POST /indexes` with an existing name |
+| `409` | `IndexAlreadyExists` | `POST /indexes` with an existing name, or a name taken by an alias |
 | `409` | `SynonymMapAlreadyExists` | `POST /synonymmaps` with an existing name |
-| `409` | `AliasAlreadyExists` | `POST /aliases` with an existing name |
+| `409` | `AliasAlreadyExists` | `POST /aliases` with an existing name, or a name taken by an index |
 | `409` | `KnowledgeSourceAlreadyExists` | `POST /knowledgesources` with an existing name |
 | `409` | `KnowledgeBaseAlreadyExists` | `POST /knowledgebases` with an existing name |
 | `500` | `InternalError` | Search engine failure |
@@ -331,16 +340,16 @@ Matching is case-insensitive prefix matching of the search text against the whit
 | Index create/get/list/update/delete | `tests/contract/index_management.rs` | `service`, `storage` | `test_emulator.py`, `tests/sdk/` | `E2ETests`, `SdkTests.IndexCrud` |
 | Synonym map create/update/get/list/delete, auth, validation, reset | `tests/contract/synonym_maps.rs` | `service` | `tests/sdk/`, `tests/ms_samples/` (`sample_index_synonym_map_crud.py`) | `SdkTests.SynonymMapCrud` |
 | Document upload/merge/mergeOrUpload/delete, per-document errors, batch shapes, get-document, document count, GeographyPoint values | `tests/contract/document_management.rs` | `service` | `tests/sdk/` | `SdkTests` (upload/merge/delete/count), `E2ETests.UploadAndSearch` |
-| Search shape, count, match-all, boolean operators, empty text, searchFields, facet options (incl. `$count` via raw HTTP), analyze text, service stats, unsupported-option rejection | `tests/contract/search.rs` | `query`, `service` | `tests/sdk/`, `test_emulator.py` (`$count`) | `SdkTests`, `E2ETests` (incl. `$count` via raw HTTP) |
-| Filters, including nested complex-type paths and collection `any`/`all` | `tests/contract/filtering.rs` | `filter`, `service` | `tests/sdk/` | `SdkTests.SearchFilter`, `SearchCollectionAnyAll` |
+| Search shape, count, match-all, boolean operators, fuzzy terms (incl. default distance 2), searchMode, stemming/stopwords, BM25 scores + ordering (incl. `@search.score`), highlights, empty text, searchFields (incl. weights), `select=*`, facet options (incl. `$count` via raw HTTP, string-form options), analyze text (incl. analyzer/field validation, keyword/whitespace), service stats | `tests/contract/search.rs` | `query`, `service` | `tests/sdk/`, `test_emulator.py` (`$count`) | `SdkTests`, `E2ETests` (incl. `$count` via raw HTTP) |
+| Filters, including `in`, string functions, nested complex-type and collection-of-complex paths and collection `any`/`all` | `tests/contract/filtering.rs` | `filter`, `service` | `tests/sdk/` | `SdkTests.SearchFilter`, `SearchCollectionAnyAll` |
 | Complex-type schema, documents, filters, collection-of-complex | `tests/contract/complex_fields.rs` | `service` | `tests/sdk/` | `SdkTests.ComplexTypeFilter`, `CollectionOfComplexType` |
-| Ordering (multi-field), projection, facets | `tests/contract/search.rs` | `service` | `tests/sdk/` | `SdkTests.SearchOrderBy`, `SearchSelect`, `SearchFacets` |
-| Continuation tokens (nextLink, staleness) | `tests/contract/pagination.rs` | `service` | `tests/sdk/` (`by_page()`) | `SdkTests.SearchPaging` (`AsPages()`) |
-| Autocomplete, suggest (prefix match, suggester validation, auth) | `tests/contract/suggest_autocomplete.rs` | `service`, `storage` | `tests/sdk/`, `tests/ms_samples/` (`sample_query_autocomplete.py`, `sample_query_suggestions.py`) | `SdkTests.SuggestAndAutocomplete` |
+| Ordering (multi-field, nulls-first-asc/last-desc), projection, facets | `tests/contract/search.rs` | `service` | `tests/sdk/` | `SdkTests.SearchOrderBy`, `SearchSelect`, `SearchFacets` |
+| Continuation tokens (nextLink, staleness, continuation-only requests, `top=0`) | `tests/contract/pagination.rs` | `service` | `tests/sdk/` (`by_page()`) | `SdkTests.SearchPaging` (`AsPages()`) |
+| Autocomplete, suggest (prefix/infix match, suggester validation, auth) | `tests/contract/suggest_autocomplete.rs` | `service`, `storage` | `tests/sdk/`, `tests/ms_samples/` (`sample_query_autocomplete.py`, `sample_query_suggestions.py`) | `SdkTests.SuggestAndAutocomplete` |
 | Vector search (schema, document validation, vector/hybrid, filter modes, exhaustive, dotProduct/euclidean metrics, non-retrievable, multi-query, vector+orderby) | `tests/contract/vector_search.rs` | `vector`, `service` | `tests/sdk/test_vectors.py`, `test_emulator.py` (RAG flow) | `VectorSearchTests`, `E2ETests.RagStyleVectorAndHybridFlow` |
-| Index aliases (CRUD, validation, auth, reset) | `tests/contract/aliases_knowledge.rs` | `service` | `tests/sdk/`, `tests/ms_samples/` (`sample_index_alias_crud.py`) | `SdkTests.AliasCrud` |
+| Index aliases (CRUD, validation incl. PUT, auth, reset, data-plane resolution, index/alias namespace conflicts) | `tests/contract/aliases_knowledge.rs` | `service` | `tests/sdk/`, `tests/ms_samples/` (`sample_index_alias_crud.py`) | `SdkTests.AliasCrud` |
 | Knowledge sources/bases + retrieval (CRUD, validation, auth, reset, empty retrieval) | `tests/contract/aliases_knowledge.rs` | `service` | `tests/sdk/`, `tests/ms_samples/` (`sample_agentic_retrieval.py`) | `SdkTests.KnowledgeSourceCrud`, `KnowledgeBaseCrud`, `KnowledgeBaseRetrieveReturnsEmpty` |
-| Auth, API version, 404s, error structure | `tests/contract/errors.rs` | `version` | `test_emulator.py` | `E2ETests`, `SdkTests.ErrorBodyIsAzureStructured` |
+| Auth, API version (incl. floor acceptance), 404s, error structure | `tests/contract/errors.rs` | `version` | `test_emulator.py` | `E2ETests`, `SdkTests.ErrorBodyIsAzureStructured` |
 | Admin reset, health | `tests/contract/admin.rs` | — | `test_emulator.py` | `E2ETests.HealthEndpoint` (reset runs before each test) |
 | Wire-format compatibility (Python-captured fixtures) | — | — | `fixtures/` (captured) | `FixtureReplayTests` (replays `fixtures/`) |
 | Configuration parsing | — | `config` | — |

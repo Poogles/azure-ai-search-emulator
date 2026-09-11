@@ -376,3 +376,79 @@ async fn collection_of_complex_rejects_unknown_subfield() {
         "expected per-document failure: {item}"
     );
 }
+
+#[tokio::test]
+async fn filter_on_collection_of_complex_path_matches_any_element() {
+    let app = app();
+    let uri = format!("/indexes?api-version={API_VERSION}");
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            &uri,
+            Some(API_KEY),
+            Some(json!({
+                "name": "hotels",
+                "fields": [
+                    {"name": "HotelId", "type": "Edm.String", "key": true},
+                    {
+                        "name": "Rooms",
+                        "type": "Edm.Collection(Edm.ComplexType)",
+                        "fields": [
+                            {"name": "Type", "type": "Edm.String", "filterable": true},
+                            {"name": "Rate", "type": "Edm.Double", "filterable": true}
+                        ]
+                    }
+                ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        upload_request(
+            "hotels",
+            json!([
+                {
+                    "@search.action": "upload",
+                    "document": {
+                        "HotelId": "1",
+                        "Rooms": [{"Type": "standard", "Rate": 80.0}, {"Type": "suite", "Rate": 200.0}]
+                    }
+                },
+                {
+                    "@search.action": "upload",
+                    "document": {"HotelId": "2", "Rooms": [{"Type": "standard", "Rate": 90.0}]}
+                }
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A direct path through the collection matches when any element matches.
+    let (status, body) = call(
+        app.clone(),
+        search_request(
+            "hotels",
+            json!({"search": "*", "filter": "Rooms/Type eq 'suite'"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "filter rejected: {body}");
+    assert_eq!(body["value"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["value"][0]["HotelId"], "1");
+
+    let (status, body) = call(
+        app,
+        search_request(
+            "hotels",
+            json!({"search": "*", "filter": "Rooms/Rate gt 100"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "filter rejected: {body}");
+    assert_eq!(body["value"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["value"][0]["HotelId"], "1");
+}

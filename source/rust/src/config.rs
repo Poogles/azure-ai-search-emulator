@@ -155,7 +155,9 @@ impl Config {
 
     #[must_use]
     pub fn supports_api_version(&self, version: &str) -> bool {
-        self.api_versions.iter().any(|v| v == version)
+        // The floor rule lives in exactly one place (`VersionAdapter`); this
+        // stays in sync with request-time validation by delegating to it.
+        crate::version::VersionAdapter::new(self.api_versions.clone()).is_supported(version)
     }
 }
 
