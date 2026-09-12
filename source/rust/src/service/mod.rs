@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 use crate::error::ApiError;
 use crate::filter::{self, FilterExpr};
 use crate::query::{
-    parse_search_text, Clause, FullTextQuery, QueryError, SearchEngine, SearchMode,
+    parse_search_text, Clause, FullTextQuery, QueryError, QueryType, SearchEngine, SearchMode,
 };
 use crate::storage::{
     Document, FieldDefinition, IndexDefinition, Storage, StorageError, Suggester,
@@ -93,6 +93,8 @@ pub enum ActionKind {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SearchQuery {
     pub search: Option<String>,
+    /// The `queryType`: `simple` (the default) or `full` (Lucene).
+    pub query_type: QueryType,
     /// How multi-term required clauses combine (`searchMode`).
     pub search_mode: SearchMode,
     pub count: bool,
@@ -218,9 +220,82 @@ pub struct Suggestion {
     pub text: String,
 }
 
+/// One parsed Solr synonym rule: `inputs` (matched query terms) rewrite to
+/// `outputs` (additional indexed/query terms). For `a,b,c` every term is both
+/// an input and an output; for `a => b` only `a` is an input. Multi-word
+/// sides contribute each word separately; matching and expansion are
+/// case-insensitive (terms are analyzed with the query field's analyzer at
+/// search time, so stemming and stopwords apply consistently).
+#[derive(Debug, Clone, PartialEq)]
+struct SynonymRule {
+    inputs: Vec<String>,
+    outputs: Vec<String>,
+}
+
+/// Parses Solr synonym-map rules: one rule per line, either equivalent terms
+/// (`USA, United States, America`) or an explicit mapping (`Washington,
+/// Wash. => WA`). Blank lines are skipped.
+///
+/// # Errors
+///
+/// Returns an error string when a rule is empty, has an empty side, or
+/// contains an empty term.
+fn parse_synonym_rules(synonyms: &str) -> Result<Vec<SynonymRule>, String> {
+    let mut rules = Vec::new();
+    for (index, line) in synonyms.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let rule_no = index + 1;
+        let (inputs, outputs) = if let Some((left, right)) = line.split_once("=>") {
+            let inputs = split_synonym_terms(left, rule_no)?;
+            let outputs = split_synonym_terms(right, rule_no)?;
+            (inputs, outputs)
+        } else {
+            let terms = split_synonym_terms(line, rule_no)?;
+            (terms.clone(), terms)
+        };
+        if inputs.is_empty() || outputs.is_empty() {
+            return Err(format!(
+                "Synonym rule {rule_no} {line:?} has an empty side; each side needs at least one term."
+            ));
+        }
+        rules.push(SynonymRule { inputs, outputs });
+    }
+    Ok(rules)
+}
+
+/// Splits one side of a synonym rule into lowercase terms: comma-separated
+/// phrases, each split on whitespace.
+fn split_synonym_terms(side: &str, rule_no: usize) -> Result<Vec<String>, String> {
+    let mut terms = Vec::new();
+    for phrase in side.split(',') {
+        let mut words = 0;
+        for word in phrase.split_whitespace() {
+            if word.is_empty() {
+                continue;
+            }
+            words += 1;
+            terms.push(word.to_lowercase());
+        }
+        if words == 0 {
+            return Err(format!(
+                "Synonym rule {rule_no} has an empty term; terms must be non-empty."
+            ));
+        }
+    }
+    if terms.is_empty() {
+        return Err(format!(
+            "Synonym rule {rule_no} has an empty side; each side needs at least one term."
+        ));
+    }
+    Ok(terms)
+}
+
 /// A synonym map: a named collection of synonym rules in Solr format.
-/// Synonym maps are stored and echoed but inert: they do not affect search
-/// results (see `docs/known_differences.md`).
+/// Synonym maps apply to search: query terms matching a rule's inputs also
+/// match its outputs (see `docs/supported_operations.md`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SynonymMap {
     pub name: String,
@@ -228,6 +303,8 @@ pub struct SynonymMap {
     pub format: String,
     /// The synonym rules joined by newlines (the wire format the SDKs use).
     pub synonyms: String,
+    /// The parsed rules, for query-time expansion.
+    rules: Vec<SynonymRule>,
     /// Opaque entity tag, bumped on every create or update.
     pub etag: String,
 }
@@ -695,7 +772,7 @@ impl SearchService {
                 format!("A synonym map with name {name:?} already exists."),
             ));
         }
-        Ok(self.insert_synonym_map(&mut maps, name, format, synonyms))
+        self.insert_synonym_map(&mut maps, name, format, synonyms)
     }
 
     /// Creates or replaces a synonym map. Replacing a map issues a new etag.
@@ -715,7 +792,7 @@ impl SearchService {
             .synonym_maps
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(self.insert_synonym_map(&mut maps, name, format, synonyms))
+        self.insert_synonym_map(&mut maps, name, format, synonyms)
     }
 
     /// Returns a clone of the synonym map with the given name.
@@ -731,6 +808,28 @@ impl SearchService {
         maps.get(name)
             .cloned()
             .ok_or_else(|| ApiError::not_found(format!("Synonym map {name:?} was not found.")))
+    }
+
+    /// Returns the raw synonym outputs for a query word: the union of outputs
+    /// from all rules (across all service-level maps) with a matching input
+    /// (case-insensitive), excluding the word itself. All maps apply to every
+    /// search (the emulator does not track per-field map associations).
+    fn synonym_expansions(&self, word: &str) -> Vec<String> {
+        let lowered = word.to_lowercase();
+        let maps = self
+            .synonym_maps
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut outputs = std::collections::BTreeSet::new();
+        for map in maps.values() {
+            for rule in &map.rules {
+                if rule.inputs.iter().any(|input| input == &lowered) {
+                    outputs.extend(rule.outputs.iter().cloned());
+                }
+            }
+        }
+        outputs.remove(&lowered);
+        outputs.into_iter().collect()
     }
 
     /// Returns clones of all synonym maps, sorted by name.
@@ -768,7 +867,10 @@ impl SearchService {
         name: &str,
         format: &str,
         synonyms: &str,
-    ) -> SynonymMap {
+    ) -> Result<SynonymMap, ApiError> {
+        let rules = parse_synonym_rules(synonyms).map_err(|e| {
+            ApiError::bad_request("InvalidSynonymMap", format!("Invalid synonym rules: {e}"))
+        })?;
         let etag = self
             .synonym_map_etags
             .fetch_add(1, Ordering::SeqCst)
@@ -777,10 +879,11 @@ impl SearchService {
             name: name.to_owned(),
             format: format.to_owned(),
             synonyms: synonyms.to_owned(),
+            rules,
             etag,
         };
         maps.insert(name.to_owned(), map.clone());
-        map
+        Ok(map)
     }
 
     // ------------------------------------------------------------------
@@ -1265,14 +1368,14 @@ impl SearchService {
                 ));
             }
         }
-        if let Some(query_type) = obj.get("queryType").and_then(Value::as_str) {
-            if query_type != "simple" {
-                return Err(ApiError::unsupported(
-                    "UnsupportedQuery",
-                    format!("queryType {query_type:?} is not supported by the emulator."),
-                ));
-            }
-        }
+        // `queryType`: `simple` (the default) or `full` (Lucene syntax,
+        // parsed by the engine's query parser).
+        let query_type = match obj.get("queryType").and_then(Value::as_str) {
+            Some(value) => QueryType::parse(value).map_err(|e| {
+                ApiError::bad_request("InvalidQuery", format!("Invalid queryType: {e}"))
+            })?,
+            None => QueryType::Simple,
+        };
 
         let search = obj.get("search").and_then(Value::as_str).map(str::to_owned);
         // The search text itself is parsed once, in `prepare_full_text` when
@@ -1328,6 +1431,7 @@ impl SearchService {
 
         Ok(SearchQuery {
             search,
+            query_type,
             search_mode,
             count,
             top,
@@ -1370,7 +1474,7 @@ impl SearchService {
         let (skip, filter, orderby) =
             Self::resolve_paging(query, &definition, current_vector_hash)?;
 
-        let full_text = prepare_full_text(query)?;
+        let full_text = prepare_full_text(self, query)?;
         let vector_active = !query.vector_queries.is_empty();
         let full_text_active = !full_text.is_match_all();
 
@@ -1455,7 +1559,7 @@ impl SearchService {
             .collect();
         // Highlight fragments for the returned page, when `highlight`
         // fields were requested.
-        let highlights = page_highlights(query, &full_text, &page);
+        let highlights = page_highlights(query, &full_text, &definition, &page);
         // Vectors with `retrievable: false` are searchable but omitted from
         // the response unless explicitly selected (same as Azure).
         let hidden: BTreeSet<&str> = definition
@@ -1834,23 +1938,54 @@ impl SearchService {
         alias.target_index().unwrap_or_else(|| name.to_owned())
     }
 
-    /// Analyzer names accepted by the analyze-text endpoint. `keyword` and
-    /// `whitespace` tokenize as Azure documents them (single verbatim token;
-    /// whitespace split without lowercasing); every other listed analyzer
-    /// maps to the emulator's English analyzer (lowercasing, punctuation
-    /// splitting, English stopword removal, English stemming). Unknown names
-    /// are rejected explicitly rather than silently mapped.
+    /// Analyzer names accepted by the analyze-text endpoint (see
+    /// [`crate::query::analyzer_tokenizer_name`] for the mapping): the
+    /// standard/English aliases, `keyword` (single verbatim token),
+    /// `whitespace` (whitespace split, no lowercasing), `alphanum`
+    /// (punctuation split, no lowercasing), `latin` (lowercasing only),
+    /// `ngram` / `edgeNgram` (character n-grams), CJK (bigrams), and the
+    /// `*.microsoft` language analyzers. Unknown names are rejected
+    /// explicitly rather than silently mapped.
     const KNOWN_ANALYZERS: &'static [&'static str] = &[
         "standard",
         "standard.lucene",
         "standard.asciiFolding",
         "keyword",
         "whitespace",
+        "alphanum",
+        "latin",
+        "ngram",
+        "ngram.microsoft",
+        "ngram.lucene",
+        "edgeNgram",
+        "edgeNgram.microsoft",
+        "edgeNgram.lucene",
         "simple",
         "classic",
         "stop",
         "en.microsoft",
         "en.lucene",
+        "chinese",
+        "japanese",
+        "korean",
+        "thai",
+        "vietnamese",
+        "ar.microsoft",
+        "da.microsoft",
+        "de.microsoft",
+        "el.microsoft",
+        "es.microsoft",
+        "fi.microsoft",
+        "fr.microsoft",
+        "hu.microsoft",
+        "it.microsoft",
+        "nl.microsoft",
+        "no.microsoft",
+        "pt.microsoft",
+        "ro.microsoft",
+        "ru.microsoft",
+        "sv.microsoft",
+        "tr.microsoft",
     ];
 
     /// Validates analyze-text parameters against the index schema: `field`,
@@ -2951,21 +3086,40 @@ fn resolve_field_values<'a>(fields: &'a Map<String, Value>, path: &str) -> Vec<&
 }
 
 /// Builds the engine-level full-text query for a search: parses the search
-/// text and applies the request's `searchMode` and `searchFields` (names plus
-/// `field^N` boosts).
+/// text (simple-query clauses, or raw Lucene text for `queryType=full`),
+/// attaches synonym expansions for single-term clauses, and applies the
+/// request's `searchMode` and `searchFields` (names plus `field^N` boosts).
 ///
 /// # Errors
 ///
 /// Returns an [`ApiError`] (`400 InvalidQuery`) when the search text is
 /// malformed.
-fn prepare_full_text(query: &SearchQuery) -> Result<FullTextQuery, ApiError> {
-    let mut full_text = match &query.search {
-        Some(text) => parse_search_text(text).map_err(|e| {
+fn prepare_full_text(
+    service: &SearchService,
+    query: &SearchQuery,
+) -> Result<FullTextQuery, ApiError> {
+    let mut full_text = match (&query.search, query.query_type) {
+        (Some(text), QueryType::Full) => FullTextQuery {
+            lucene: Some(text.clone()),
+            ..FullTextQuery::default()
+        },
+        (Some(text), QueryType::Simple) => parse_search_text(text).map_err(|e| {
             ApiError::bad_request("InvalidQuery", format!("Invalid search text: {e}"))
         })?,
-        None => FullTextQuery::default(),
+        (None, _) => FullTextQuery::default(),
     };
     full_text.mode = query.search_mode;
+    // Synonym expansions for single-term clauses (fuzzy terms and phrases do
+    // not expand). Each pair is `(raw term, raw expansions)`; the engine
+    // analyzes both sides per field.
+    for clause in &full_text.required {
+        if let Clause::Term(term) = clause {
+            let expansions = service.synonym_expansions(term);
+            if !expansions.is_empty() {
+                full_text.synonyms.push((term.clone(), expansions));
+            }
+        }
+    }
     if !query.search_fields.is_empty() {
         full_text.fields = Some(query.search_fields.iter().map(|f| f.name.clone()).collect());
         full_text.boosts = query
@@ -2983,18 +3137,20 @@ fn prepare_full_text(query: &SearchQuery) -> Result<FullTextQuery, ApiError> {
 fn page_highlights(
     query: &SearchQuery,
     full_text: &FullTextQuery,
+    definition: &IndexDefinition,
     page: &[(Document, f32)],
 ) -> BTreeMap<String, BTreeMap<String, Vec<String>>> {
     if query.highlight_fields.is_empty() {
         return BTreeMap::new();
     }
-    let terms = highlight_query_terms(full_text);
+    let raw_terms = highlight_raw_terms(full_text);
     page.iter()
         .filter_map(|(doc, _)| {
             let fields = highlight_document(
                 doc,
                 &query.highlight_fields,
-                &terms,
+                definition,
+                &raw_terms,
                 &query.highlight_pre_tag,
                 &query.highlight_post_tag,
             );
@@ -3017,37 +3173,74 @@ fn field_words(value: &Value) -> Vec<String> {
     }
 }
 
-/// Collects the analyzed query terms from a full-text query's required
-/// clauses (terms, fuzzy terms, and phrase tokens), for highlight matching.
-/// Excluded clauses never highlight.
-fn highlight_query_terms(query: &FullTextQuery) -> BTreeSet<String> {
-    let mut terms = BTreeSet::new();
+/// Collects the raw (unanalyzed) query terms from a full-text query, for
+/// highlight matching. For simple queries this is the required clauses'
+/// terms, fuzzy terms, and phrase texts (excluded clauses never highlight).
+/// For Lucene queries it is the candidate terms extracted from the query
+/// text. Each term is analyzed with the highlight field's own analyzer at
+/// highlight time (see [`highlight_document`]).
+fn highlight_raw_terms(query: &FullTextQuery) -> Vec<String> {
+    if let Some(text) = &query.lucene {
+        return crate::query::lucene_query_terms(text);
+    }
+    let mut terms = Vec::new();
     for clause in &query.required {
         match clause {
             Clause::Term(term) | Clause::FuzzyTerm { term, .. } => {
-                terms.extend(crate::query::analyze(term));
+                terms.push(term.clone());
             }
             Clause::Phrase(phrase) => {
-                terms.extend(crate::query::analyze(phrase));
+                terms.push(phrase.clone());
             }
         }
     }
     terms
 }
 
-/// Wraps the words of `text` that match the analyzed query `terms` with the
-/// highlight tags, preserving the original text (including spacing and
-/// casing). Matching is analyzer-aware, so inflected forms highlight. Returns
-/// `None` when no word matches.
-fn highlight_text(
+/// Upper bound on the number of highlight fragments returned per field,
+/// approximating Azure's excerpt count.
+const MAX_HIGHLIGHT_FRAGMENTS: usize = 3;
+
+/// Splits `text` into sentences: a sentence ends at a sentence terminator
+/// (`.`, `!`, `?`, or a newline) followed by whitespace or the end of the
+/// text. Text without terminators is a single sentence. The terminator stays
+/// with its sentence.
+fn split_sentences(text: &str) -> Vec<&str> {
+    let mut sentences = Vec::new();
+    let mut start = 0usize;
+    let chars: Vec<char> = text.chars().collect();
+    let mut offset = 0usize;
+    for (i, &c) in chars.iter().enumerate() {
+        let is_terminator = matches!(c, '.' | '!' | '?' | '\n' | '\r');
+        if !is_terminator {
+            offset += c.len_utf8();
+            continue;
+        }
+        let next_is_boundary = chars.get(i + 1).is_none_or(|next| next.is_whitespace());
+        if next_is_boundary {
+            let end = offset + c.len_utf8();
+            sentences.push(&text[start..end]);
+            start = end;
+        }
+        offset += c.len_utf8();
+    }
+    if start < text.len() {
+        sentences.push(&text[start..]);
+    }
+    sentences
+}
+
+/// Wraps the words of `text` whose analyzed form (under `analyzer`) is in
+/// `terms` with the highlight tags, preserving the original text (including
+/// spacing and casing). Matching is analyzer-aware, so inflected forms
+/// highlight. Returns the wrapped text and whether any word matched.
+fn wrap_matched_words(
     text: &str,
     terms: &BTreeSet<String>,
+    analyzer: Option<&str>,
     pre_tag: &str,
     post_tag: &str,
-) -> Option<String> {
-    if terms.is_empty() {
-        return None;
-    }
+) -> (String, bool) {
     let mut out = String::new();
     let mut matched = false;
     // `split_inclusive` keeps each word glued to its trailing whitespace so
@@ -3058,7 +3251,7 @@ fn highlight_text(
             .unwrap_or(segment.len());
         let (word, rest) = segment.split_at(split);
         if !word.is_empty()
-            && crate::query::analyze(word)
+            && crate::query::analyze_with(word, analyzer)
                 .iter()
                 .any(|token| terms.contains(token))
         {
@@ -3071,38 +3264,82 @@ fn highlight_text(
         }
         out.push_str(rest);
     }
-    matched.then_some(out)
+    (out, matched)
+}
+
+/// Computes the highlighted sentence-window fragments of `text` for the
+/// query terms analyzed with `analyzer`: each sentence containing a match is
+/// one fragment (matched words wrapped in tags), in order of appearance, up
+/// to [`MAX_HIGHLIGHT_FRAGMENTS`]. Returns `None` when no sentence matches.
+fn highlight_fragments(
+    text: &str,
+    terms: &BTreeSet<String>,
+    analyzer: Option<&str>,
+    pre_tag: &str,
+    post_tag: &str,
+) -> Option<Vec<String>> {
+    if terms.is_empty() {
+        return None;
+    }
+    let mut fragments = Vec::new();
+    for sentence in split_sentences(text) {
+        let (highlighted, matched) =
+            wrap_matched_words(sentence, terms, analyzer, pre_tag, post_tag);
+        if matched {
+            fragments.push(highlighted);
+            if fragments.len() >= MAX_HIGHLIGHT_FRAGMENTS {
+                break;
+            }
+        }
+    }
+    (!fragments.is_empty()).then_some(fragments)
 }
 
 /// Computes a document's `@search.highlights` value: one entry per highlight
-/// field that contains a query term, each with the highlighted fragments (one
-/// per matching string value).
+/// field that contains a query term, each with its highlighted sentence-window
+/// fragments. Query terms are analyzed with the field's own analyzer, so a
+/// `keyword`-analyzed field highlights its verbatim value and an
+/// English-analyzed field highlights stemmed forms.
 fn highlight_document(
     doc: &Document,
     fields: &[String],
-    terms: &BTreeSet<String>,
+    definition: &IndexDefinition,
+    raw_terms: &[String],
     pre_tag: &str,
     post_tag: &str,
 ) -> BTreeMap<String, Vec<String>> {
     let mut out = BTreeMap::new();
     for field in fields {
+        let analyzer = definition
+            .field_path(field)
+            .and_then(|f| f.analyzer.as_deref());
+        let terms: BTreeSet<String> = raw_terms
+            .iter()
+            .flat_map(|term| crate::query::analyze_with(term, analyzer))
+            .collect();
+        if terms.is_empty() {
+            continue;
+        }
         // A highlight path may resolve to several values (a collection field
         // or a path through a collection-of-complex field); every string
-        // value with a query-term match contributes a fragment.
-        let mut strings: Vec<&str> = Vec::new();
-        for value in resolve_field_values(&doc.fields, field) {
-            match value {
-                Value::String(text) => strings.push(text.as_str()),
-                Value::Array(items) => {
-                    strings.extend(items.iter().filter_map(Value::as_str));
-                }
-                _ => {}
-            }
-        }
+        // value with a query-term match contributes fragments.
         let mut fragments = Vec::new();
-        for text in strings {
-            if let Some(fragment) = highlight_text(text, terms, pre_tag, post_tag) {
-                fragments.push(fragment);
+        for value in resolve_field_values(&doc.fields, field) {
+            let texts: Vec<&str> = match value {
+                Value::String(text) => vec![text.as_str()],
+                Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
+                _ => Vec::new(),
+            };
+            for text in texts {
+                if let Some(sentence_fragments) =
+                    highlight_fragments(text, &terms, analyzer, pre_tag, post_tag)
+                {
+                    fragments.extend(sentence_fragments);
+                }
+            }
+            if fragments.len() >= MAX_HIGHLIGHT_FRAGMENTS {
+                fragments.truncate(MAX_HIGHLIGHT_FRAGMENTS);
+                break;
             }
         }
         if !fragments.is_empty() {
@@ -3117,6 +3354,9 @@ fn engine_error(index: &str, error: QueryError) -> ApiError {
     match error {
         QueryError::IndexNotFound(name) => {
             ApiError::not_found(format!("Index {name:?} was not found."))
+        }
+        QueryError::InvalidQuery(message) => {
+            ApiError::bad_request("InvalidQuery", format!("Invalid search text: {message}"))
         }
         QueryError::Engine(message) => {
             ApiError::internal(format!("Search failed for index {index:?}: {message}"))
@@ -3444,7 +3684,8 @@ fn validate_subfields(field: &FieldDefinition) -> Result<(), ApiError> {
 }
 
 /// Validates a synonym-map definition: a non-empty name, the `solr` format
-/// (the only format Azure supports), and at least one non-blank synonym rule.
+/// (the only format Azure supports), and well-formed synonym rules (at least
+/// one non-blank rule; every rule needs non-empty sides and terms).
 fn validate_synonym_map(name: &str, format: &str, synonyms: &str) -> Result<(), ApiError> {
     if name.is_empty() {
         return Err(ApiError::bad_request(
@@ -3458,13 +3699,17 @@ fn validate_synonym_map(name: &str, format: &str, synonyms: &str) -> Result<(), 
             format!("Synonym map format {format:?} is not supported; only \"solr\" is supported."),
         ));
     }
-    if synonyms.trim().is_empty() {
-        return Err(ApiError::bad_request(
+    match parse_synonym_rules(synonyms) {
+        Ok(rules) if !rules.is_empty() => Ok(()),
+        Ok(_) => Err(ApiError::bad_request(
             "InvalidSynonymMap",
             "The synonym map must contain at least one synonym rule.",
-        ));
+        )),
+        Err(e) => Err(ApiError::bad_request(
+            "InvalidSynonymMap",
+            format!("Invalid synonym rules: {e}"),
+        )),
     }
-    Ok(())
 }
 
 fn validate_document(definition: &IndexDefinition, document: &Value) -> Result<Document, String> {
@@ -4950,5 +5195,63 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["value"], "red");
         assert_eq!(entries[0]["count"], 2);
+    }
+
+    #[test]
+    fn synonym_rules_parse_solr_format() {
+        let rules = ok(parse_synonym_rules("USA, United States\nWashington => WA"));
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].inputs, vec!["usa", "united", "states"]);
+        assert_eq!(rules[0].outputs, vec!["usa", "united", "states"]);
+        assert_eq!(rules[1].inputs, vec!["washington"]);
+        assert_eq!(rules[1].outputs, vec!["wa"]);
+        // Blank lines are skipped.
+        assert_eq!(ok(parse_synonym_rules("\n  \na, b\n")).len(), 1);
+        // Empty rules, sides, and terms are rejected.
+        assert!(parse_synonym_rules("").is_ok());
+        assert!(parse_synonym_rules("   ").is_ok());
+        assert!(parse_synonym_rules("a, => b").is_err());
+        assert!(parse_synonym_rules("=> b").is_err());
+        assert!(parse_synonym_rules("a =>").is_err());
+        assert!(parse_synonym_rules("a,,b").is_err());
+    }
+
+    #[test]
+    fn synonym_expansions_match_case_insensitively() {
+        let service = service();
+        ok(service.create_synonym_map("m", "solr", "USA, United States\nWA => Washington"));
+        assert_eq!(service.synonym_expansions("usa"), vec!["states", "united"]);
+        assert_eq!(service.synonym_expansions("USA"), vec!["states", "united"]);
+        assert_eq!(service.synonym_expansions("states"), vec!["united", "usa"]);
+        // Explicit mappings only expand from the left side.
+        assert_eq!(service.synonym_expansions("wa"), vec!["washington"]);
+        assert!(service.synonym_expansions("washington").is_empty());
+        assert!(service.synonym_expansions("unknown").is_empty());
+    }
+
+    #[test]
+    fn synonym_search_expands_query_terms() {
+        let service = service();
+        ok(service.create_index(&index_body()));
+        upload(
+            &service,
+            vec![
+                json!({"id": "1", "title": "hotels in Washington"}),
+                json!({"id": "2", "title": "flights to Boston"}),
+            ],
+        );
+        ok(service.create_synonym_map("m", "solr", "WA, Washington"));
+        // "wa" matches document 1 via the "washington" expansion.
+        let query = ok(service.parse_search("items", &json!({"search": "wa"})));
+        let outcome = ok(service.search("items", &query));
+        let keys: Vec<&str> = outcome.documents.iter().map(|d| d.key.as_str()).collect();
+        assert_eq!(keys, vec!["1"]);
+        // Without the map, "wa" matches nothing.
+        service
+            .delete_synonym_map("m")
+            .unwrap_or_else(|e| panic!("delete failed: {e}"));
+        let query = ok(service.parse_search("items", &json!({"search": "wa"})));
+        let outcome = ok(service.search("items", &query));
+        assert!(outcome.documents.is_empty());
     }
 }

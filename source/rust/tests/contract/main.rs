@@ -11,6 +11,7 @@ mod errors;
 mod filtering;
 mod index_management;
 mod pagination;
+mod query_features;
 mod search;
 mod suggest_autocomplete;
 mod synonym_maps;

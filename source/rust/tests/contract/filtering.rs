@@ -317,3 +317,159 @@ async fn filter_string_functions_match_substrings() {
         assert_eq!(body["error"]["code"], "InvalidQuery");
     }
 }
+
+#[tokio::test]
+async fn filter_date_functions_compare_dates() {
+    let app = app();
+    let uri = format!("/indexes?api-version={API_VERSION}");
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            &uri,
+            Some(API_KEY),
+            Some(json!({
+                "name": "articles",
+                "fields": [
+                    {"name": "id", "type": "Edm.String", "key": true},
+                    {"name": "title", "type": "Edm.String", "searchable": true, "filterable": true},
+                    {"name": "published", "type": "Edm.DateTimeOffset", "filterable": true},
+                    {"name": "archived", "type": "Edm.DateTimeOffset", "filterable": true}
+                ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        upload_request(
+            "articles",
+            json!([
+                {"@search.action": "upload", "document": {"id": "1", "title": "spring release", "published": "2024-03-15T10:30:00Z", "archived": "2024-03-10T10:30:00Z"}},
+                {"@search.action": "upload", "document": {"id": "2", "title": "winter recap", "published": "2023-12-02T08:00:00Z", "archived": "2023-11-01T08:00:00Z"}}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    for (filter, expected) in [
+        ("datepart(year, published) eq 2024", vec!["1"]),
+        ("datepart(month, published) eq 12", vec!["2"]),
+        ("datepart(dayofweek, published) eq 5", vec!["1"]),
+        (
+            "dateadd(day, 1, published) gt utcdatetime('2024-03-15T10:30:00Z')",
+            vec!["1"],
+        ),
+        ("datediff(day, archived, published) eq 5", vec!["1"]),
+        ("datediff(day, archived, published) gt 10", vec!["2"]),
+        (
+            "published gt utcdatetime('2024-01-01T00:00:00Z')",
+            vec!["1"],
+        ),
+        (
+            "utcdatetime('2024-01-01T00:00:00Z') lt published",
+            vec!["1"],
+        ),
+        ("datepart(year, published) eq 1999", Vec::<&str>::new()),
+    ] {
+        let (status, body) = call(
+            app.clone(),
+            search_request("articles", json!({"search": "*", "filter": filter})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "filter {filter:?}: {body}");
+        let ids: Vec<&str> = body["value"]
+            .as_array()
+            .map(|items| items.iter().filter_map(|d| d["id"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(ids, expected, "filter {filter:?}");
+    }
+
+    // Malformed date filters are rejected explicitly.
+    for filter in [
+        "datepart(century, published) eq 21",
+        "published gt utcdatetime('not a date')",
+        "datepart(year, title) eq 2024",
+    ] {
+        let (status, body) = call(
+            app.clone(),
+            search_request("articles", json!({"search": "*", "filter": filter})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "filter {filter:?}");
+        assert_eq!(body["error"]["code"], "InvalidQuery");
+    }
+}
+
+#[tokio::test]
+async fn filter_search_functions_match() {
+    let app = app();
+    let uri = format!("/indexes?api-version={API_VERSION}");
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            &uri,
+            Some(API_KEY),
+            Some(json!({
+                "name": "docs",
+                "fields": [
+                    {"name": "id", "type": "Edm.String", "key": true},
+                    {"name": "title", "type": "Edm.String", "searchable": true, "filterable": true},
+                    {"name": "subtitle", "type": "Edm.String", "filterable": true}
+                ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        upload_request(
+            "docs",
+            json!([
+                {"@search.action": "upload", "document": {"id": "1", "title": "Azure Search"}},
+                {"@search.action": "upload", "document": {"id": "2", "title": "Other", "subtitle": ""}},
+                {"@search.action": "upload", "document": {"id": "3", "title": "More"}}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    for (filter, expected) in [
+        ("search.ismatch('azure', title)", vec!["1"]),
+        ("search.ismatch('SEARCH', title)", vec!["1"]),
+        ("search.ismatch('azure', 'title,subtitle')", vec!["1"]),
+        ("search.ismatchscoring('other', title)", vec!["2"]),
+        ("search.isempty(subtitle)", vec!["1", "2", "3"]),
+        ("search.isnull(subtitle)", vec!["1", "3"]),
+        ("search.ismatch('zzz', title)", Vec::<&str>::new()),
+    ] {
+        let (status, body) = call(
+            app.clone(),
+            search_request("docs", json!({"search": "*", "filter": filter})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "filter {filter:?}: {body}");
+        let ids: Vec<&str> = body["value"]
+            .as_array()
+            .map(|items| items.iter().filter_map(|d| d["id"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(ids, expected, "filter {filter:?}");
+    }
+
+    // Unknown search functions are rejected explicitly.
+    let (status, body) = call(
+        app,
+        search_request(
+            "docs",
+            json!({"search": "*", "filter": "search.unknown(title)"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "InvalidQuery");
+}

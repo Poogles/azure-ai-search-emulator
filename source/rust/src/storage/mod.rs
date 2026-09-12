@@ -27,6 +27,9 @@ pub struct FieldDefinition {
     pub vector_search_profile: Option<String>,
     /// Subfields of an `Edm.ComplexType` field; empty for all other types.
     pub subfields: Vec<FieldDefinition>,
+    /// The field's declared analyzer name (`analyzer` property); `None` means
+    /// the index default (the emulator's English analyzer).
+    pub analyzer: Option<String>,
     /// The raw JSON field definition, preserved for echo in responses.
     pub raw: Value,
 }
@@ -74,6 +77,11 @@ impl FieldDefinition {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
+        let analyzer = obj
+            .get("analyzer")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
         Ok(FieldDefinition {
             name: name.to_owned(),
             field_type: normalize_field_type(field_type),
@@ -101,6 +109,7 @@ impl FieldDefinition {
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
             subfields,
+            analyzer,
             raw,
         })
     }

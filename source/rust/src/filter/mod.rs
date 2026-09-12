@@ -11,6 +11,7 @@
 //! tree against the index schema and the search pipeline evaluates it per
 //! document.
 
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde_json::{Map, Value};
 
 use crate::storage::{FieldDefinition, IndexDefinition};
@@ -44,6 +45,19 @@ impl FilterOp {
     }
 }
 
+/// Reverses a comparison operator (`a op b` ⇔ `b reverse(op) a`), for
+/// leading-`utcdatetime` comparisons (`utcdatetime('...') op field`).
+fn reverse_op(op: FilterOp) -> FilterOp {
+    match op {
+        FilterOp::Eq => FilterOp::Eq,
+        FilterOp::Ne => FilterOp::Ne,
+        FilterOp::Gt => FilterOp::Lt,
+        FilterOp::Ge => FilterOp::Le,
+        FilterOp::Lt => FilterOp::Gt,
+        FilterOp::Le => FilterOp::Ge,
+    }
+}
+
 /// A literal value in a filter expression.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilterValue {
@@ -70,6 +84,107 @@ impl StringFunc {
             _ => None,
         }
     }
+}
+
+/// A calendar part extracted by `datepart` (e.g. `datepart(year, published)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatePart {
+    Year,
+    Quarter,
+    Month,
+    Week,
+    Day,
+    Hour,
+    Minute,
+    Second,
+    DayOfWeek,
+    DayOfYear,
+}
+
+impl DatePart {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "year" => Some(Self::Year),
+            "quarter" => Some(Self::Quarter),
+            "month" => Some(Self::Month),
+            "week" => Some(Self::Week),
+            "day" => Some(Self::Day),
+            "hour" => Some(Self::Hour),
+            "minute" => Some(Self::Minute),
+            "second" => Some(Self::Second),
+            "dayofweek" => Some(Self::DayOfWeek),
+            "dayofyear" => Some(Self::DayOfYear),
+            _ => None,
+        }
+    }
+}
+
+/// A date/time unit for `dateadd` and `datediff`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DateUnit {
+    Year,
+    Quarter,
+    Month,
+    Week,
+    Day,
+    Hour,
+    Minute,
+    Second,
+}
+
+impl DateUnit {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "year" => Some(Self::Year),
+            "quarter" => Some(Self::Quarter),
+            "month" => Some(Self::Month),
+            "week" => Some(Self::Week),
+            "day" => Some(Self::Day),
+            "hour" => Some(Self::Hour),
+            "minute" => Some(Self::Minute),
+            "second" => Some(Self::Second),
+            _ => None,
+        }
+    }
+}
+
+/// A date/time value reference for `datediff`: a field or a literal date.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DateRef {
+    /// A field holding a date/time string.
+    Field(String),
+    /// A literal date, normalized to fixed-width UTC ISO-8601 at parse time.
+    Literal(String),
+}
+
+/// A date/time value expression: the left side of a date comparison.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DateExpr {
+    /// `datepart(part, field)`: the calendar part as a number.
+    DatePart { part: DatePart, field: String },
+    /// `dateadd(unit, interval, field)`: the field's date shifted by
+    /// `interval` units, as a normalized ISO-8601 string.
+    DateAdd {
+        unit: DateUnit,
+        interval: i64,
+        field: String,
+    },
+    /// `datediff(unit, start, end)`: the whole units between two dates.
+    DateDiff {
+        unit: DateUnit,
+        start: DateRef,
+        end: DateRef,
+    },
+    /// `utcdatetime('...')`: a literal date, normalized at parse time.
+    UtcDateTime(String),
+}
+
+/// The left side of a date comparison: a field (compared as a normalized
+/// date string) or a date expression.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DateOperand {
+    Field(String),
+    Expr(DateExpr),
 }
 
 /// The internal filter expression tree.
@@ -102,6 +217,32 @@ pub enum FilterExpr {
     All {
         field: String,
         inner: Box<FilterExpr>,
+    },
+    /// A date comparison: `datepart(...) op value`, `dateadd(...) op value`,
+    /// `datediff(...) op value`, `field op utcdatetime('...')`, or
+    /// `utcdatetime('...') op field`. The left side evaluates to a number
+    /// (`datepart`/`datediff`) or a normalized ISO-8601 string
+    /// (`dateadd`/`utcdatetime`/field); unparseable dates and type mismatches
+    /// never match.
+    DateCompare {
+        left: DateOperand,
+        op: FilterOp,
+        value: FilterValue,
+    },
+    /// `search.ismatch('pattern', field)`: case-insensitive substring match
+    /// of the pattern against the field's string value(s).
+    IsMatch {
+        field: String,
+        pattern: String,
+    },
+    /// `search.isempty(field)`: the field is missing, null, an empty string,
+    /// or an empty array.
+    IsEmpty {
+        field: String,
+    },
+    /// `search.isnull(field)`: the field is missing or null.
+    IsNull {
+        field: String,
     },
 }
 
@@ -149,6 +290,44 @@ impl FilterExpr {
                 .get(field)
                 .and_then(Value::as_array)
                 .is_some_and(|items| items.iter().all(|item| element_matches(inner, item))),
+            FilterExpr::DateCompare { left, op, value } => {
+                let Some(actual) = left.evaluate(fields) else {
+                    return false;
+                };
+                let actual_value = match &actual {
+                    FilterValue::Number(n) => Value::from(*n),
+                    FilterValue::String(s) => Value::String(s.clone()),
+                    _ => return false,
+                };
+                compare(&actual_value, *op, value)
+            }
+            FilterExpr::IsMatch { field, pattern } => {
+                let lowered = pattern.to_lowercase();
+                flatten_values(&resolve_paths(fields, field))
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .any(|text| text.to_lowercase().contains(lowered.as_str()))
+            }
+            FilterExpr::IsEmpty { field } => {
+                let resolved = resolve_paths(fields, field);
+                if resolved.is_empty() {
+                    return true;
+                }
+                let flat = flatten_values(&resolved);
+                flat.is_empty()
+                    || flat
+                        .iter()
+                        .all(|value| value.is_null() || value.as_str() == Some(""))
+            }
+            FilterExpr::IsNull { field } => {
+                let resolved = resolve_paths(fields, field);
+                if resolved.is_empty() {
+                    return true;
+                }
+                flatten_values(&resolved)
+                    .iter()
+                    .any(|value| value.is_null())
+            }
         }
     }
 }
@@ -317,6 +496,189 @@ fn values_equal(item: &Value, expected: &FilterValue) -> bool {
     }
 }
 
+/// Parses a document or literal date/time string into UTC. Accepts full
+/// RFC-3339 (`2024-01-15T10:30:00Z`, with offsets and fractional seconds), a
+/// date-only value (`2024-01-15`, midnight UTC), and a timezone-less datetime
+/// (`2024-01-15T10:30:00`, assumed UTC). Returns `None` when unparseable.
+fn parse_datetime(text: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(text) {
+        return Some(dt.to_utc());
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d") {
+        return date.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
+    }
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S") {
+        return Some(dt.and_utc());
+    }
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S") {
+        return Some(dt.and_utc());
+    }
+    None
+}
+
+/// Normalizes a date/time string to fixed-width UTC ISO-8601
+/// (`YYYY-MM-DDTHH:MM:SS.sssZ`). Fixed width keeps lexicographic string
+/// comparison chronological. Returns `None` when unparseable.
+fn normalize_datetime(text: &str) -> Option<String> {
+    parse_datetime(text).map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+}
+
+/// Resolves a field path to its first date/time value, parsed to UTC. Paths
+/// through collections resolve to the first parseable element.
+fn resolve_datetime(fields: &Map<String, Value>, field: &str) -> Option<DateTime<Utc>> {
+    for value in flatten_values(&resolve_paths(fields, field)) {
+        if let Some(text) = value.as_str() {
+            if let Some(dt) = parse_datetime(text) {
+                return Some(dt);
+            }
+        }
+    }
+    None
+}
+
+impl DateRef {
+    /// Resolves a `datediff` endpoint to UTC.
+    fn resolve(&self, fields: &Map<String, Value>) -> Option<DateTime<Utc>> {
+        match self {
+            DateRef::Field(field) => resolve_datetime(fields, field),
+            DateRef::Literal(iso) => parse_datetime(iso),
+        }
+    }
+}
+
+/// Extracts a `datepart` calendar component as a number. All components fit
+/// exactly in an `f64` (year, month, day, ...), so the conversion is lossless.
+fn datepart_value(part: DatePart, dt: &DateTime<Utc>) -> f64 {
+    match part {
+        DatePart::Year => f64::from(dt.year()),
+        DatePart::Quarter => f64::from(dt.month0() / 3 + 1),
+        DatePart::Month => f64::from(dt.month()),
+        DatePart::Week => f64::from(dt.iso_week().week()),
+        DatePart::Day => f64::from(dt.day()),
+        DatePart::Hour => f64::from(dt.hour()),
+        DatePart::Minute => f64::from(dt.minute()),
+        DatePart::Second => f64::from(dt.second()),
+        DatePart::DayOfWeek => f64::from(dt.weekday().num_days_from_sunday()),
+        DatePart::DayOfYear => f64::from(dt.ordinal()),
+    }
+}
+
+/// Shifts a date by `interval` `unit`s, returning the normalized ISO-8601
+/// string. Returns `None` on overflow or out-of-range intervals.
+fn dateadd_value(unit: DateUnit, interval: i64, dt: &DateTime<Utc>) -> Option<String> {
+    let shifted = match unit {
+        DateUnit::Year => {
+            let months = u32::try_from(interval.abs().checked_mul(12)?).ok()?;
+            if interval >= 0 {
+                dt.checked_add_months(chrono::Months::new(months))?
+            } else {
+                dt.checked_sub_months(chrono::Months::new(months))?
+            }
+        }
+        DateUnit::Quarter => {
+            let months = u32::try_from(interval.abs().checked_mul(3)?).ok()?;
+            if interval >= 0 {
+                dt.checked_add_months(chrono::Months::new(months))?
+            } else {
+                dt.checked_sub_months(chrono::Months::new(months))?
+            }
+        }
+        DateUnit::Month => {
+            let months = u32::try_from(interval.abs()).ok()?;
+            if interval >= 0 {
+                dt.checked_add_months(chrono::Months::new(months))?
+            } else {
+                dt.checked_sub_months(chrono::Months::new(months))?
+            }
+        }
+        DateUnit::Week => dt.checked_add_signed(chrono::Duration::try_weeks(interval)?)?,
+        DateUnit::Day => dt.checked_add_signed(chrono::Duration::try_days(interval)?)?,
+        DateUnit::Hour => dt.checked_add_signed(chrono::Duration::try_hours(interval)?)?,
+        DateUnit::Minute => dt.checked_add_signed(chrono::Duration::try_minutes(interval)?)?,
+        DateUnit::Second => dt.checked_add_signed(chrono::Duration::try_seconds(interval)?)?,
+    };
+    Some(shifted.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+}
+
+/// Computes the whole `unit`s between `start` and `end` (truncated toward
+/// zero, matching Azure's `datediff`). Calendar units count month/year
+/// boundaries; clock units divide the exact duration. Results always fit
+/// exactly in an `f64` (chrono's date range spans ~262k years, at most ~8e12
+/// seconds, far below the 2^52 exact-integer limit).
+fn datediff_value(unit: DateUnit, start: &DateTime<Utc>, end: &DateTime<Utc>) -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let as_number = |value: i64| value as f64;
+    match unit {
+        DateUnit::Year | DateUnit::Quarter | DateUnit::Month => {
+            let months = (i64::from(end.year()) - i64::from(start.year())) * 12
+                + i64::from(end.month())
+                - i64::from(start.month());
+            as_number(match unit {
+                DateUnit::Year => months.div_euclid(12),
+                DateUnit::Quarter => months.div_euclid(3),
+                _ => months,
+            })
+        }
+        _ => {
+            let duration = *end - *start;
+            as_number(match unit {
+                DateUnit::Week => duration.num_weeks(),
+                DateUnit::Day => duration.num_days(),
+                DateUnit::Hour => duration.num_hours(),
+                DateUnit::Minute => duration.num_minutes(),
+                _ => duration.num_seconds(),
+            })
+        }
+    }
+}
+
+impl DateExpr {
+    /// Evaluates a date expression against a document: `datepart`/`datediff`
+    /// produce a number, `dateadd`/`utcdatetime` a normalized ISO-8601
+    /// string. Returns `None` when a referenced date is missing or
+    /// unparseable, or the arithmetic overflows.
+    fn evaluate(&self, fields: &Map<String, Value>) -> Option<FilterValue> {
+        match self {
+            DateExpr::DatePart { part, field } => {
+                let dt = resolve_datetime(fields, field)?;
+                Some(FilterValue::Number(datepart_value(*part, &dt)))
+            }
+            DateExpr::DateAdd {
+                unit,
+                interval,
+                field,
+            } => {
+                let dt = resolve_datetime(fields, field)?;
+                Some(FilterValue::String(dateadd_value(*unit, *interval, &dt)?))
+            }
+            DateExpr::DateDiff { unit, start, end } => {
+                let start_dt = start.resolve(fields)?;
+                let end_dt = end.resolve(fields)?;
+                Some(FilterValue::Number(datediff_value(
+                    *unit, &start_dt, &end_dt,
+                )))
+            }
+            DateExpr::UtcDateTime(iso) => Some(FilterValue::String(iso.clone())),
+        }
+    }
+}
+
+impl DateOperand {
+    /// Evaluates a date-comparison left side: a field normalizes to its
+    /// ISO-8601 string, a date expression to its number or string.
+    fn evaluate(&self, fields: &Map<String, Value>) -> Option<FilterValue> {
+        match self {
+            DateOperand::Field(field) => {
+                let dt = resolve_datetime(fields, field)?;
+                Some(FilterValue::String(
+                    dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+                ))
+            }
+            DateOperand::Expr(expr) => expr.evaluate(fields),
+        }
+    }
+}
+
 /// Validates a parsed filter expression against an index schema.
 ///
 /// # Errors
@@ -348,7 +710,9 @@ pub fn validate(expr: &FilterExpr, definition: &IndexDefinition) -> Result<(), S
             }
             Ok(())
         }
-        FilterExpr::In { field, .. } => {
+        FilterExpr::In { field, .. }
+        | FilterExpr::IsEmpty { field }
+        | FilterExpr::IsNull { field } => {
             require_filterable(field, definition)?;
             Ok(())
         }
@@ -382,8 +746,8 @@ pub fn validate(expr: &FilterExpr, definition: &IndexDefinition) -> Result<(), S
                     if inner_field.contains('/') {
                         return Err(format!(
                             "any/all on field {field:?} must contain a single comparison on the \
-                             lambda variable; paths into the element (e.g. {inner_field:?}) are \
-                             not supported."
+                              lambda variable; paths into the element (e.g. {inner_field:?}) are \
+                              not supported."
                         ));
                     }
                     Ok(())
@@ -392,6 +756,54 @@ pub fn validate(expr: &FilterExpr, definition: &IndexDefinition) -> Result<(), S
                     "any/all on field {field:?} must contain a single comparison on the lambda variable."
                 )),
             }
+        }
+        FilterExpr::DateCompare { left, .. } => {
+            for field in left.referenced_fields() {
+                let field_def = require_filterable(&field, definition)?;
+                if field_def.field_type != "Edm.DateTimeOffset" {
+                    return Err(format!(
+                        "Date filter on field {field:?} requires an Edm.DateTimeOffset field; \
+                         field type is {:?}.",
+                        field_def.field_type
+                    ));
+                }
+            }
+            Ok(())
+        }
+        FilterExpr::IsMatch { field, .. } => {
+            let field_def = require_filterable(field, definition)?;
+            if field_def.field_type != "Edm.String"
+                && field_def.field_type != "Edm.Collection(Edm.String)"
+            {
+                return Err(format!(
+                    "Filter function search.ismatch on field {field:?} requires a string field; \
+                     field type is {:?}.",
+                    field_def.field_type
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+impl DateOperand {
+    /// All field names referenced by a date-comparison left side.
+    fn referenced_fields(&self) -> Vec<String> {
+        match self {
+            DateOperand::Field(field)
+            | DateOperand::Expr(
+                DateExpr::DatePart { field, .. } | DateExpr::DateAdd { field, .. },
+            ) => vec![field.clone()],
+            DateOperand::Expr(DateExpr::DateDiff { start, end, .. }) => {
+                let mut fields = Vec::new();
+                for date_ref in [start, end] {
+                    if let DateRef::Field(field) = date_ref {
+                        fields.push(field.clone());
+                    }
+                }
+                fields
+            }
+            DateOperand::Expr(DateExpr::UtcDateTime(_)) => Vec::new(),
         }
     }
 }
@@ -698,6 +1110,29 @@ impl Parser {
                 }),
             };
         }
+        // Date functions: `datepart(...)`, `dateadd(...)`, `datediff(...)`,
+        // or a leading `utcdatetime('...')`.
+        if matches!(
+            first.as_str(),
+            "datepart" | "dateadd" | "datediff" | "utcdatetime"
+        ) && matches!(self.peek(), Some(Token::LParen))
+        {
+            return self.parse_date_compare(&first);
+        }
+        // Search functions: `search.ismatch(...)`, `search.ismatchscoring(...)`,
+        // `search.isempty(...)`, `search.isnull(...)`. The tokenizer splits
+        // `search.ismatch` into an identifier, a dot, and an identifier.
+        if first == "search" && matches!(self.peek(), Some(Token::Dot)) {
+            self.next(); // Consume '.'.
+            let func = self.expect_ident("search function name")?;
+            if matches!(self.peek(), Some(Token::LParen)) {
+                return self.parse_search_function(&func);
+            }
+            return Err(format!(
+                "Expected '(' after 'search.{func}'; supported search functions: \
+                 ismatch, ismatchscoring, isempty, isnull."
+            ));
+        }
         // Function calls: `startswith(field, 'prefix')`, `endswith(field,
         // 'suffix')`, `contains(field, 'substring')`.
         if matches!(self.peek(), Some(Token::LParen)) {
@@ -709,6 +1144,14 @@ impl Parser {
             return self.parse_in_list(&first);
         }
         let op = self.parse_op()?;
+        // A trailing `utcdatetime('...')`: `field op utcdatetime('...')`.
+        if let Some(Token::Ident(name)) = self.peek() {
+            if name == "utcdatetime" && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+            {
+                self.next(); // Consume `utcdatetime`.
+                return self.parse_field_vs_utcdatetime(&first, op);
+            }
+        }
         let value = self.parse_value()?;
         Ok(FilterExpr::Compare {
             field: first,
@@ -756,6 +1199,275 @@ impl Parser {
             }
         }
         Ok(FilterExpr::StringFunc { func, field, arg })
+    }
+
+    /// Expects a `,` separator in a function argument list.
+    fn expect_comma(&mut self, func: &str) -> Result<(), String> {
+        match self.next() {
+            Some(Token::Comma) => Ok(()),
+            other => Err(format!(
+                "Expected ',' in {func} arguments, found {}.",
+                describe_token(other.as_ref())
+            )),
+        }
+    }
+
+    /// Expects a `)` closing a function argument list.
+    fn expect_rparen(&mut self, func: &str) -> Result<(), String> {
+        match self.next() {
+            Some(Token::RParen) => Ok(()),
+            other => Err(format!(
+                "Expected ')' to close {func} arguments, found {}.",
+                describe_token(other.as_ref())
+            )),
+        }
+    }
+
+    /// Parses a date comparison after the function name (`datepart`,
+    /// `dateadd`, `datediff`, or a leading `utcdatetime`), with `(` peeked:
+    /// `(args) op value`.
+    fn parse_date_compare(&mut self, name: &str) -> Result<FilterExpr, String> {
+        // A leading `utcdatetime('...') op field` consumes its own parens.
+        if name == "utcdatetime" {
+            let iso = self.parse_utcdatetime_literal()?;
+            let op = self.parse_op()?;
+            let field = self.expect_ident("field name")?;
+            return Ok(FilterExpr::DateCompare {
+                left: DateOperand::Field(field),
+                op: reverse_op(op),
+                value: FilterValue::String(iso),
+            });
+        }
+        self.next(); // Consume '('.
+        let left = match name {
+            "datepart" => {
+                let part_name = self.expect_ident("date part")?;
+                let part = DatePart::parse(&part_name).ok_or_else(|| {
+                    format!(
+                        "Unknown datepart {part_name:?}; supported parts: year, quarter, month, \
+                         week, day, hour, minute, second, dayofweek, dayofyear."
+                    )
+                })?;
+                self.expect_comma("datepart")?;
+                let field = self.expect_ident("field name")?;
+                self.expect_rparen("datepart")?;
+                DateOperand::Expr(DateExpr::DatePart { part, field })
+            }
+            "dateadd" => {
+                let unit_name = self.expect_ident("date unit")?;
+                let unit = DateUnit::parse(&unit_name).ok_or_else(|| {
+                    format!(
+                        "Unknown dateadd unit {unit_name:?}; supported units: year, quarter, \
+                         month, week, day, hour, minute, second."
+                    )
+                })?;
+                self.expect_comma("dateadd")?;
+                let interval = match self.next() {
+                    Some(Token::Number(n)) if n.fract() == 0.0 => {
+                        // `as` saturates on overflow; the `try_from` below
+                        // rejects the saturated value as out of range.
+                        #[allow(clippy::cast_possible_truncation)]
+                        let as_i128 = n as i128;
+                        i64::try_from(as_i128).map_err(|_| {
+                            format!("dateadd interval {n} is out of range; expected an integer.")
+                        })?
+                    }
+                    other => {
+                        return Err(format!(
+                            "Expected an integer interval in dateadd, found {}.",
+                            describe_token(other.as_ref())
+                        ))
+                    }
+                };
+                self.expect_comma("dateadd")?;
+                let field = self.expect_ident("field name")?;
+                self.expect_rparen("dateadd")?;
+                DateOperand::Expr(DateExpr::DateAdd {
+                    unit,
+                    interval,
+                    field,
+                })
+            }
+            "datediff" => {
+                let unit_name = self.expect_ident("date unit")?;
+                let unit = DateUnit::parse(&unit_name).ok_or_else(|| {
+                    format!(
+                        "Unknown datediff unit {unit_name:?}; supported units: year, quarter, \
+                         month, week, day, hour, minute, second."
+                    )
+                })?;
+                self.expect_comma("datediff")?;
+                let start = self.parse_date_ref("datediff")?;
+                self.expect_comma("datediff")?;
+                let end = self.parse_date_ref("datediff")?;
+                self.expect_rparen("datediff")?;
+                DateOperand::Expr(DateExpr::DateDiff { unit, start, end })
+            }
+            _ => {
+                return Err(format!(
+                    "Unsupported date function {name:?}; supported functions: \
+                     datepart, dateadd, datediff, utcdatetime."
+                ));
+            }
+        };
+        let op = self.parse_op()?;
+        let value = self.parse_value_or_utcdatetime()?;
+        Ok(FilterExpr::DateCompare { left, op, value })
+    }
+
+    /// Parses a comparison right-hand value: a `utcdatetime('...')` literal
+    /// (normalized to ISO-8601) or a plain literal value.
+    fn parse_value_or_utcdatetime(&mut self) -> Result<FilterValue, String> {
+        if let Some(Token::Ident(name)) = self.peek() {
+            if name == "utcdatetime" && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+            {
+                self.next(); // Consume `utcdatetime`.
+                let iso = self.parse_utcdatetime_literal()?;
+                return Ok(FilterValue::String(iso));
+            }
+        }
+        self.parse_value()
+    }
+
+    /// Parses a `datediff` endpoint: a field name or a `utcdatetime('...')`
+    /// literal.
+    fn parse_date_ref(&mut self, func: &str) -> Result<DateRef, String> {
+        if let Some(Token::Ident(name)) = self.peek() {
+            if name == "utcdatetime" && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+            {
+                self.next(); // Consume `utcdatetime`.
+                let iso = self.parse_utcdatetime_literal()?;
+                return Ok(DateRef::Literal(iso));
+            }
+        }
+        Ok(DateRef::Field(
+            self.expect_ident(&format!("{func} date field"))?,
+        ))
+    }
+
+    /// Parses a `utcdatetime('...')` literal after the function name, with
+    /// `(` peeked, returning the normalized ISO-8601 string.
+    fn parse_utcdatetime_literal(&mut self) -> Result<String, String> {
+        self.next(); // Consume '('.
+        let literal = match self.next() {
+            Some(Token::String(text)) => text,
+            other => {
+                return Err(format!(
+                    "Expected a date string literal in utcdatetime, found {}.",
+                    describe_token(other.as_ref())
+                ))
+            }
+        };
+        self.expect_rparen("utcdatetime")?;
+        normalize_datetime(&literal).ok_or_else(|| {
+            format!(
+                "Invalid date {literal:?} in utcdatetime; expected ISO-8601 \
+                 (e.g. '2024-01-15T10:30:00Z')."
+            )
+        })
+    }
+
+    /// Parses `field op utcdatetime('...')` after the field name and operator.
+    fn parse_field_vs_utcdatetime(
+        &mut self,
+        field: &str,
+        op: FilterOp,
+    ) -> Result<FilterExpr, String> {
+        let iso = self.parse_utcdatetime_literal()?;
+        Ok(FilterExpr::DateCompare {
+            left: DateOperand::Field(field.to_owned()),
+            op,
+            value: FilterValue::String(iso),
+        })
+    }
+
+    /// Parses a `search.*` function call after the function name, with `(`
+    /// peeked: `search.ismatch('pattern', field)`,
+    /// `search.ismatchscoring('pattern', field)`, `search.isempty(field)`,
+    /// `search.isnull(field)`.
+    fn parse_search_function(&mut self, name: &str) -> Result<FilterExpr, String> {
+        self.next(); // Consume '('.
+        match name {
+            "ismatch" | "ismatchscoring" => {
+                let pattern = match self.next() {
+                    Some(Token::String(text)) => text,
+                    other => {
+                        return Err(format!(
+                            "Expected a search pattern string in search.{name}, found {}.",
+                            describe_token(other.as_ref())
+                        ))
+                    }
+                };
+                self.expect_comma(&format!("search.{name}"))?;
+                // The field list is a field name or a comma-separated string
+                // of field names (the documented Azure form).
+                let mut fields = Vec::new();
+                match self.next() {
+                    Some(Token::Ident(field)) => fields.push(field),
+                    Some(Token::String(list)) => {
+                        for field in list.split(',') {
+                            let field = field.trim();
+                            if field.is_empty() {
+                                return Err(format!(
+                                    "Empty field name in search.{name} field list {list:?}."
+                                ));
+                            }
+                            fields.push(field.to_owned());
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "Expected a field name in search.{name}, found {}.",
+                            describe_token(other.as_ref())
+                        ))
+                    }
+                }
+                // Extra parameters (query type, search mode) are accepted but
+                // inert.
+                while matches!(self.peek(), Some(Token::Comma)) {
+                    self.next();
+                    match self.next() {
+                        Some(Token::String(_) | Token::Ident(_)) => {}
+                        other => {
+                            return Err(format!(
+                                "Expected a string in search.{name} options, found {}.",
+                                describe_token(other.as_ref())
+                            ))
+                        }
+                    }
+                }
+                self.expect_rparen(&format!("search.{name}"))?;
+                let mut exprs: Vec<FilterExpr> = fields
+                    .into_iter()
+                    .map(|field| FilterExpr::IsMatch {
+                        field,
+                        pattern: pattern.clone(),
+                    })
+                    .collect();
+                if exprs.len() == 1 {
+                    Ok(exprs.pop().unwrap_or_else(|| FilterExpr::IsMatch {
+                        field: String::new(),
+                        pattern,
+                    }))
+                } else {
+                    Ok(FilterExpr::Or(exprs))
+                }
+            }
+            "isempty" => {
+                let field = self.expect_ident("field name")?;
+                self.expect_rparen("search.isempty")?;
+                Ok(FilterExpr::IsEmpty { field })
+            }
+            "isnull" => {
+                let field = self.expect_ident("field name")?;
+                self.expect_rparen("search.isnull")?;
+                Ok(FilterExpr::IsNull { field })
+            }
+            _ => Err(format!(
+                "Unsupported search function 'search.{name}'; supported functions: \
+                 ismatch, ismatchscoring, isempty, isnull."
+            )),
+        }
     }
 
     /// Parses an `in` value list after the field name and `in` keyword:
@@ -1324,5 +2036,265 @@ mod tests {
         let definition = collection_complex_definition();
         assert!(validate(&parse_ok("Rooms/Type eq 'suite'"), &definition).is_ok());
         assert!(validate(&parse_ok("Rooms/Rate gt 100"), &definition).is_ok());
+    }
+
+    fn dated_definition() -> IndexDefinition {
+        IndexDefinition::from_json(json!({
+            "name": "articles",
+            "fields": [
+                {"name": "id", "type": "Edm.String", "key": true},
+                {"name": "title", "type": "Edm.String", "filterable": true},
+                {"name": "body", "type": "Edm.String", "filterable": true},
+                {"name": "published", "type": "Edm.DateTimeOffset", "filterable": true},
+                {"name": "archived", "type": "Edm.DateTimeOffset", "filterable": true},
+                {"name": "price", "type": "Edm.Double", "filterable": true}
+            ]
+        }))
+        .unwrap_or_else(|e| panic!("valid definition: {e}"))
+    }
+
+    #[test]
+    fn parses_and_evaluates_datepart() {
+        // 2024-03-15 is a Friday (dayofweek 5), ISO week 11, day 75 of leap 2024.
+        let doc = [("published", json!("2024-03-15T10:30:45Z"))];
+        assert!(matches(
+            &parse_ok("datepart(year, published) eq 2024"),
+            &doc
+        ));
+        assert!(matches(
+            &parse_ok("datepart(quarter, published) eq 1"),
+            &doc
+        ));
+        assert!(matches(&parse_ok("datepart(month, published) eq 3"), &doc));
+        assert!(matches(&parse_ok("datepart(week, published) eq 11"), &doc));
+        assert!(matches(&parse_ok("datepart(day, published) eq 15"), &doc));
+        assert!(matches(&parse_ok("datepart(hour, published) eq 10"), &doc));
+        assert!(matches(
+            &parse_ok("datepart(minute, published) eq 30"),
+            &doc
+        ));
+        assert!(matches(
+            &parse_ok("datepart(second, published) eq 45"),
+            &doc
+        ));
+        assert!(matches(
+            &parse_ok("datepart(dayofweek, published) eq 5"),
+            &doc
+        ));
+        assert!(matches(
+            &parse_ok("datepart(dayofyear, published) eq 75"),
+            &doc
+        ));
+        assert!(!matches(
+            &parse_ok("datepart(year, published) eq 2023"),
+            &doc
+        ));
+        // Missing or unparseable dates never match.
+        assert!(!matches(
+            &parse_ok("datepart(year, published) eq 2024"),
+            &[]
+        ));
+        assert!(!matches(
+            &parse_ok("datepart(year, published) eq 2024"),
+            &[("published", json!("not a date"))]
+        ));
+    }
+
+    #[test]
+    fn parses_and_evaluates_dateadd() {
+        let doc = [("published", json!("2024-03-15T10:30:00Z"))];
+        assert!(matches(
+            &parse_ok("dateadd(day, 1, published) gt utcdatetime('2024-03-15T10:30:00Z')"),
+            &doc
+        ));
+        assert!(matches(
+            &parse_ok("dateadd(month, -1, published) eq utcdatetime('2024-02-15T10:30:00Z')"),
+            &doc
+        ));
+        assert!(matches(
+            &parse_ok("dateadd(year, 1, published) gt utcdatetime('2025-01-01T00:00:00Z')"),
+            &doc
+        ));
+        assert!(!matches(
+            &parse_ok("dateadd(day, 1, published) lt utcdatetime('2024-03-15T10:30:00Z')"),
+            &doc
+        ));
+        // Missing dates never match.
+        assert!(!matches(
+            &parse_ok("dateadd(day, 1, published) gt utcdatetime('2024-01-01T00:00:00Z')"),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn parses_and_evaluates_datediff() {
+        let doc = [
+            ("published", json!("2024-03-15T00:00:00Z")),
+            ("archived", json!("2024-03-10T00:00:00Z")),
+        ];
+        assert!(matches(
+            &parse_ok("datediff(day, archived, published) eq 5"),
+            &doc
+        ));
+        assert!(matches(
+            &parse_ok("datediff(day, published, archived) eq -5"),
+            &doc
+        ));
+        assert!(matches(
+            &parse_ok("datediff(hour, archived, published) eq 120"),
+            &doc
+        ));
+        assert!(matches(
+            &parse_ok(
+                "datediff(month, archived, published) eq 0 and datediff(year, archived, published) eq 0"
+            ),
+            &doc
+        ));
+        // Literal endpoints.
+        assert!(matches(
+            &parse_ok("datediff(day, utcdatetime('2024-03-01T00:00:00Z'), published) eq 14"),
+            &doc
+        ));
+        // Missing dates never match.
+        assert!(!matches(
+            &parse_ok("datediff(day, archived, published) eq 5"),
+            &[("published", json!("2024-03-15T00:00:00Z"))]
+        ));
+    }
+
+    #[test]
+    fn parses_and_evaluates_utcdatetime_comparisons() {
+        let doc = [("published", json!("2024-06-01T12:00:00Z"))];
+        assert!(matches(
+            &parse_ok("published gt utcdatetime('2024-01-01T00:00:00Z')"),
+            &doc
+        ));
+        assert!(!matches(
+            &parse_ok("published lt utcdatetime('2024-01-01T00:00:00Z')"),
+            &doc
+        ));
+        // Leading utcdatetime with a reversed operator.
+        assert!(matches(
+            &parse_ok("utcdatetime('2024-01-01T00:00:00Z') lt published"),
+            &doc
+        ));
+        assert!(matches(
+            &parse_ok("utcdatetime('2024-06-01T12:00:00Z') eq published"),
+            &doc
+        ));
+        // Timezone offsets normalize to UTC for comparison.
+        assert!(matches(
+            &parse_ok("published eq utcdatetime('2024-06-01T14:00:00+02:00')"),
+            &doc
+        ));
+        // Missing dates never match.
+        assert!(!matches(
+            &parse_ok("published gt utcdatetime('2024-01-01T00:00:00Z')"),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn parses_and_evaluates_search_functions() {
+        let doc = [("title", json!("Azure Search Basics"))];
+        // `search.ismatch` is case-insensitive substring matching.
+        assert!(matches(&parse_ok("search.ismatch('azure', title)"), &doc));
+        assert!(matches(&parse_ok("search.ismatch('SEARCH', title)"), &doc));
+        assert!(!matches(&parse_ok("search.ismatch('solr', title)"), &doc));
+        // The documented multi-field string form fans out to an OR.
+        let doc = [("title", json!("hello")), ("body", json!("azure world"))];
+        assert!(matches(
+            &parse_ok("search.ismatch('azure', 'title,body')"),
+            &doc
+        ));
+        assert!(!matches(&parse_ok("search.ismatch('azure', title)"), &doc));
+        // `search.ismatchscoring` is an alias for filtering.
+        assert!(matches(
+            &parse_ok("search.ismatchscoring('azure', body)"),
+            &doc
+        ));
+        // Missing fields never match.
+        assert!(!matches(&parse_ok("search.ismatch('azure', title)"), &[]));
+    }
+
+    #[test]
+    fn parses_and_evaluates_isempty_isnull() {
+        assert!(matches(&parse_ok("search.isempty(title)"), &[]));
+        assert!(matches(
+            &parse_ok("search.isempty(title)"),
+            &[("title", json!(null))]
+        ));
+        assert!(matches(
+            &parse_ok("search.isempty(title)"),
+            &[("title", json!(""))]
+        ));
+        assert!(matches(
+            &parse_ok("search.isempty(title)"),
+            &[("title", json!([]))]
+        ));
+        assert!(!matches(
+            &parse_ok("search.isempty(title)"),
+            &[("title", json!("x"))]
+        ));
+        assert!(matches(&parse_ok("search.isnull(title)"), &[]));
+        assert!(matches(
+            &parse_ok("search.isnull(title)"),
+            &[("title", json!(null))]
+        ));
+        assert!(!matches(
+            &parse_ok("search.isnull(title)"),
+            &[("title", json!(""))]
+        ));
+        assert!(!matches(
+            &parse_ok("search.isnull(title)"),
+            &[("title", json!("x"))]
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_date_and_search_syntax() {
+        for input in [
+            "datepart(year published) eq 2024",
+            "datepart(century, published) eq 21",
+            "datepart(year) eq 2024",
+            "dateadd(day, 1.5, published) gt utcdatetime('2024-01-01T00:00:00Z')",
+            "dateadd(fortnight, 1, published) eq utcdatetime('2024-01-01T00:00:00Z')",
+            "datediff(day, published) eq 5",
+            "published gt utcdatetime('not a date')",
+            "published gt utcdatetime(5)",
+            "search.ismatch(title)",
+            "search.ismatch('azure')",
+            "search.unknownfunc(title)",
+            "search.isempty()",
+            "search.isnull(title, body)",
+        ] {
+            assert!(parse_filter(input).is_err(), "expected error for {input:?}");
+        }
+    }
+
+    #[test]
+    fn validation_checks_date_and_search_fields() {
+        let definition = dated_definition();
+        assert!(validate(&parse_ok("datepart(year, published) eq 2024"), &definition).is_ok());
+        assert!(validate(
+            &parse_ok("published gt utcdatetime('2024-01-01T00:00:00Z')"),
+            &definition
+        )
+        .is_ok());
+        assert!(validate(&parse_ok("search.ismatch('a', title)"), &definition).is_ok());
+        assert!(validate(&parse_ok("search.isempty(title)"), &definition).is_ok());
+        assert!(validate(&parse_ok("search.isnull(title)"), &definition).is_ok());
+        // Date functions on non-date fields are rejected.
+        assert!(validate(&parse_ok("datepart(year, title) eq 2024"), &definition).is_err());
+        assert!(validate(
+            &parse_ok("price gt utcdatetime('2024-01-01T00:00:00Z')"),
+            &definition
+        )
+        .is_err());
+        // `search.ismatch` on a non-string field is rejected.
+        assert!(validate(&parse_ok("search.ismatch('a', price)"), &definition).is_err());
+        // Unknown fields are rejected like any other comparison.
+        assert!(validate(&parse_ok("search.isempty(missing)"), &definition).is_err());
+        assert!(validate(&parse_ok("datepart(year, missing) eq 2024"), &definition).is_err());
     }
 }
