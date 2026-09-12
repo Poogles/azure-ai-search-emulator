@@ -1,6 +1,12 @@
 # Rust
 /source/rust/target/
 
+# .NET
+[Bb]in/
+[Oo]bj/
+TestResults/
+*.user
+
 # Python
 __pycache__/
 *.py[cod]

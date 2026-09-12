@@ -48,8 +48,8 @@ Differences fall into two categories:
 
 ### Query matching
 
-- **Simple** query semantics with `+`/`-` modifiers, `"quoted phrases"`, and Lucene-style fuzzy terms (`term~` for the default edit distance 2 like Azure, `term~N` for an explicit distance 0-2; distances above 2 are rejected explicitly). A multi-term search combines required clauses with AND (`searchMode=all`) or OR (`searchMode=any`). When `searchMode` is omitted the emulator uses AND; Azure defaults to OR.
-- Unlike Azure (which only lowercases fuzzy terms, bypassing analysis), the emulator analyzes fuzzy terms with the English analyzer, so `emulator~` matches the stemmed form and a stopword-only fuzzy term matches nothing. Fuzzy matches do not produce highlight fragments (highlighting matches analyzed query terms exactly).
+- **Simple** query semantics with `+`/`-` modifiers, `"quoted phrases"`, and Lucene-style fuzzy terms (`term~` for the default edit distance 2 like Azure, `term~N` for an explicit distance 0-2; distances above 2 are rejected explicitly). A multi-term search combines required clauses with OR (`searchMode=any`, the default, matching Azure) or AND (`searchMode=all`).
+- Fuzzy terms are lowercased only (no stemming, stopword removal, or punctuation splitting), matching Azure. Fuzzy matches do not produce highlight fragments (highlighting matches analyzed query terms exactly).
 - Tokenization uses an English analyzer: lowercasing, punctuation splitting, English stopword removal, and English stemming — approximating Azure's basic English analyzer. `running` matches `run`; `the` is a stopword and matches nothing (a stopword-only query returns no documents).
 - `searchFields` weights (`field^N`, with a finite positive `N`) scale the field's BM25 contribution to `@search.score`.
 - `POST /search.analyze` uses the English analyzer, except `keyword` (the whole input as one verbatim token) and `whitespace` (whitespace split without lowercasing or stemming), which tokenize as Azure documents them. An explicit `analyzer` (`analyzerName` alias accepted) must be a known analyzer name and `field` (`fieldName` alias accepted) must exist in the index schema. Unknown analyzers/fields are rejected with `400 InvalidRequest`.
@@ -82,10 +82,10 @@ Differences fall into two categories:
 
 ### Pagination
 
-- Continuation tokens embed a `state_version` that is bumped on every document mutation; following a token after the index changed returns `400` (stale token) and the search must be restarted. Azure tokens remain valid across mutations (results may shift).
+- Continuation tokens remain valid across document mutations (like Azure; results may shift). A token issued before a mutation can still be followed; the `skip` offset applies to the current result set.
 - A continuation token encapsulates the result-set state: its `skip`/`filter`/`orderby` win over request parameters, so later pages may send only `{continuation}` (plus a page size) and stay on the same result set. `top` remains a per-request page size. An empty page (e.g. `top=0`) ends the sequence with no further token. Tokens are URL-safe base64 so `@odata.nextLink` survives query-string transport.
-- The pinned Python SDK drops the opaque `continuation` property when re-POSTing `@search.nextPageParameters`, so SDK paging advances via `skip` and does not get staleness detection; direct HTTP clients that preserve `continuation` do.
-- **Rationale:** fail-fast staleness beats silently shifted pages in tests; SDK paging still terminates correctly via `skip`.
+- The pinned Python SDK drops the opaque `continuation` property when re-POSTing `@search.nextPageParameters`, so SDK paging advances via `skip`; direct HTTP clients that preserve `continuation` bind the result-set state (filter/orderby) across pages.
+- **Rationale:** matching Azure's token semantics keeps paging behaviour portable; SDK paging still terminates correctly via `skip`.
 
 ### Index update semantics
 
@@ -145,7 +145,7 @@ Differences fall into two categories:
 - Error structure: `{"error": {"code", "message"}}` with Azure status codes (`401`, `400`, `404`, `409`, `500`).
 - Response envelopes: `@odata.context`, `@odata.count` (with `count=true`), `@search.facets` (present only when facets requested; omitted, not null, otherwise), `@search.score` per document, `@search.highlights` per document (only when highlighting was requested and the document matched), `{"value": [...]}` lists, per-document indexing results (`key`/`status`/`statusCode`/`errorMessage`).
 - Ranking direction: BM25 results order by score descending (most relevant first), like Azure; nulls sort first ascending / last descending, like Azure.
-- `searchMode` (`all`/`any`), field boosts (`field^N`), fuzzy terms (`term~`), stemming/stopwords, `highlight`, `in`, and string functions behave as Azure documents them (subject to the default-mode and single-analyzer notes above).
+- `searchMode` (`all`/`any`, defaulting to `any`/OR like Azure), field boosts (`field^N`), fuzzy terms (`term~`, lowercased only like Azure), stemming/stopwords, `highlight`, `in`, and string functions behave as Azure documents them (subject to the single-analyzer note above).
 - Alias names resolve to their target index on data-plane routes.
 - API versions on or after the configured floor are accepted.
 - SDK wire format: routes (`/docs/search.index`, `/docs/search.post.search`), the `{"value": [...]}` batch envelope, and top-level-spread document actions as sent by the pinned Python SDK (fixtures in `source/tests/python/fixtures/`).

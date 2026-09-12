@@ -171,6 +171,39 @@ def test_search_facet_count(
     assert body["@search.facets"]["$count"] == 3
 
 
+def test_continuation_token_survives_mutation(
+    clean_emulator: str,
+    index_client: SearchIndexClient,
+    search_client: SearchClient,
+    test_index: SearchIndex,
+) -> None:
+    """Continuation tokens remain valid across document mutations (like Azure).
+
+    Exercised over raw HTTP because the pinned SDK drops the opaque
+    ``continuation`` property when re-POSTing ``@search.nextPageParameters``
+    (it pages via ``skip``). A direct-HTTP client that preserves
+    ``continuation`` must still be able to follow the token after a mutation.
+    """
+    index_client.create_index(test_index)
+    search_client.upload_documents(
+        documents=[{"id": str(i), "title": f"doc {i}"} for i in range(1, 6)]
+    )
+    url = f"{clean_emulator}/indexes('{INDEX_NAME}')/docs/search.post.search?api-version={API_VERSION}"
+    status, body = _raw_post(url, {"search": "*", "top": 2})
+    assert status == 200
+    assert [doc["id"] for doc in body["value"]] == ["1", "2"]
+    next_params = body["@search.nextPageParameters"]
+    assert "continuation" in next_params
+
+    # A document mutation does NOT invalidate the outstanding token; the new
+    # doc sorts last, so skip=2 still resumes at "3".
+    search_client.upload_documents(documents=[{"id": "6", "title": "doc 6"}])
+
+    status, body = _raw_post(url, next_params)
+    assert status == 200
+    assert [doc["id"] for doc in body["value"]] == ["3", "4"]
+
+
 def test_create_index(created_index: SearchIndex) -> None:
     assert created_index.name == INDEX_NAME
     assert len(created_index.fields) == 2

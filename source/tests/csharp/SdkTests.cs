@@ -179,6 +179,50 @@ public class SdkTests : EmulatorTestBase
     }
 
     [Fact]
+    public async Task ContinuationTokenSurvivesMutation()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(TestData.FullIndex());
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = "doc 1", ["price"] = 1.0 },
+            new SearchDocument { ["id"] = "2", ["title"] = "doc 2", ["price"] = 2.0 },
+            new SearchDocument { ["id"] = "3", ["title"] = "doc 3", ["price"] = 3.0 },
+            new SearchDocument { ["id"] = "4", ["title"] = "doc 4", ["price"] = 4.0 },
+            new SearchDocument { ["id"] = "5", ["title"] = "doc 5", ["price"] = 5.0 },
+        });
+
+        // Raw HTTP so the opaque `continuation` token is preserved (the SDK
+        // pages via `skip` and drops it).
+        var url = $"{BaseUrl}/indexes('{IndexName}')/docs/search.post.search?api-version={ApiVersion}";
+        var (status, body) = await RawPostAsync(url, """{"search": "*", "top": 2}""");
+        Assert.Equal(200, status);
+        using (var doc = System.Text.Json.JsonDocument.Parse(body))
+        {
+            var ids = doc.RootElement.GetProperty("value")
+                .EnumerateArray().Select(e => e.GetProperty("id").GetString()).ToArray();
+            Assert.Equal(new[] { "1", "2" }, ids);
+            var nextParams = doc.RootElement.GetProperty("@search.nextPageParameters").GetRawText();
+            Assert.Contains("continuation", nextParams);
+
+            // A document mutation does NOT invalidate the outstanding token;
+            // the new doc sorts last, so skip=2 still resumes at "3".
+            await searchClient.UploadDocumentsAsync(new[]
+            {
+                new SearchDocument { ["id"] = "6", ["title"] = "doc 6", ["price"] = 6.0 },
+            });
+
+            var (status2, body2) = await RawPostAsync(url, nextParams);
+            Assert.Equal(200, status2);
+            using var doc2 = System.Text.Json.JsonDocument.Parse(body2);
+            var ids2 = doc2.RootElement.GetProperty("value")
+                .EnumerateArray().Select(e => e.GetProperty("id").GetString()).ToArray();
+            Assert.Equal(new[] { "3", "4" }, ids2);
+        }
+    }
+
+    [Fact]
     public async Task SearchCount()
     {
         var searchClient = await PricedDocsAsync();
@@ -732,14 +776,14 @@ public class SdkTests : EmulatorTestBase
             new SearchDocument { ["id"] = "3", ["title"] = "unrelated", ["price"] = 3.0 },
         });
 
-        // Default (all/AND): no document contains both terms.
+        // Default (any/OR, matching Azure): either term matches.
         var found = await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "azure emulators");
-        Assert.Empty(found);
-        // Explicit all: same AND semantics.
+        Assert.Equal(new[] { "1", "2" }, found.Select(d => (string)d["id"]).OrderBy(x => x));
+        // Explicit all: AND semantics — no document contains both terms.
         found = await RunSearch<SearchDocument>(
             searchClient, new SearchOptions { SearchMode = SearchMode.All }, "azure emulators");
         Assert.Empty(found);
-        // Any (OR): either term matches.
+        // Explicit any (OR): either term matches.
         found = await RunSearch<SearchDocument>(
             searchClient, new SearchOptions { SearchMode = SearchMode.Any }, "azure emulators");
         Assert.Equal(new[] { "1", "2" }, found.Select(d => (string)d["id"]).OrderBy(x => x));
@@ -784,6 +828,27 @@ public class SdkTests : EmulatorTestBase
             Assert.Equal(new[] { "1" }, found.Select(d => (string)d["id"]));
         }
         Assert.Empty(await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "zzz~"));
+    }
+
+    [Fact]
+    public async Task SearchFuzzyLowercasesButDoesNotStem()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(TestData.FullIndex());
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = "azure emulator", ["price"] = 1.0 },
+            new SearchDocument { ["id"] = "2", ["title"] = "other things", ["price"] = 2.0 },
+        });
+
+        // The indexed term is the stem "emul". A fuzzy term is lowercased only
+        // (no stemming), matching Azure: "emul" matches, but the full word
+        // "emulator" is 4 edits from "emul" and matches nothing.
+        Assert.Equal(new[] { "1" }, (await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "emul~")).Select(d => (string)d["id"]));
+        Assert.Empty(await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "emulator~"));
+        // Fuzzy terms are case-insensitive.
+        Assert.Equal(new[] { "1" }, (await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "EMUL~")).Select(d => (string)d["id"]));
     }
 
     [Fact]

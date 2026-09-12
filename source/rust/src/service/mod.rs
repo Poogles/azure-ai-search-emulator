@@ -398,18 +398,18 @@ impl ResourceStore {
 }
 
 /// A continuation token: the opaque URL-safe `base64(json{filter, orderby,
-/// skip, state_version, vector_query_hash?})` value carried in
-/// `@odata.nextLink` and returned by the client in the `continuation` request
-/// parameter. URL-safe encoding keeps the token intact inside query strings
-/// (`+`/`/` would otherwise be mangled); decoding still accepts the legacy
-/// standard alphabet. `vector_query_hash` binds the token to the
-/// `vectorQueries` + `vectorFilterMode` identity when vector search is active.
+/// skip, vector_query_hash?})` value carried in `@odata.nextLink` and returned
+/// by the client in the `continuation` request parameter. URL-safe encoding
+/// keeps the token intact inside query strings (`+`/`/` would otherwise be
+/// mangled); decoding still accepts the legacy standard alphabet. Tokens remain
+/// valid across document mutations (like Azure; results may shift).
+/// `vector_query_hash` binds the token to the `vectorQueries` +
+/// `vectorFilterMode` identity when vector search is active.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContinuationToken {
     pub filter: Option<String>,
     pub orderby: Option<String>,
     pub skip: u64,
-    pub state_version: u64,
     #[serde(default)]
     pub vector_query_hash: Option<u64>,
 }
@@ -447,10 +447,6 @@ pub struct SearchService {
     /// Cap on accepted vector dimensions (`EMULATOR_VECTOR__MAX_DIMENSION`,
     /// default 3072).
     max_vector_dimension: usize,
-    /// Monotonically increasing counter incremented on every document
-    /// mutation; embedded in continuation tokens so stale tokens can be
-    /// detected.
-    state_version: AtomicU64,
     /// Service-level synonym maps, keyed by name (sorted).
     synonym_maps: std::sync::RwLock<std::collections::BTreeMap<String, SynonymMap>>,
     /// Counter for generated synonym-map etags.
@@ -475,7 +471,6 @@ impl SearchService {
             engine,
             vectors,
             max_vector_dimension,
-            state_version: AtomicU64::new(0),
             synonym_maps: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             synonym_map_etags: AtomicU64::new(0),
             aliases: ResourceStore::default(),
@@ -487,16 +482,6 @@ impl SearchService {
     #[must_use]
     pub fn storage(&self) -> &Arc<dyn Storage> {
         &self.storage
-    }
-
-    /// The current document-mutation counter.
-    #[must_use]
-    pub fn state_version(&self) -> u64 {
-        self.state_version.load(Ordering::SeqCst)
-    }
-
-    fn bump_state_version(&self) {
-        self.state_version.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Creates an index from a raw Azure `SearchIndex` definition, returning
@@ -564,7 +549,6 @@ impl SearchService {
                 format!("An alias with name {:?} already exists.", definition.name),
             ));
         }
-        let replaced = self.storage.get_index(&definition.name).is_some();
         self.storage.upsert_index(&definition);
         // Replacing an index discards its documents, so rebuild the search index.
         self.engine.delete_index(&definition.name);
@@ -583,9 +567,6 @@ impl SearchService {
             self.storage.delete_index(&definition.name);
             self.engine.delete_index(&definition.name);
             return Err(ApiError::bad_request("InvalidIndex", message));
-        }
-        if replaced {
-            self.bump_state_version();
         }
         Ok(definition.raw.clone())
     }
@@ -1003,7 +984,6 @@ impl SearchService {
                     .delete_documents(&definition.name, &deletes)
                     .map_err(|e| ApiError::not_found(e.to_string()))?;
             }
-            self.bump_state_version();
         }
         Ok(batch.results)
     }
@@ -1256,9 +1236,7 @@ impl SearchService {
         let search = obj.get("search").and_then(Value::as_str).map(str::to_owned);
         // The search text itself is parsed once, in `prepare_full_text` when
         // the search runs; malformed text surfaces there as `400 InvalidQuery`.
-        // `searchMode`: `all` (AND, the emulator default) or `any` (OR).
-        // When omitted the emulator uses AND; Azure defaults to OR (see
-        // `docs/known_differences.md`).
+        // `searchMode`: `any` (OR, the default, matching Azure) or `all` (AND).
         let search_mode = parse_search_mode(obj)?;
         let (count, top, skip) = parse_paging_options(obj)?;
 
@@ -1349,7 +1327,7 @@ impl SearchService {
         // A continuation token is authoritative for skip/filter/orderby and
         // must reference the current document state.
         let (skip, filter, orderby) =
-            self.resolve_paging(query, &definition, current_vector_hash)?;
+            Self::resolve_paging(query, &definition, current_vector_hash)?;
 
         let full_text = prepare_full_text(query)?;
         let vector_active = !query.vector_queries.is_empty();
@@ -1458,15 +1436,15 @@ impl SearchService {
     /// Resolves the effective `(skip, filter, orderby)` for a search. When a
     /// continuation token is present it encapsulates the result-set state, so
     /// its `skip`/`filter`/`orderby` win over the request parameters: paging
-    /// can never mix states mid-sequence. The token must also reference the
-    /// current document state as well as the request's vector-query identity.
+    /// can never mix states mid-sequence. Tokens remain valid across document
+    /// mutations (like Azure; results may shift). The token must also match the
+    /// request's vector-query identity.
     ///
     /// # Errors
     ///
-    /// Returns an [`ApiError`] (`400 InvalidQuery`) when the token is
-    /// invalid or stale, or the vector queries changed mid-paging.
+    /// Returns an [`ApiError`] (`400 InvalidQuery`) when the token is invalid
+    /// or the vector queries changed mid-paging.
     fn resolve_paging(
-        &self,
         query: &SearchQuery,
         definition: &IndexDefinition,
         current_vector_hash: Option<u64>,
@@ -1477,13 +1455,6 @@ impl SearchService {
         let token = ContinuationToken::decode(raw).map_err(|e| {
             ApiError::bad_request("InvalidQuery", format!("Invalid continuation token: {e}"))
         })?;
-        if token.state_version != self.state_version() {
-            return Err(ApiError::bad_request(
-                "InvalidQuery",
-                "Stale continuation token: the index changed since the token was issued. \
-                 Restart the search.",
-            ));
-        }
         if (current_vector_hash.is_some() || token.vector_query_hash.is_some())
             && current_vector_hash != token.vector_query_hash
         {
@@ -1618,7 +1589,6 @@ impl SearchService {
                 filter,
                 orderby,
                 skip: outcome.next_skip,
-                state_version: self.state_version(),
                 vector_query_hash,
             }
             .encode(),
@@ -1771,7 +1741,6 @@ impl SearchService {
         self.aliases.clear();
         self.knowledge_sources.clear();
         self.knowledge_bases.clear();
-        self.bump_state_version();
     }
 
     fn require_index(&self, name: &str) -> Result<IndexDefinition, ApiError> {
@@ -2366,8 +2335,8 @@ fn parse_facet_entry(
     Ok(())
 }
 
-/// Parses the `searchMode` option (`search_mode` SDK alias accepted): `all`
-/// (AND, the default) or `any` (OR).
+/// Parses the `searchMode` option (`search_mode` SDK alias accepted): `any`
+/// (OR, the default, matching Azure) or `all` (AND).
 ///
 /// # Errors
 ///
@@ -4211,15 +4180,15 @@ mod tests {
         assert_eq!(query.highlight_fields, vec!["title".to_owned()]);
         assert_eq!(query.highlight_pre_tag, "<b>");
         assert_eq!(query.highlight_post_tag, "</b>");
-        // Defaults: AND mode, unit boosts, <em> tags.
+        // Defaults: OR mode (matching Azure), unit boosts, <em> tags.
         let query = ok(service.parse_search("items", &json!({"highlight": "title"})));
-        assert_eq!(query.search_mode, crate::query::SearchMode::All);
+        assert_eq!(query.search_mode, crate::query::SearchMode::Any);
         assert_eq!(query.highlight_pre_tag, "<em>");
         assert_eq!(query.highlight_post_tag, "</em>");
     }
 
     #[test]
-    fn continuation_token_round_trips_and_detects_staleness() {
+    fn continuation_token_round_trips_and_survives_mutation() {
         let service = service();
         ok(service.create_index(&index_body()));
         upload(
@@ -4240,20 +4209,19 @@ mod tests {
         let decoded =
             ContinuationToken::decode(&token).unwrap_or_else(|e| panic!("token decodes: {e}"));
         assert_eq!(decoded.skip, 2);
-        assert_eq!(decoded.state_version, service.state_version());
         assert_eq!(decoded.filter.as_deref(), Some("title eq 'same'"));
 
-        // A mutation invalidates the token.
+        // A mutation does NOT invalidate the token (like Azure; results may
+        // shift). The filter still matches ids 0-4, so skip=2 resumes at "2".
         upload(&service, vec![json!({"id": "5", "title": "new"})]);
-        let stale = SearchQuery {
+        let resumed = SearchQuery {
             continuation: Some(token),
             ..query.clone()
         };
-        let api_error = err(service.search("items", &stale));
-        assert_eq!(api_error.code, "InvalidQuery");
-        assert!(api_error.message.contains("Stale"));
+        let outcome = ok(service.search("items", &resumed));
+        assert_eq!(outcome.documents.first().map(|d| d.key.as_str()), Some("2"));
 
-        // A fresh token works and resumes after the first page.
+        // A fresh token also works and resumes after the first page.
         let outcome = ok(service.search("items", &query));
         let token = service
             .next_continuation(&query, &outcome)
@@ -4607,7 +4575,6 @@ mod tests {
             filter: Some("price ge 2 and title ne 'x/y+z'".to_owned()),
             orderby: Some("price desc".to_owned()),
             skip: 7,
-            state_version: 3,
             vector_query_hash: Some(u64::MAX),
         };
         // `+` and `/` would be mangled inside query strings; the URL-safe

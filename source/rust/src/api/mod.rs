@@ -760,8 +760,8 @@ fn search_response(
         // next request is the original body plus the continuation token. The
         // SDK drops unknown properties on re-serialization, so the paging
         // cursor is also carried in the first-class `skip` property (which
-        // survives the round-trip); `continuation` additionally enables stale
-        // token detection for clients that preserve it.
+        // survives the round-trip); `continuation` additionally binds the
+        // result-set state (filter/orderby) for clients that preserve it.
         let mut next_params = match raw_request {
             Value::Object(map) => map.clone(),
             _ => Map::new(),

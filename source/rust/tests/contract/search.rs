@@ -518,16 +518,16 @@ async fn search_mode_any_matches_union() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    // Default (all/AND): both terms must match — nothing matches both.
+    // Default (any/OR, matching Azure): either term matches.
     let (status, body) = call(
         app.clone(),
         search_request("items", json!({"search": "azure emulators"})),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["value"].as_array().map(Vec::len), Some(0));
+    assert_eq!(body["value"].as_array().map(Vec::len), Some(2));
 
-    // Explicit all: same AND semantics.
+    // Explicit all: AND semantics — nothing matches both terms.
     let (status, body) = call(
         app.clone(),
         search_request(

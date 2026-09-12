@@ -11,8 +11,8 @@
 //!   stopword removal, English stemming) approximating Azure's basic English
 //!   analyzer.
 //! - `*` or an empty search term matches all documents.
-//! - A multi-term search combines required clauses with AND (`searchMode=all`,
-//!   the emulator default) or OR (`searchMode=any`).
+//! - A multi-term search combines required clauses with OR (`searchMode=any`,
+//!   the default, matching Azure) or AND (`searchMode=all`).
 //! - Simple-query boolean operators: `+term` (required, the default),
 //!   `-term` (excluded), `"quoted phrases"`, and Lucene-style fuzzy terms
 //!   (`term~` for the default edit distance 2, `term~1` for distance 1).
@@ -219,11 +219,11 @@ pub enum Clause {
 /// `searchMode` (`all` / `any`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SearchMode {
-    /// Every required clause must match (AND). This is the emulator default
-    /// when `searchMode` is omitted; Azure defaults to `Any`.
-    #[default]
+    /// Every required clause must match (AND).
     All,
-    /// At least one required clause must match (OR).
+    /// At least one required clause must match (OR). This is the default when
+    /// `searchMode` is omitted, matching Azure.
+    #[default]
     Any,
 }
 
@@ -274,9 +274,8 @@ impl FullTextQuery {
 /// Supports `+term` (required; the default), `-term` (excluded), `"quoted
 /// phrases"`, and Lucene-style fuzzy terms (`term~` for the default edit
 /// distance 2, `term~N` for an explicit distance 0-2). An empty text or `*`
-/// produces a match-all query. Like the rest of the emulator pipeline, fuzzy
-/// terms are analyzed (lowercased, stemmed); Azure only lowercases fuzzy
-/// terms (see `docs/known_differences.md`).
+/// produces a match-all query. Fuzzy terms are lowercased only (no stemming,
+/// stopword removal, or punctuation splitting), matching Azure.
 ///
 /// # Errors
 ///
@@ -706,7 +705,7 @@ fn resolve_doc_paths<'a>(fields: &'a Map<String, Value>, path: &str) -> Vec<&'a 
 
 /// Builds the Tantivy query for a [`FullTextQuery`]: match-all when the query
 /// has no clauses, otherwise a boolean combination where each required clause
-/// is `Must` (`searchMode=all`, the default) or `Should` (`searchMode=any`)
+/// is `Should` (`searchMode=any`, the default) or `Must` (`searchMode=all`)
 /// and each excluded clause is `MustNot`. Each clause is an OR over the
 /// in-scope searchable fields (a term query per analyzer token, or a phrase
 /// query for quoted phrases). A clause that analyzes to no tokens (e.g. a
@@ -775,20 +774,18 @@ fn clause_query(
             Box::new(BooleanQuery::new(term_clauses))
         }
         Clause::FuzzyTerm { term, distance } => {
-            let tokens = analyze(term);
-            if tokens.is_empty() {
+            // Azure lowercases fuzzy terms but bypasses analysis (no stemming,
+            // no stopword removal, no punctuation splitting), so the raw
+            // lowercased term is the single fuzzy token.
+            let token = term.to_lowercase();
+            if token.is_empty() {
                 return Box::new(EmptyQuery);
             }
-            let mut fuzzy_clauses: Vec<(Occur, Box<dyn Query>)> =
-                Vec::with_capacity(tokens.len() * fields.len());
-            for token in &tokens {
-                for (name, field) in fields {
-                    let term = Term::from_field_text(*field, token);
-                    let query: Box<dyn Query> =
-                        Box::new(FuzzyTermQuery::new(term, *distance, true));
-                    fuzzy_clauses
-                        .push((Occur::Should, maybe_boost(query, field_boost(boosts, name))));
-                }
+            let mut fuzzy_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(fields.len());
+            for (name, field) in fields {
+                let term = Term::from_field_text(*field, &token);
+                let query: Box<dyn Query> = Box::new(FuzzyTermQuery::new(term, *distance, true));
+                fuzzy_clauses.push((Occur::Should, maybe_boost(query, field_boost(boosts, name))));
             }
             Box::new(BooleanQuery::new(fuzzy_clauses))
         }
@@ -950,10 +947,29 @@ mod tests {
     }
 
     #[test]
-    fn multi_term_requires_all_terms() {
+    fn multi_term_all_mode_requires_all_terms() {
         let engine = engine_with_docs();
-        assert_eq!(keys(&engine, "azure fox"), vec!["1"]);
-        assert!(keys(&engine, "azure horse").is_empty());
+        // Explicit `all` (AND): both terms must match.
+        let mut all =
+            parse_search_text("azure fox").unwrap_or_else(|e| panic!("parse failed: {e}"));
+        all.mode = SearchMode::All;
+        let mut keys: Vec<String> = engine
+            .search("items", &all)
+            .unwrap_or_else(|e| panic!("search failed: {e}"))
+            .into_keys()
+            .collect();
+        keys.sort();
+        assert_eq!(keys, vec!["1"]);
+        // AND of a present and an absent term matches nothing.
+        let mut none =
+            parse_search_text("azure horse").unwrap_or_else(|e| panic!("parse failed: {e}"));
+        none.mode = SearchMode::All;
+        assert!(engine
+            .search("items", &none)
+            .unwrap_or_else(|e| panic!("search failed: {e}"))
+            .into_keys()
+            .collect::<Vec<_>>()
+            .is_empty());
     }
 
     #[test]
@@ -1037,8 +1053,10 @@ mod tests {
     #[test]
     fn explicit_plus_is_the_default() {
         let engine = engine_with_docs();
-        assert_eq!(keys(&engine, "+azure +fox"), vec!["1"]);
-        assert_eq!(keys(&engine, "azure fox"), vec!["1"]);
+        // `+term` is treated like a plain term (both go to the required list),
+        // so under the OR default both match either document.
+        assert_eq!(keys(&engine, "+azure +fox"), vec!["1", "2"]);
+        assert_eq!(keys(&engine, "azure fox"), vec!["1", "2"]);
     }
 
     #[test]
@@ -1047,8 +1065,8 @@ mod tests {
         assert_eq!(keys(&engine, r#""quick brown""#), vec!["1"]);
         // Tokens present but not adjacent.
         assert!(keys(&engine, r#""brown quick""#).is_empty());
-        // Phrase combined with a required term.
-        assert_eq!(keys(&engine, r#"azure "lazy dogs""#), vec!["2"]);
+        // Phrase combined with a term: OR (the default) matches either.
+        assert_eq!(keys(&engine, r#"azure "lazy dogs""#), vec!["1", "2"]);
     }
 
     #[test]
@@ -1107,19 +1125,19 @@ mod tests {
     #[test]
     fn search_mode_any_matches_union() {
         let engine = engine_with_docs();
-        // Default (all/AND): both terms must match.
-        assert_eq!(keys(&engine, "azure fox"), vec!["1"]);
-        // Any (OR): either term matches.
-        let mut any =
+        // Default (any/OR, matching Azure): either term matches.
+        assert_eq!(keys(&engine, "azure fox"), vec!["1", "2"]);
+        // All (AND): both terms must match.
+        let mut all =
             parse_search_text("azure fox").unwrap_or_else(|e| panic!("parse failed: {e}"));
-        any.mode = SearchMode::Any;
+        all.mode = SearchMode::All;
         let mut keys: Vec<String> = engine
-            .search("items", &any)
+            .search("items", &all)
             .unwrap_or_else(|e| panic!("search failed: {e}"))
             .into_keys()
             .collect();
         keys.sort();
-        assert_eq!(keys, vec!["1", "2"]);
+        assert_eq!(keys, vec!["1"]);
         // SearchMode parsing accepts both values case-insensitively.
         assert_eq!(SearchMode::parse("all"), Ok(SearchMode::All));
         assert_eq!(SearchMode::parse("ANY"), Ok(SearchMode::Any));
@@ -1149,8 +1167,15 @@ mod tests {
     #[test]
     fn fuzzy_terms_match_within_edit_distance() {
         let engine = engine_with_docs();
-        // "emulator" stems to the indexed "emul" (from "Emulators").
-        assert_eq!(keys(&engine, "emulator~"), vec!["2"]);
+        // Fuzzy terms are lowercased only (no stemming): "emul" matches the
+        // indexed stemmed "emul" (from "Emulators") exactly.
+        assert_eq!(keys(&engine, "emul~"), vec!["2"]);
+        // "emulator" is NOT stemmed for fuzzy matching, so it is 4 edits from
+        // the indexed "emul" and matches nothing (Azure lowercases fuzzy
+        // terms only; a stemmed query would have matched).
+        assert!(keys(&engine, "emulator~").is_empty());
+        // Fuzzy terms are case-insensitive: "FOX~1" matches indexed "fox".
+        assert_eq!(keys(&engine, "FOX~1"), vec!["1"]);
         // One substitution away from indexed "fox" ("box" is also two away
         // from indexed "dog", so the default distance matches both).
         assert_eq!(keys(&engine, "box~1"), vec!["1"]);

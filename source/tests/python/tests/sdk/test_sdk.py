@@ -695,12 +695,13 @@ def test_search_mode_any_matches_union(
             {"id": "3", "title": "unrelated", "price": 3.0},
         ]
     )
-    # Default (all/AND): no document contains both terms.
-    assert list(search_client.search(search_text="azure emulators")) == []
-    # Explicit all: same AND semantics.
+    # Default (any/OR, matching Azure): either term matches.
+    found = list(search_client.search(search_text="azure emulators"))
+    assert {doc["id"] for doc in found} == {"1", "2"}
+    # Explicit all: AND semantics — no document contains both terms.
     found = list(search_client.search(search_text="azure emulators", search_mode="all"))
     assert found == []
-    # Any (OR): either term matches.
+    # Explicit any (OR): either term matches.
     found = list(search_client.search(search_text="azure emulators", search_mode="any"))
     assert {doc["id"] for doc in found} == {"1", "2"}
 
@@ -739,6 +740,25 @@ def test_search_fuzzy_matches_typos(
         assert [doc["id"] for doc in found] == ["1"], f"term {term!r}"
     # Unrelated terms match nothing, even fuzzy.
     assert list(search_client.search(search_text="zzz~")) == []
+
+
+def test_search_fuzzy_lowercases_but_does_not_stem(
+    index_client: SearchIndexClient, search_client: SearchClient, full_index: SearchIndex
+) -> None:
+    index_client.create_index(full_index)
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "azure emulator", "price": 1.0},
+            {"id": "2", "title": "other things", "price": 2.0},
+        ]
+    )
+    # The indexed term is the stem "emul". A fuzzy term is lowercased only
+    # (no stemming), matching Azure: "emul" matches, but the full word
+    # "emulator" is 4 edits from "emul" and matches nothing.
+    assert [doc["id"] for doc in search_client.search(search_text="emul~")] == ["1"]
+    assert list(search_client.search(search_text="emulator~")) == []
+    # Fuzzy terms are case-insensitive.
+    assert [doc["id"] for doc in search_client.search(search_text="EMUL~")] == ["1"]
 
 
 def test_search_scores_rank_by_relevance(

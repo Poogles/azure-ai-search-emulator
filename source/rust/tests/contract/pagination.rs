@@ -83,7 +83,7 @@ async fn partial_page_returns_continuation() {
 }
 
 #[tokio::test]
-async fn stale_continuation_after_mutation_returns_400() {
+async fn continuation_survives_mutation() {
     let app = app_with_five_docs().await;
     let (status, body) = call(
         app.clone(),
@@ -93,7 +93,8 @@ async fn stale_continuation_after_mutation_returns_400() {
     assert_eq!(status, StatusCode::OK);
     let next_params = body["@search.nextPageParameters"].clone();
 
-    // A document mutation invalidates outstanding tokens.
+    // A document mutation does NOT invalidate outstanding tokens (like Azure;
+    // results may shift). The new doc sorts last, so skip=2 still resumes at "3".
     let (status, _) = call(
         app.clone(),
         upload_request(
@@ -105,11 +106,10 @@ async fn stale_continuation_after_mutation_returns_400() {
     assert_eq!(status, StatusCode::OK);
 
     let (status, body) = call(app, search_request("items", next_params)).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"]["code"], "InvalidQuery");
-    assert!(body["error"]["message"]
-        .as_str()
-        .is_some_and(|m| m.contains("Stale")));
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["value"].as_array().map(Vec::len), Some(2));
+    assert_eq!(body["value"][0]["id"], "3");
+    assert_eq!(body["value"][1]["id"], "4");
 }
 
 #[tokio::test]

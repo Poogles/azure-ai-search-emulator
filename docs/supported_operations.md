@@ -198,7 +198,7 @@ Route: `POST /indexes('{name}')/docs/search.post.search?api-version=...`.
 | Projection | `select=` | Supported (top-level fields only; `*` selects all fields) |
 | Facets | `facets=` | Supported (facetable fields only), with `count:N` / `top:N` limits (single-string and array forms) and the special `$count` facet |
 | Field-specific search | `search_fields=` | Supported (searchable fields only, including nested paths such as `Address/City`; `field^N` weights scale the field's BM25 score) |
-| Search modes | `search_mode=` (`all`/`any`) | Supported (`all`/AND is the emulator default when omitted; Azure defaults to `any`/OR) |
+| Search modes | `search_mode=` (`all`/`any`) | Supported (`any`/OR is the default when omitted, matching Azure) |
 | Highlighting | `highlight_fields=`, pre/post tags | Supported (searchable fields only; `@search.highlights` with whole-value fragments) |
 | Scoring profiles / parameters / statistics | `scoring_profile=`, ... | Unsupported (explicit) |
 | Semantic queries | `semantic=`, ... | Unsupported (explicit) |
@@ -234,8 +234,8 @@ When more results exist beyond the returned page, the response includes `@odata.
 
 - Token-based full-text match across `searchable: true` **string** fields (all of them, or the `searchFields` subset), using an English analyzer (lowercasing, punctuation splitting, English stopword removal, English stemming) approximating Azure's basic English analyzer.
 - `*` or an empty term matches all documents.
-- A multi-term search combines required clauses with AND (`searchMode=all`, the emulator default when omitted) or OR (`searchMode=any`); Azure defaults to OR.
-- Simple-query boolean operators: `+term` (required, the default), `-term` (excluded), `"quoted phrases"` (adjacent tokens), and fuzzy terms (`term~` for the default edit distance 2 like Azure, `term~N` for an explicit distance 0-2; larger distances rejected). An exclusion-only query matches all documents except the excluded ones. A clause that analyzes to no tokens (e.g. a stopword-only term) matches nothing.
+- A multi-term search combines required clauses with OR (`searchMode=any`, the default when omitted, matching Azure) or AND (`searchMode=all`).
+- Simple-query boolean operators: `+term` (required, the default), `-term` (excluded), `"quoted phrases"` (adjacent tokens), and fuzzy terms (`term~` for the default edit distance 2 like Azure, `term~N` for an explicit distance 0-2; larger distances rejected). Fuzzy terms are lowercased only (no stemming, stopword removal, or punctuation splitting), matching Azure. An exclusion-only query matches all documents except the excluded ones. A non-fuzzy clause that analyzes to no tokens (e.g. a stopword-only term) matches nothing.
 - `searchFields` weights (`field^N`, finite positive `N`) scale the field's BM25 contribution to `@search.score`; unknown/non-searchable fields and invalid weights are rejected with `400 InvalidQuery`.
 - Non-string fields are not full-text indexed; searching for a value that only appears in a numeric/boolean field matches nothing.
 - Results are ordered by BM25 score descending with the key field as tie-breaker (deterministic). `@search.score` is the BM25 relevance score (higher = more relevant); exact values differ from Azure's internal scoring, so assertions must check ordering, not equality. See `docs/known_differences.md`.
@@ -311,7 +311,7 @@ Matching is case-insensitive prefix or infix matching of the search text against
 | `400` | `InvalidIndexName` | Malformed `indexes('name')` path segment |
 | `400` | `InvalidRequest` | Missing or invalid JSON request body; analyze-text with an unknown `analyzer` or `field` |
 | `400` | `InvalidDocuments` | Document batch is not an array or `{"value": [...]}` object |
-| `400` | `InvalidQuery` | Search body is not a JSON object; `top`/`skip` not non-negative integers; invalid search text (incl. bad fuzzy distance), `searchMode`, filter (incl. `in`, string functions), orderby, select, facets, searchFields (incl. bad weights), or highlight options; stale or invalid continuation token; autocomplete/suggest missing `search`/`suggesterName`, empty search text, unknown suggester, or invalid `top` |
+| `400` | `InvalidQuery` | Search body is not a JSON object; `top`/`skip` not non-negative integers; invalid search text (incl. bad fuzzy distance), `searchMode`, filter (incl. `in`, string functions), orderby, select, facets, searchFields (incl. bad weights), or highlight options; invalid continuation token; autocomplete/suggest missing `search`/`suggesterName`, empty search text, unknown suggester, or invalid `top` |
 | `400` | `InvalidSynonymMap` | Missing/empty synonym-map name, format other than `solr`, empty synonyms, malformed `synonymmaps('name')` path segment, path/body name mismatch on `PUT` |
 | `400` | `InvalidAlias` | Missing/empty alias name, missing/empty `indexes`, malformed `aliases('name')` path segment, path/body name mismatch on `PUT` |
 | `400` | `InvalidKnowledgeSource` | Missing/empty source name or `kind`, missing `searchIndexParameters.searchIndexName` for searchIndex sources, malformed `knowledgesources('name')` path segment, path/body name mismatch on `PUT` |
