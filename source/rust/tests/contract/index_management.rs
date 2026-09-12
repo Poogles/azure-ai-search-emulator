@@ -1,4 +1,5 @@
 use axum::http::StatusCode;
+use serde_json::json;
 
 use super::common::*;
 
@@ -37,6 +38,93 @@ async fn create_or_update_index_upserts() {
     let (status, body) = call(app, second).await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["name"], "items");
+}
+
+#[tokio::test]
+async fn in_place_update_preserves_documents_when_compatible() {
+    let app = app();
+    let (status, _) = create_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let docs = json!([
+        {"@search.action": "upload", "document": {"id": "1", "title": "alpha", "price": 10.0}},
+        {"@search.action": "upload", "document": {"id": "2", "title": "beta", "price": 20.0}}
+    ]);
+    let (status, _) = call(app.clone(), upload_request("items", docs)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Update in place with a compatible schema: add a field.
+    let updated = json!({
+        "name": "items",
+        "fields": [
+            {"name": "id", "type": "Edm.String", "key": true},
+            {"name": "title", "type": "Edm.String", "searchable": true},
+            {"name": "price", "type": "Edm.Double", "filterable": true, "sortable": true},
+            {"name": "category", "type": "Edm.String", "filterable": true, "facetable": true}
+        ]
+    });
+    let (status, body) = call(
+        app.clone(),
+        request(
+            "PUT",
+            &format!("/indexes('items')?api-version={API_VERSION}"),
+            Some(API_KEY),
+            Some(updated),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["name"], "items");
+
+    // The documents survive the in-place update.
+    let (status, body) = call(app, search_request("items", json!({"search": "*"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<&str> = body["value"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|doc| doc["id"].as_str().unwrap_or(""))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(ids, vec!["1", "2"]);
+}
+
+#[tokio::test]
+async fn in_place_update_discards_documents_when_incompatible() {
+    let app = app();
+    let (status, _) = create_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let docs = json!([
+        {"@search.action": "upload", "document": {"id": "1", "title": "alpha", "price": 10.0}}
+    ]);
+    let (status, _) = call(app.clone(), upload_request("items", docs)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Update with an incompatible schema: drop the searchable `title` field.
+    let updated = json!({
+        "name": "items",
+        "fields": [
+            {"name": "id", "type": "Edm.String", "key": true},
+            {"name": "price", "type": "Edm.Double", "filterable": true, "sortable": true}
+        ]
+    });
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "PUT",
+            &format!("/indexes('items')?api-version={API_VERSION}"),
+            Some(API_KEY),
+            Some(updated),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The incompatible change replaces the index, discarding its documents.
+    let (status, body) = call(app, search_request("items", json!({"search": "*"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["value"].as_array().map_or(0, Vec::len), 0);
 }
 
 #[tokio::test]

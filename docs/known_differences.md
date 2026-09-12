@@ -19,7 +19,6 @@ Differences fall into two categories:
 | Scoring profiles, parameters, statistics              | Rejected                          | Scoring is BM25 (see below); custom scoring profiles are not applied.                               |
 | Semantic queries                                      | Rejected                          | No model inference in the emulator (initial design non-goal).                                       |
 | Vectorizer (`kind: "text"`) queries                   | Rejected (`400 UnsupportedQuery`) | No vectorizer in the emulator; callers must supply raw vectors.                                     |
-| Quantized vector types (`Collection(Edm.Half)`, etc.) | Rejected (`400 InvalidIndex`)     | Quantization is an optimisation not needed for a test double.                                       |
 | `queryType` other than `simple` (e.g. `full`/Lucene)  | Rejected                          | Only simple-query semantics are implemented (plus trailing-`~` fuzzy terms).                        |
 
 ## Silently different (operation succeeds, result may differ from Azure)
@@ -40,8 +39,8 @@ Differences fall into two categories:
 
 - `@search.score` for vector results uses emulator-defined formulas: cosine similarity for `cosine`, the raw inner product for `dotProduct`, `1/(1+l2)` for `euclidean`. Same direction as Azure (higher = more similar) and, for cosine, the same [0,1] range — but exact values differ from Azure's internal scoring. Test assertions must check ordering and recall, not exact score equality.
 - The HNSW path (cosine/euclidean on indexes larger than the `ef` window) is approximate; recall may differ slightly from Azure. Everything else is exact: the brute-force path (`exhaustiveKnn` profiles, per-query `exhaustive: true`, `preFilter`, small indexes) and `dotProduct`, which always scans (raw inner products cannot back an HNSW graph — see `docs/decisions/0004-vector-index.md`).
-- Hybrid (vector + full-text) ranking is union + max-score (deterministic): documents matching either side are returned, ordered by the best score. Azure fuses with RRF/a ranking model, so recall matches but ordering may differ.
-- Per-query `weight`, the index-schema `stored` property, and `sessionId` are accepted but inert. A missing vector-query `kind` defaults to `"vector"` (emulator-only leniency).
+- Hybrid (vector + full-text) ranking fuses the two sides with **Reciprocal Rank Fusion** (RRF, `k=60`): each side is ranked by its own score and a document's fused score is the sum of `1/(k+rank)` over the sides in which it appears, so a document ranked well on either side surfaces and a document present on both sides outranks one present on only one. This matches Azure's RRF-based fusion in approach (recall is the union, not the intersection). When only one side is active (vector-only or full-text-only) the native scores are kept via a plain union. Exact fused score values differ from Azure's ranking model, so test assertions must check ordering and recall, not exact score equality.
+- Per-query `weight` scales that vector query's contribution to the hybrid RRF fusion (a heavier query lifts its matches); the index-schema `stored` property and `sessionId` are accepted but inert. A missing vector-query `kind` defaults to `"vector"` (emulator-only leniency).
 - Algorithm-config leniencies (emulator-only): a missing algorithm `kind` defaults to `"hnsw"`; a top-level `parameters` object is accepted as an alias for the kind-specific parameters object; `m` is validated as 1-256 (Azure restricts it to 4-100).
 - Paging with vectors binds `vectorQueries` + `vectorFilterMode` into the continuation token; changing them mid-paging is `400` (Azure tokens tolerate broader reuse). Fail-fast beats silently shifted pages.
 - At most 5 vector queries per search and at most 16 vector fields per index (both match Azure); max dimension 3072 (or `EMULATOR_VECTOR__MAX_DIMENSION`).
@@ -60,7 +59,7 @@ Differences fall into two categories:
 - Autocomplete and suggest use **case-insensitive prefix or infix matching** of the search text against the whitespace-separated words of the suggester's search fields. Azure uses its full suggester algorithm (analyzing infix matching with scoring, fuzzy matching, and `searchMode` behaviour).
 - Autocomplete returns distinct completed terms (`text` + `queryPlusText`); suggest returns the matching documents (all fields) plus an `@search.text` field carrying the first matched word.
 - Results are ordered by index key (deterministic), not by relevance; `top` (default 5) limits the count.
-- The suggester's `searchMode` is accepted but inert, as are the other options the SDKs support on these routes (`filter`, `select`, `searchFields`, `orderby`, fuzzy matching, highlight tags, `autocompleteMode`, `minimumCoverage`). In particular a `filter` does not narrow suggestions — test assertions must not rely on it.
+- A `filter` narrows the candidate documents (like the search route): only documents matching the filter are considered for suggestions/completions. The suggester's `searchMode` and the other options the SDKs support on these routes (`select`, `searchFields`, `orderby`, fuzzy matching, highlight tags, `autocompleteMode`, `minimumCoverage`) are accepted but inert.
 - **Rationale:** substring matching covers the assertions the reference samples make (a term that prefixes a field word); real suggester scoring is out of scope for a test double.
 
 ### Filter matching
@@ -89,8 +88,9 @@ Differences fall into two categories:
 
 ### Index update semantics
 
-- `PUT /indexes('{name}')` (create or update) **replaces the index and discards all its documents**. Azure updates the definition in place and preserves documents when the schema change is compatible.
-- **Rationale:** replacement is simpler and deterministic; test suites recreate indexes from scratch rather than relying on in-place schema evolution.
+- `PUT /indexes('{name}')` (create or update) updates the definition **in place and preserves documents** when the schema change is compatible: every field in the previous schema is kept with the same name and type (and, for vector fields, the same dimensions). Adding fields or changing field attributes (`filterable`, `facetable`, `searchable`, analyzers, ...) preserves the documents, which are re-indexed into the updated schema.
+- When the change is **incompatible** — a field is removed, or a field's type or vector dimensions change — the index is replaced and its documents are discarded (matching Azure, which cannot preserve documents it can no longer validate).
+- **Rationale:** in-place preservation matches Azure's common update path so tests that evolve a schema keep their data; incompatible changes fail safe by replacing rather than silently keeping documents the new schema cannot index.
 
 ### Authentication
 
@@ -147,6 +147,8 @@ Differences fall into two categories:
 - Ranking direction: BM25 results order by score descending (most relevant first), like Azure; nulls sort first ascending / last descending, like Azure.
 - `searchMode` (`all`/`any`, defaulting to `any`/OR like Azure), field boosts (`field^N`), fuzzy terms (`term~`, lowercased only like Azure), stemming/stopwords, `highlight`, `in`, and string functions behave as Azure documents them (subject to the single-analyzer note above).
 - Alias names resolve to their target index on data-plane routes.
+- Quantized vector fields (`Collection(Edm.Half)`) are accepted and searched like `Collection(Edm.Single)` (values are dequantized to `f32`).
 - API versions on or after the configured floor are accepted.
 - SDK wire format: routes (`/docs/search.index`, `/docs/search.post.search`), the `{"value": [...]}` batch envelope, and top-level-spread document actions as sent by the pinned Python SDK (fixtures in `source/tests/python/fixtures/`).
 - Index-not-found (`404 ResourceNotFound`) is distinguished from an empty index (successful search with zero results).
+- `PUT /indexes('{name}')` updates a compatible schema in place, preserving and re-indexing its documents (incompatible changes replace the index).

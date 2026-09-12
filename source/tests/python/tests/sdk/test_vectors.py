@@ -121,6 +121,52 @@ def test_vector_index_crud(index_client: SearchIndexClient, vector_index: Search
     index_client.delete_index(INDEX_NAME)
 
 
+def test_quantized_half_vector_field_accepted(
+    index_client: SearchIndexClient, search_client: SearchClient
+) -> None:
+    """``Collection(Edm.Half)`` (quantized) vector fields are accepted and searchable."""
+    index = SearchIndex(
+        name=INDEX_NAME,
+        fields=[
+            SearchField(name="id", type="Edm.String", key=True),
+            SearchField(name="title", type="Edm.String", searchable=True, filterable=True),
+            SearchField(
+                name="v",
+                type="Collection(Edm.Half)",
+                searchable=True,
+                vector_search_dimensions=3,
+                vector_search_profile_name="eknn",
+            ),
+        ],
+        vector_search=VectorSearch(
+            algorithms=[
+                ExhaustiveKnnAlgorithmConfiguration(
+                    name="eknn-1",
+                    parameters=ExhaustiveKnnParameters(metric="cosine"),
+                ),
+            ],
+            profiles=[VectorSearchProfile(name="eknn", algorithm_configuration_name="eknn-1")],
+        ),
+    )
+    index_client.create_index(index)
+    results = search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "a", "v": [1.0, 0.0, 0.0]},
+            {"id": "2", "title": "b", "v": [0.0, 1.0, 0.0]},
+            {"id": "3", "title": "c", "v": [0.0, 0.0, 1.0]},
+        ]
+    )
+    assert all(r.succeeded for r in results)
+    found = list(
+        search_client.search(
+            vector_queries=[
+                VectorizedQuery(vector=[1.0, 0.0, 0.0], k_nearest_neighbors=3, fields="v")
+            ]
+        )
+    )
+    assert [doc["id"] for doc in found] == ["1", "2", "3"]
+
+
 def test_vector_search_returns_nearest_first(vector_docs: SearchClient) -> None:
     found = list(
         vector_docs.search(
@@ -166,6 +212,57 @@ def test_hybrid_search_returns_union(vector_docs: SearchClient) -> None:
     ids = {doc["id"] for doc in found}
     # Full-text matches 1, 2, 4; vector matches 3 — the union has all four.
     assert ids == {"1", "2", "3", "4"}
+
+
+def test_hybrid_search_fuses_with_rrf(vector_docs: SearchClient) -> None:
+    """A document matching both sides ranks above one matching a single side."""
+    found = list(
+        vector_docs.search(
+            search_text="azure",
+            vector_queries=[
+                VectorizedQuery(
+                    vector=[1.0, 0.0, 0.0], k_nearest_neighbors=2, fields="content_vector"
+                )
+            ],
+        )
+    )
+    ids = [doc["id"] for doc in found]
+    # Full-text "azure" matches 1, 2, 4; vector [1,0,0] top-2 matches 1 and 4.
+    # Docs 1 and 4 appear on both sides; doc 2 only on the full-text side.
+    assert set(ids) == {"1", "2", "4"}
+    # RRF gives both-side documents a higher fused score, so the single-side
+    # document (2) ranks last and the two both-side docs fill the top two.
+    assert ids[-1] == "2"
+    assert set(ids[:2]) == {"1", "4"}
+
+
+def test_hybrid_search_weight_scales_vector_contribution(
+    search_client: SearchClient, index_client: SearchIndexClient, vector_index: SearchIndex
+) -> None:
+    """A heavier vector weight lifts vector-only matches above full-text ones."""
+    index_client.create_index(vector_index)
+    # Doc "a" matches the full-text term only; doc "b" matches the vector only.
+    results = search_client.upload_documents(
+        documents=[
+            {"id": "a", "title": "alpha", "category": "tech", "content_vector": [0.0, 0.0, 1.0]},
+            {"id": "b", "title": "beta", "category": "tech", "content_vector": [1.0, 0.0, 0.0]},
+        ]
+    )
+    assert all(r.succeeded for r in results)
+
+    def search(weight: float | None) -> list[str]:
+        query = VectorizedQuery(
+            vector=[1.0, 0.0, 0.0], k_nearest_neighbors=1, fields="content_vector"
+        )
+        if weight is not None:
+            query.weight = weight
+        found = list(search_client.search(search_text="alpha", vector_queries=[query]))
+        return [doc["id"] for doc in found]
+
+    # Equal weights: each doc ranks 1 on its own side → tie, broken by key.
+    assert search(None) == ["a", "b"]
+    # A heavier vector weight lifts the vector-only doc ("b") to the top.
+    assert search(2.0) == ["b", "a"]
 
 
 def test_vector_filter_modes(vector_docs: SearchClient) -> None:

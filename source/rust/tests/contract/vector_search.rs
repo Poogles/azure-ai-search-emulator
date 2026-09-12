@@ -83,6 +83,61 @@ async fn create_index_with_vector_fields_returns_201() {
     assert_eq!(body["fields"][3]["dimensions"], 3);
 }
 
+#[tokio::test]
+async fn quantized_half_vector_field_is_accepted_and_searchable() {
+    let app = app();
+    let body = json!({
+        "name": "halfvecs",
+        "fields": [
+            {"name": "id", "type": "Edm.String", "key": true, "filterable": true, "sortable": true},
+            {"name": "title", "type": "Edm.String", "searchable": true, "filterable": true},
+            {"name": "v", "type": "Collection(Edm.Half)",
+             "searchable": true, "retrievable": true,
+             "dimensions": 3, "vectorSearchProfile": "eknn"}
+        ],
+        "vectorSearch": {
+            "algorithms": [{"name": "eknn-1", "kind": "exhaustiveKnn",
+                            "exhaustiveKnnParameters": {"metric": "cosine"}}],
+            "profiles": [{"name": "eknn", "algorithmConfigurationName": "eknn-1"}]
+        }
+    });
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            &format!("/indexes?api-version={API_VERSION}"),
+            Some(API_KEY),
+            Some(body),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let docs = json!([
+        {"@search.action": "upload", "document": {"id": "1", "title": "a", "v": [1.0, 0.0, 0.0]}},
+        {"@search.action": "upload", "document": {"id": "2", "title": "b", "v": [0.0, 1.0, 0.0]}},
+        {"@search.action": "upload", "document": {"id": "3", "title": "c", "v": [0.0, 0.0, 1.0]}}
+    ]);
+    let (status, _) = call(app.clone(), upload_request("halfvecs", docs)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A vector query against the half-precision field returns nearest-first.
+    let (status, body) = call(
+        app,
+        search_request(
+            "halfvecs",
+            json!({
+                "vectorQueries": [
+                    {"kind": "vector", "vector": [1.0, 0.0, 0.0], "fields": "v", "k": 3}
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(doc_ids(&body), vec!["1", "2", "3"]);
+}
+
 /// Asserts that each `(label, body)` index creation fails with
 /// `400 InvalidIndex`.
 async fn assert_invalid_indexes(app: &axum::Router, cases: &[(&str, Value)]) {
@@ -235,17 +290,6 @@ async fn create_index_rejects_vector_field_problems() {
             vector_index_named(
                 "v4",
                 &json!([key, vector_field("v", &json!({"dimensions": "three"}))]),
-                Some(minimal_vector_search()),
-            ),
-        ),
-        // Quantized vector type.
-        (
-            "quantized type",
-            vector_index_named(
-                "v7",
-                &json!([key,
-                    {"name": "v", "type": "Collection(Edm.Half)",
-                     "searchable": true, "dimensions": 2, "vectorSearchProfile": "p"}]),
                 Some(minimal_vector_search()),
             ),
         ),
@@ -468,6 +512,87 @@ async fn hybrid_search_returns_union_of_both_sides() {
     assert!(ids.contains(&"2".to_owned()));
     assert!(ids.contains(&"3".to_owned()));
     assert!(ids.contains(&"4".to_owned()));
+}
+
+#[tokio::test]
+async fn hybrid_search_fuses_with_rrf_ranking() {
+    let app = app();
+    let (status, _) = create_vector_index(&app, "vecs").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(app.clone(), upload_request("vecs", vector_documents())).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Full-text "azure" matches 1, 2, 4. Vector [1,0,0] top-2 matches 1 and 4.
+    // Documents 1 and 4 appear on BOTH sides; document 2 appears only on the
+    // full-text side. RRF gives a document present in both lists a higher
+    // fused score than one present in a single list, so the two both-side docs
+    // occupy the top two positions and the single-side doc (2) ranks last.
+    let (status, body) = call(
+        app,
+        search_request(
+            "vecs",
+            json!({
+                "search": "azure",
+                "vectorQueries": [
+                    {"kind": "vector", "vector": [1.0, 0.0, 0.0],
+                     "fields": "content_vector", "k": 2}
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let ids = doc_ids(&body);
+    assert_eq!(ids.len(), 3);
+    assert!(ids.contains(&"1".to_owned()));
+    assert!(ids.contains(&"2".to_owned()));
+    assert!(ids.contains(&"4".to_owned()));
+    // The single-side document ranks below both both-side documents.
+    assert_eq!(ids[2], "2");
+    let top_two: std::collections::BTreeSet<&str> =
+        ids.iter().take(2).map(String::as_str).collect();
+    assert_eq!(top_two, std::collections::BTreeSet::from(["1", "4"]));
+}
+
+#[tokio::test]
+async fn hybrid_search_weight_scales_vector_contribution() {
+    let app = app();
+    let (status, _) = create_vector_index(&app, "vecs").await;
+    assert_eq!(status, StatusCode::CREATED);
+    // Doc "a" matches the full-text term only; doc "b" matches the vector
+    // query only.
+    let docs = json!([
+        {"@search.action": "upload", "document":
+            {"id": "a", "title": "alpha", "category": "tech",
+             "content_vector": [0.0, 0.0, 1.0], "flat_vector": [0.0, 0.0, 1.0]}},
+        {"@search.action": "upload", "document":
+            {"id": "b", "title": "beta", "category": "tech",
+             "content_vector": [1.0, 0.0, 0.0], "flat_vector": [1.0, 0.0, 0.0]}}
+    ]);
+    let (status, _) = call(app.clone(), upload_request("vecs", docs)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let base = json!({
+        "search": "alpha",
+        "vectorQueries": [
+            {"kind": "vector", "vector": [1.0, 0.0, 0.0],
+             "fields": "content_vector", "k": 1}
+        ]
+    });
+
+    // Equal weights: each doc ranks 1 on its own side → tie, broken by key
+    // ("a" before "b").
+    let (status, body) = call(app.clone(), search_request("vecs", base.clone())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(doc_ids(&body), vec!["a", "b"]);
+
+    // A heavier vector weight lifts the vector-only doc ("b") above the
+    // full-text-only doc ("a").
+    let mut weighted = base.clone();
+    weighted["vectorQueries"][0]["weight"] = json!(2.0);
+    let (status, body) = call(app, search_request("vecs", weighted)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(doc_ids(&body), vec!["b", "a"]);
 }
 
 #[tokio::test]

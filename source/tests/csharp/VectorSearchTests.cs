@@ -110,6 +110,62 @@ public class VectorSearchTests : EmulatorTestBase
     }
 
     [Fact]
+    public async Task QuantizedHalfVectorFieldAccepted()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        var index = new SearchIndex(IndexName)
+        {
+            Fields =
+            {
+                new SearchField("id", SearchFieldDataType.String) { IsKey = true },
+                new SearchableField("title") { IsFilterable = true },
+                new SearchField("v", new SearchFieldDataType("Collection(Edm.Half)"))
+                {
+                    IsSearchable = true,
+                    VectorSearchDimensions = 3,
+                    VectorSearchProfileName = "eknn",
+                },
+            },
+            VectorSearch = new VectorSearch
+            {
+                Algorithms =
+                {
+                    new ExhaustiveKnnAlgorithmConfiguration("eknn-1")
+                    {
+                        Parameters = new ExhaustiveKnnParameters { Metric = "cosine" },
+                    },
+                },
+                Profiles = { new VectorSearchProfile("eknn", "eknn-1") },
+            },
+        };
+        await indexClient.CreateIndexAsync(index);
+        var results = await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = "a", ["v"] = new[] { 1.0f, 0.0f, 0.0f } },
+            new SearchDocument { ["id"] = "2", ["title"] = "b", ["v"] = new[] { 0.0f, 1.0f, 0.0f } },
+            new SearchDocument { ["id"] = "3", ["title"] = "c", ["v"] = new[] { 0.0f, 0.0f, 1.0f } },
+        });
+        Assert.All(results.Value.Results, r => Assert.True(r.Succeeded));
+
+        var found = await RunSearch<SearchDocument>(searchClient, new SearchOptions
+        {
+            VectorSearch = new VectorSearchOptions
+            {
+                Queries =
+                {
+                    new VectorizedQuery(new[] { 1.0f, 0.0f, 0.0f })
+                    {
+                        KNearestNeighborsCount = 3,
+                        Fields = { "v" },
+                    },
+                },
+            },
+        });
+        Assert.Equal(new[] { "1", "2", "3" }, found.Select(d => (string)d["id"]));
+    }
+
+    [Fact]
     public async Task VectorSearchReturnsNearestFirst()
     {
         var searchClient = await VectorDocsAsync();
@@ -142,6 +198,55 @@ public class VectorSearchTests : EmulatorTestBase
         }, "azure");
         // Full-text matches 1, 2, 4; vector matches 3 — the union has all four.
         Assert.Equal(new[] { "1", "2", "3", "4" }, found.Select(d => (string)d["id"]).OrderBy(x => x));
+    }
+
+    [Fact]
+    public async Task HybridSearchFusesWithRrf()
+    {
+        var searchClient = await VectorDocsAsync();
+        var found = await RunSearch<SearchDocument>(searchClient, new SearchOptions
+        {
+            VectorSearch = new VectorSearchOptions { Queries = { Query([1.0f, 0.0f, 0.0f], 2) } },
+        }, "azure");
+        var ids = found.Select(d => (string)d["id"]).ToList();
+        // Full-text "azure" matches 1, 2, 4; vector [1,0,0] top-2 matches 1 and 4.
+        // Docs 1 and 4 appear on both sides; doc 2 only on the full-text side.
+        Assert.Equal(new[] { "1", "2", "4" }, ids.OrderBy(x => x));
+        // RRF gives both-side documents a higher fused score, so the single-side
+        // document (2) ranks last and the two both-side docs fill the top two.
+        Assert.Equal("2", ids[^1]);
+        Assert.Equal(new[] { "1", "4" }, ids.Take(2).OrderBy(x => x));
+    }
+
+    [Fact]
+    public async Task HybridSearchWeightScalesVectorContribution()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(VectorIndex());
+        // Doc "a" matches the full-text term only; doc "b" matches the vector only.
+        var results = await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "a", ["title"] = "alpha", ["category"] = "tech", ["content_vector"] = new[] { 0.0f, 0.0f, 1.0f } },
+            new SearchDocument { ["id"] = "b", ["title"] = "beta", ["category"] = "tech", ["content_vector"] = new[] { 1.0f, 0.0f, 0.0f } },
+        });
+        Assert.All(results.Value.Results, r => Assert.True(r.Succeeded));
+
+        async Task<List<string>> Search(float? weight)
+        {
+            var query = Query([1.0f, 0.0f, 0.0f], 1);
+            query.Weight = weight;
+            var found = await RunSearch<SearchDocument>(searchClient, new SearchOptions
+            {
+                VectorSearch = new VectorSearchOptions { Queries = { query } },
+            }, "alpha");
+            return found.Select(d => (string)d["id"]).ToList();
+        }
+
+        // Equal weights: each doc ranks 1 on its own side → tie, broken by key.
+        Assert.Equal(new[] { "a", "b" }, await Search(null));
+        // A heavier vector weight lifts the vector-only doc ("b") to the top.
+        Assert.Equal(new[] { "b", "a" }, await Search(2.0f));
     }
 
     [Fact]

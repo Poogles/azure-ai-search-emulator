@@ -105,13 +105,17 @@ impl FieldDefinition {
         })
     }
 
-    /// Whether this field is a vector field: `Collection(Edm.Single)` with
-    /// declared `dimensions`. Fields merely *attempting* to be vector fields
-    /// (e.g. `dimensions` present but invalid, or a profile without
-    /// dimensions) are caught by service-level schema validation.
+    /// Whether this field is a vector field: `Collection(Edm.Single)` or
+    /// `Collection(Edm.Half)` (quantized) with declared `dimensions`. Fields
+    /// merely *attempting* to be vector fields (e.g. `dimensions` present but
+    /// invalid, or a profile without dimensions) are caught by service-level
+    /// schema validation.
     #[must_use]
     pub fn is_vector_field(&self) -> bool {
-        self.field_type == "Edm.Collection(Edm.Single)" && self.vector_dimensions.is_some()
+        matches!(
+            self.field_type.as_str(),
+            "Edm.Collection(Edm.Single)" | "Edm.Collection(Edm.Half)"
+        ) && self.vector_dimensions.is_some()
     }
 
     /// Whether the raw definition carries a `dimensions` property (under

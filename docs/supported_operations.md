@@ -26,7 +26,7 @@ Note on routes: the pinned SDK issues document operations against `/docs/search.
 | Operation | SDK method | HTTP request | Success | Errors | Status |
 |-----------|-----------|--------------|---------|--------|--------|
 | Create index | `SearchIndexClient.create_index` | `POST /indexes?api-version=...` | `201` + echoed definition | `409 IndexAlreadyExists` (name taken by an index or an alias), `400 InvalidIndex` | Supported |
-| Create or update index | `SearchIndexClient.create_or_update_index` | `PUT /indexes('{name}')?api-version=...` | `201` + echoed definition | `400 InvalidIndex` | Supported (replaces the index and discards its documents) |
+| Create or update index | `SearchIndexClient.create_or_update_index` | `PUT /indexes('{name}')?api-version=...` | `201` + echoed definition | `400 InvalidIndex` | Supported (updates a compatible schema in place, preserving and re-indexing its documents; incompatible changes replace the index) |
 | Get index | `SearchIndexClient.get_index` | `GET /indexes('{name}')?api-version=...` | `200` + stored definition | `404 ResourceNotFound` | Supported |
 | List indexes | `SearchIndexClient.list_indexes` | `GET /indexes?api-version=...` | `200 {"value": [...]}` (sorted by name) | — | Supported |
 | Delete index | `SearchIndexClient.delete_index` | `DELETE /indexes('{name}')?api-version=...` | `204` | `404 ResourceNotFound` | Supported |
@@ -68,7 +68,7 @@ Vector fields use the Azure wire format — the dimension is a separate property
 
 Rules (rejected with `400 InvalidIndex`):
 
-- `type` must be `Collection(Edm.Single)` (both SDK and REST spellings accepted). Quantized types (`Collection(Edm.Half)`, `...Int8`, etc.) are rejected.
+- `type` must be `Collection(Edm.Single)` or `Collection(Edm.Half)` (quantized; both SDK and REST spellings accepted, values dequantized to `f32`). Other quantized types (`...Int8`, etc.) are rejected.
 - `dimensions` is required: a positive integer, 1–3072 (cap lowerable via `EMULATOR_VECTOR__MAX_DIMENSION`).
 - `vectorSearchProfile` is required and must reference a profile in the index's `vectorSearch.profiles` array.
 - `searchable` must be `true`; the field must not be `key`, `filterable`, `sortable`, or `facetable`.
@@ -203,17 +203,17 @@ Route: `POST /indexes('{name}')/docs/search.post.search?api-version=...`.
 | Scoring profiles / parameters / statistics | `scoring_profile=`, ... | Unsupported (explicit) |
 | Semantic queries | `semantic=`, ... | Unsupported (explicit) |
 | Vector queries | `vector_queries=[VectorizedQuery(vector=..., fields=..., k_nearest_neighbors=..., exhaustive=...)]` | Supported (raw-vector kNN; `kind: "text"` vectorizer queries rejected with `400 UnsupportedQuery`) |
-| Vector + full-text hybrid | `search_text=` + `vector_queries=` together | Supported (union of both sides, best score wins; see Known differences) |
-| Vector filter mode | `vector_filter_mode=` (`preFilter`/`postFilter`) + top-level `filter=` | Supported (`postFilter` default; per-query `exhaustive=` supported; `weight=` accepted but inert) |
-| Suggest | `SearchClient.suggest(search_text=..., suggester_name=...)` (`/docs/search.post.suggest`) | Supported (prefix/infix match against the suggester's fields; returns documents + `@search.text`) |
-| Autocomplete | `SearchClient.autocomplete(search_text=..., suggester_name=...)` (`/docs/search.post.autocomplete`) | Supported (prefix/infix match against the suggester's fields; returns `text` + `queryPlusText`) |
+| Vector + full-text hybrid | `search_text=` + `vector_queries=` together | Supported (union of both sides fused with Reciprocal Rank Fusion, `k=60`; see Known differences) |
+| Vector filter mode | `vector_filter_mode=` (`preFilter`/`postFilter`) + top-level `filter=` | Supported (`postFilter` default; per-query `exhaustive=` supported; per-query `weight=` scales the query's hybrid RRF contribution) |
+| Suggest | `SearchClient.suggest(search_text=..., suggester_name=..., filter=...)` (`/docs/search.post.suggest`) | Supported (prefix/infix match against the suggester's fields; optional `filter` narrows candidates; returns documents + `@search.text`) |
+| Autocomplete | `SearchClient.autocomplete(search_text=..., suggester_name=..., filter=...)` (`/docs/search.post.autocomplete`) | Supported (prefix/infix match against the suggester's fields; optional `filter` narrows candidates; returns `text` + `queryPlusText`) |
 | Analyze text | `SearchIndexClient.analyze_text(...)` (`/search.analyze`) | Supported (English analyzer; `keyword`/`whitespace` tokenize as documented; `analyzer`/`field` validated) |
 | Service statistics | `SearchIndexClient.get_service_statistics()` (`/servicestats`) | Supported (static response: zero counters, default limits) |
 | `queryType` other than `simple` | — | Unsupported (explicit) |
 
 The full list of search options rejected with `400 UnsupportedQuery`: `scoringProfile`, `scoringParameters`, `scoringStatistics`, `minimumCoverage`, `answers`, `captions`, `semantic`, `semanticConfiguration`, `semanticQuery`, `semanticErrorHandling`, `semanticMaxWaitInMilliseconds`, `debug`.
 
-Accepted but inert (silently ignored): `sessionId` (the emulator uses deterministic score + key tie-breaking, so session affinity is irrelevant), per-query `weight` (no weighted fusion; hybrid is union + max-score), and the index-schema `stored` property (no separate stored/retrievable enforcement beyond `retrievable`).
+Accepted but inert (silently ignored): `sessionId` (the emulator uses deterministic score + key tie-breaking, so session affinity is irrelevant) and the index-schema `stored` property (no separate stored/retrievable enforcement beyond `retrievable`). Per-query `weight` is applied: it scales that vector query's contribution to the hybrid RRF fusion.
 
 ### Filter
 
@@ -273,9 +273,9 @@ Routes: `POST /indexes('{name}')/docs/search.post.autocomplete?api-version=...` 
 
 Both require the index to define a suggester (a `suggesters` array on the index definition; each suggester has a `name` and a list of searchable fields under `searchFields` — the key the pinned Python SDK serializes as `sourceFields` — both accepted). Suggester search fields must exist and be marked `searchable` (validated at index creation with `400 InvalidIndex`).
 
-Request body (as sent by the pinned Python SDK): `{"search": "...", "suggesterName": "..."}` plus optional `top` (default 5). The query-string form (`search`, `suggesterName`, `top`/`$top`) is also accepted. Missing `search` or `suggesterName` returns `400 InvalidQuery`; an unknown suggester returns `400 InvalidQuery`; a missing index returns `404 ResourceNotFound`; a present-but-invalid `top` (zero, negative, or non-integer) returns `400 InvalidQuery`.
+Request body (as sent by the pinned Python SDK): `{"search": "...", "suggesterName": "..."}` plus optional `top` (default 5) and `filter`. The query-string form (`search`, `suggesterName`, `top`/`$top`, `filter`) is also accepted. Missing `search` or `suggesterName` returns `400 InvalidQuery`; an unknown suggester returns `400 InvalidQuery`; a missing index returns `404 ResourceNotFound`; a present-but-invalid `top` (zero, negative, or non-integer) or an invalid `filter` returns `400 InvalidQuery`.
 
-Other options the SDKs support on these routes (`filter`, `select`, `searchFields`, `orderby`, fuzzy matching, highlight tags, `autocompleteMode`, `minimumCoverage`) are accepted but inert (see `docs/known_differences.md`).
+A `filter` narrows the candidate documents (only matching documents are considered). Other options the SDKs support on these routes (`select`, `searchFields`, `orderby`, fuzzy matching, highlight tags, `autocompleteMode`, `minimumCoverage`) are accepted but inert (see `docs/known_differences.md`).
 
 Matching is case-insensitive prefix or infix matching of the search text against the whitespace-separated words of the suggester's search fields (see `docs/known_differences.md`).
 

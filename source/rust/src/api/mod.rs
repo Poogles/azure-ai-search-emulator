@@ -575,10 +575,11 @@ async fn autocomplete_documents(
 ) -> Result<Json<Value>, ApiError> {
     let name = parse_index_name(&raw_name)?;
     let raw = parse_body(&body)?;
-    let (search_text, suggester_name, top) = suggest_request_params(&raw, uri.query())?;
-    let completions = state
-        .service
-        .autocomplete(&name, &suggester_name, &search_text, top)?;
+    let (search_text, suggester_name, top, filter) = suggest_request_params(&raw, uri.query())?;
+    let completions =
+        state
+            .service
+            .autocomplete(&name, &suggester_name, &search_text, top, filter.as_deref())?;
     let value = completions
         .iter()
         .map(|c| {
@@ -603,10 +604,11 @@ async fn suggest_documents(
 ) -> Result<Json<Value>, ApiError> {
     let name = parse_index_name(&raw_name)?;
     let raw = parse_body(&body)?;
-    let (search_text, suggester_name, top) = suggest_request_params(&raw, uri.query())?;
-    let suggestions = state
-        .service
-        .suggest(&name, &suggester_name, &search_text, top)?;
+    let (search_text, suggester_name, top, filter) = suggest_request_params(&raw, uri.query())?;
+    let suggestions =
+        state
+            .service
+            .suggest(&name, &suggester_name, &search_text, top, filter.as_deref())?;
     let value = suggestions
         .iter()
         .map(|s| {
@@ -1082,7 +1084,7 @@ fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
 fn suggest_request_params(
     raw: &Value,
     query: Option<&str>,
-) -> Result<(String, String, u64), ApiError> {
+) -> Result<(String, String, u64, Option<String>), ApiError> {
     let param = |keys: &[&str]| -> Option<String> {
         keys.iter().find_map(|key| {
             let key: &str = key;
@@ -1112,7 +1114,10 @@ fn suggest_request_params(
             ApiError::bad_request("InvalidQuery", "\"top\" must be a positive integer.")
         })?,
     };
-    Ok((search_text, suggester_name, top))
+    // An optional `filter` narrows the candidate documents (like the search
+    // route); absent or empty means no narrowing.
+    let filter = param(&["filter"]);
+    Ok((search_text, suggester_name, top, filter))
 }
 
 /// Parses a `top`/`$top` query-string value: must be a positive integer.

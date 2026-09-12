@@ -441,14 +441,36 @@ def test_search_order_by_multiple_fields(
     assert [doc["id"] for doc in found] == ["3", "1", "2"]
 
 
-def test_create_or_update_index_discards_documents(
+def test_create_or_update_index_preserves_documents_when_compatible(
     index_client: SearchIndexClient, search_client: SearchClient, full_index: SearchIndex
 ) -> None:
     index_client.create_index(full_index)
     search_client.upload_documents(documents=[{"id": "1", "title": "one"}])
     assert search_client.get_document_count() == 1
 
+    # Re-PUTting the same (compatible) schema updates in place and keeps the
+    # documents.
     index_client.create_or_update_index(full_index)
+    assert search_client.get_document_count() == 1
+
+
+def test_create_or_update_index_discards_documents_when_incompatible(
+    index_client: SearchIndexClient, search_client: SearchClient, full_index: SearchIndex
+) -> None:
+    index_client.create_index(full_index)
+    search_client.upload_documents(documents=[{"id": "1", "title": "one"}])
+    assert search_client.get_document_count() == 1
+
+    # Dropping the searchable `title` field is incompatible: the index is
+    # replaced and its documents discarded.
+    reduced = SearchIndex(
+        name=INDEX_NAME,
+        fields=[
+            SearchField(name="id", type=SearchFieldDataType.String, key=True),
+            SimpleField(name="price", type=SearchFieldDataType.Double, filterable=True, sortable=True),
+        ],
+    )
+    index_client.create_or_update_index(reduced)
     assert search_client.get_document_count() == 0
 
 
@@ -557,6 +579,46 @@ def test_suggest_and_autocomplete(
     assert suggestions[0].text == "Boston"
 
     completions = search_client.autocomplete(search_text="bos", suggester_name="sg")
+    assert [item.text for item in completions] == ["Boston"]
+    assert completions[0].query_plus_text == "bos Boston"
+
+
+def test_suggest_and_autocomplete_filter(
+    index_client: SearchIndexClient, search_client: SearchClient
+) -> None:
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchField(name="title", type=SearchFieldDataType.String, searchable=True),
+                SearchField(name="category", type=SearchFieldDataType.String, filterable=True),
+            ],
+            suggesters=[SearchSuggester(name="sg", source_fields=["title"])],
+        )
+    )
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "Boston Harbor Hotel", "category": "hotel"},
+            {"id": "2", "title": "Boston Airport Inn", "category": "inn"},
+            {"id": "3", "title": "Portland Harbor Hotel", "category": "hotel"},
+        ]
+    )
+
+    # Without a filter, both "bos" titles match.
+    suggestions = search_client.suggest(search_text="bos", suggester_name="sg")
+    assert [doc["id"] for doc in suggestions] == ["1", "2"]
+
+    # A filter narrows the candidates to only matching documents.
+    suggestions = search_client.suggest(
+        search_text="bos", suggester_name="sg", filter="category eq 'hotel'"
+    )
+    assert [doc["id"] for doc in suggestions] == ["1"]
+    assert suggestions[0].text == "Boston"
+
+    completions = search_client.autocomplete(
+        search_text="bos", suggester_name="sg", filter="category eq 'hotel'"
+    )
     assert [item.text for item in completions] == ["Boston"]
     assert completions[0].query_plus_text == "bos Boston"
 

@@ -436,3 +436,58 @@ async fn suggest_matches_infix() {
         .unwrap_or_default();
     assert_eq!(ids, vec!["1"]);
 }
+
+#[tokio::test]
+async fn suggest_and_autocomplete_filter_narrow_candidates() {
+    let app = app();
+    let (status, _) = create_suggester_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+    seed(&app).await;
+
+    // Without a filter, "bos" matches doc 1 (title) and doc 2 (tag).
+    let (status, body) = call(
+        app.clone(),
+        suggest_request("items", json!({"search": "bos", "suggesterName": "sg"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["value"].as_array().map(Vec::len), Some(2));
+
+    // A filter narrows the candidates: only the wifi-tagged doc (2) remains.
+    let (status, body) = call(
+        app.clone(),
+        suggest_request(
+            "items",
+            json!({"search": "bos", "suggesterName": "sg",
+                   "filter": "tags/any(t: t eq 'wifi')"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "filtered suggest failed: {body}");
+    let ids: Vec<&str> = body["value"]
+        .as_array()
+        .map(|items| items.iter().filter_map(|d| d["id"].as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(ids, vec!["2"]);
+
+    // Autocomplete narrows the same way: "bos" only completes from doc 2's tag.
+    let (status, body) = call(
+        app,
+        autocomplete_request(
+            "items",
+            json!({"search": "bos", "suggesterName": "sg",
+                   "filter": "tags/any(t: t eq 'wifi')"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "filtered autocomplete failed: {body}"
+    );
+    let texts: Vec<&str> = body["value"]
+        .as_array()
+        .map(|items| items.iter().filter_map(|c| c["text"].as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(texts, vec!["boston"]);
+}

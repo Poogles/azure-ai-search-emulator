@@ -523,7 +523,7 @@ public class SdkTests : EmulatorTestBase
     }
 
     [Fact]
-    public async Task CreateOrUpdateIndexDiscardsDocuments()
+    public async Task CreateOrUpdateIndexPreservesDocumentsWhenCompatible()
     {
         var indexClient = IndexClient();
         var searchClient = SearchClient(IndexName);
@@ -533,7 +533,34 @@ public class SdkTests : EmulatorTestBase
             new SearchDocument { ["id"] = "1", ["title"] = "one" },
         });
         Assert.Equal(1, (await searchClient.GetDocumentCountAsync()).Value);
+        // Re-PUTting the same (compatible) schema updates in place and keeps
+        // the documents.
         await indexClient.CreateOrUpdateIndexAsync(TestData.FullIndex());
+        Assert.Equal(1, (await searchClient.GetDocumentCountAsync()).Value);
+    }
+
+    [Fact]
+    public async Task CreateOrUpdateIndexDiscardsDocumentsWhenIncompatible()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(TestData.FullIndex());
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = "one" },
+        });
+        Assert.Equal(1, (await searchClient.GetDocumentCountAsync()).Value);
+        // Dropping the searchable `title` field is incompatible: the index is
+        // replaced and its documents discarded.
+        var reduced = new SearchIndex(IndexName)
+        {
+            Fields =
+            {
+                new SearchField("id", SearchFieldDataType.String) { IsKey = true },
+                new SimpleField("price", SearchFieldDataType.Double) { IsFilterable = true, IsSortable = true },
+            },
+        };
+        await indexClient.CreateOrUpdateIndexAsync(reduced);
         Assert.Equal(0, (await searchClient.GetDocumentCountAsync()).Value);
     }
 
@@ -656,6 +683,40 @@ public class SdkTests : EmulatorTestBase
         var completions = (await searchClient.AutocompleteAsync("bos", "sg", new AutocompleteOptions())).Value;
         Assert.Equal(new[] { "Boston" }, completions.Results.Select(c => c.Text));
         Assert.Equal("bos Boston", completions.Results[0].QueryPlusText);
+    }
+
+    [Fact]
+    public async Task SuggestAndAutocompleteFilter()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(new SearchIndex(IndexName)
+        {
+            Fields =
+            {
+                new SearchField("id", SearchFieldDataType.String) { IsKey = true },
+                new SearchableField("title"),
+                new SearchField("category", SearchFieldDataType.String) { IsFilterable = true },
+            },
+            Suggesters = { new SearchSuggester("sg", new[] { "title" }) },
+        });
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = "Boston Harbor Hotel", ["category"] = "hotel" },
+            new SearchDocument { ["id"] = "2", ["title"] = "Boston Airport Inn", ["category"] = "inn" },
+            new SearchDocument { ["id"] = "3", ["title"] = "Portland Harbor Hotel", ["category"] = "hotel" },
+        });
+
+        var allSuggestions = (await searchClient.SuggestAsync<SearchDocument>("bos", "sg", new SuggestOptions())).Value;
+        Assert.Equal(new[] { "1", "2" }, allSuggestions.Results.Select(d => (string)d.Document["id"]));
+
+        var filteredSuggestions = (await searchClient.SuggestAsync<SearchDocument>("bos", "sg", new SuggestOptions { Filter = "category eq 'hotel'" })).Value;
+        Assert.Equal(new[] { "1" }, filteredSuggestions.Results.Select(d => (string)d.Document["id"]));
+        Assert.Equal("Boston", filteredSuggestions.Results[0].Text);
+
+        var filteredCompletions = (await searchClient.AutocompleteAsync("bos", "sg", new AutocompleteOptions { Filter = "category eq 'hotel'" })).Value;
+        Assert.Equal(new[] { "Boston" }, filteredCompletions.Results.Select(c => c.Text));
+        Assert.Equal("bos Boston", filteredCompletions.Results[0].QueryPlusText);
     }
 
     [Fact]

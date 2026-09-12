@@ -36,6 +36,7 @@ const SUPPORTED_FIELD_TYPES: &[&str] = &[
     "Edm.Collection(Edm.Int64)",
     "Edm.Collection(Edm.Single)",
     "Edm.Collection(Edm.Double)",
+    "Edm.Collection(Edm.Half)",
     "Edm.Collection(Edm.Boolean)",
     "Edm.Collection(Edm.DateTimeOffset)",
     "Edm.Collection(Edm.Guid)",
@@ -130,14 +131,15 @@ pub struct SearchField {
 }
 
 /// One parsed `vectorQueries[]` entry: a raw-vector kNN query over one or
-/// more vector fields. `weight` is accepted but inert (no weighted fusion;
-/// see `docs/known_differences.md`).
+/// more vector fields. `weight` scales this query's contribution to the
+/// hybrid RRF fusion (default `1.0`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorQuery {
     pub fields: Vec<String>,
     pub vector: Vec<f32>,
     pub k: usize,
     pub exhaustive: bool,
+    pub weight: f32,
 }
 
 /// The top-level `vectorFilterMode`: `postFilter` (default) retrieves top-k
@@ -532,9 +534,13 @@ impl SearchService {
         }
     }
 
-    /// Creates or replaces an index from a raw Azure `SearchIndex` definition,
-    /// returning the echoed definition. Replacing an index discards its
-    /// documents.
+    /// Creates or updates an index from a raw Azure `SearchIndex` definition,
+    /// returning the echoed definition. When the index already exists and the
+    /// schema change is compatible with its stored documents (every existing
+    /// field is kept with the same name, type, and — for vector fields —
+    /// dimensions), the documents are preserved and re-indexed, matching
+    /// Azure's in-place update. Otherwise the index is replaced and its
+    /// documents are discarded.
     ///
     /// # Errors
     ///
@@ -549,8 +555,18 @@ impl SearchService {
                 format!("An alias with name {:?} already exists.", definition.name),
             ));
         }
+        // In-place update: capture the stored documents when the index exists
+        // and the schema change is compatible with them; otherwise the index
+        // is replaced and its documents are discarded.
+        let preserved = match self.storage.get_index(&definition.name) {
+            Some(existing) if schema_compatible(&existing, &definition) => self
+                .storage
+                .get_documents(&definition.name)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         self.storage.upsert_index(&definition);
-        // Replacing an index discards its documents, so rebuild the search index.
+        // Rebuild the search index; preserved documents are re-indexed below.
         self.engine.delete_index(&definition.name);
         if let Err(e) = self
             .engine
@@ -561,12 +577,37 @@ impl SearchService {
             self.storage.delete_index(&definition.name);
             return Err(engine_error(&definition.name, e));
         }
-        // Replacing an index discards its vectors as well.
+        // Rebuild the vector indexes; preserved vectors are re-inserted below.
         self.vectors.delete_index(&definition.name);
         if let Err(message) = self.create_vector_indexes(&definition) {
             self.storage.delete_index(&definition.name);
             self.engine.delete_index(&definition.name);
             return Err(ApiError::bad_request("InvalidIndex", message));
+        }
+        // Re-materialize preserved documents: engine, vectors, then storage
+        // (the same order as a fresh upload). A failure rolls the index back
+        // to absent so storage/engine/vectors never diverge.
+        if !preserved.is_empty() {
+            let rollback = |name: &str| {
+                self.storage.delete_index(name);
+                self.engine.delete_index(name);
+                self.vectors.delete_index(name);
+            };
+            if let Err(e) = self.engine.index_documents(&definition.name, &preserved) {
+                rollback(&definition.name);
+                return Err(engine_error(&definition.name, e));
+            }
+            if let Err(message) = self.apply_vector_changes(&definition, &preserved, &[]) {
+                rollback(&definition.name);
+                return Err(ApiError::internal(format!(
+                    "Vector re-indexing failed for index {:?}: {message}",
+                    definition.name
+                )));
+            }
+            if let Err(e) = self.storage.put_documents(&definition.name, preserved) {
+                rollback(&definition.name);
+                return Err(ApiError::not_found(e.to_string()));
+            }
         }
         Ok(definition.raw.clone())
     }
@@ -1342,10 +1383,10 @@ impl SearchService {
             .map(|doc| (doc.key.as_str(), &doc.fields))
             .collect();
 
-        let vector_scores = if vector_active {
-            self.vector_side_scores(&definition.name, query, filter.as_ref(), &doc_fields)
+        let vector_lists = if vector_active {
+            self.vector_side_score_lists(&definition.name, query, filter.as_ref(), &doc_fields)
         } else {
-            BTreeMap::new()
+            Vec::new()
         };
 
         // Full-text side: skipped only for vector-only searches (a match-all
@@ -1358,14 +1399,26 @@ impl SearchService {
             BTreeMap::new()
         };
 
-        // Hybrid merge: union, best score wins.
-        let mut merged: BTreeMap<String, f32> = vector_scores;
-        for (key, score) in full_text_scores {
+        // Hybrid merge: when both sides produced hits, fuse them with weighted
+        // Reciprocal Rank Fusion (RRF, k=60) — the full-text list at weight
+        // 1.0 and each vector-query list at its own `weight` — so a document
+        // ranked well on either side surfaces and a heavier query contributes
+        // more. When only one side is active (vector-only or full-text-only)
+        // keep the native scores via a plain union (best score wins).
+        let merged = if vector_lists.is_empty() || full_text_scores.is_empty() {
+            let mut merged = full_text_scores;
+            for (_, scores) in &vector_lists {
+                for (key, score) in scores {
+                    merged
+                        .entry(key.clone())
+                        .and_modify(|best| *best = best.max(*score))
+                        .or_insert(*score);
+                }
+            }
             merged
-                .entry(key)
-                .and_modify(|best| *best = best.max(score))
-                .or_insert(score);
-        }
+        } else {
+            rrf_fuse_weighted(&full_text_scores, 1.0, &vector_lists)
+        };
         let doc_map: BTreeMap<&str, &Document> = documents
             .iter()
             .map(|doc| (doc.key.as_str(), doc))
@@ -1474,17 +1527,19 @@ impl SearchService {
         Ok((token.skip, filter, orderby))
     }
 
-    /// Vector side of [`SearchService::search`]: the union of every
-    /// (query × field) hit with the best score per document key.
+    /// Vector side of [`SearchService::search`]: one `(weight, scores)` list
+    /// per vector query, where `scores` is the union of that query's
+    /// (field) hits with the best score per document key. Keeping the queries
+    /// separate lets the hybrid merge weight each query's RRF contribution.
     /// `preFilter` constrains candidates inside the scan; `postFilter` trims
     /// the retrieved top-k afterwards.
-    fn vector_side_scores(
+    fn vector_side_score_lists(
         &self,
         definition_name: &str,
         query: &SearchQuery,
         filter: Option<&FilterExpr>,
         doc_fields: &BTreeMap<&str, &Map<String, Value>>,
-    ) -> BTreeMap<String, f32> {
+    ) -> Vec<(f32, BTreeMap<String, f32>)> {
         let pre_filter: Option<KeyPredicate<'_>> = match (&query.vector_filter_mode, filter) {
             (VectorFilterMode::PreFilter, Some(expr)) => Some(Box::new(|key: &str| {
                 doc_fields
@@ -1493,8 +1548,13 @@ impl SearchService {
             })),
             _ => None,
         };
-        let mut scores: BTreeMap<String, f32> = BTreeMap::new();
+        let post_filter = matches!(
+            (&query.vector_filter_mode, filter),
+            (VectorFilterMode::PostFilter, Some(_))
+        );
+        let mut lists = Vec::with_capacity(query.vector_queries.len());
         for vector_query in &query.vector_queries {
+            let mut scores: BTreeMap<String, f32> = BTreeMap::new();
             for field in &vector_query.fields {
                 let hits = self.vectors.search(
                     definition_name,
@@ -1511,20 +1571,18 @@ impl SearchService {
                         .or_insert(score);
                 }
             }
-        }
-        if matches!(
-            (&query.vector_filter_mode, filter),
-            (VectorFilterMode::PostFilter, Some(_))
-        ) {
-            if let Some(expr) = filter {
-                scores.retain(|key, _| {
-                    doc_fields
-                        .get(key.as_str())
-                        .is_some_and(|fields| expr.matches(fields))
-                });
+            if post_filter {
+                if let Some(expr) = filter {
+                    scores.retain(|key, _| {
+                        doc_fields
+                            .get(key.as_str())
+                            .is_some_and(|fields| expr.matches(fields))
+                    });
+                }
             }
+            lists.push((vector_query.weight, scores));
         }
-        scores
+        lists
     }
 
     /// Full-text side of [`SearchService::search`]: matching keys with BM25
@@ -1610,8 +1668,10 @@ impl SearchService {
         suggester_name: &str,
         search_text: &str,
         top: u64,
+        filter: Option<&str>,
     ) -> Result<Vec<AutocompleteCompletion>, ApiError> {
         let (documents, suggester) = self.suggester_documents(index, suggester_name)?;
+        let filter_expr = filter.map(parse_filter_option).transpose()?;
         let search = search_text.trim();
         let needle = search.to_lowercase();
         if needle.is_empty() {
@@ -1624,6 +1684,11 @@ impl SearchService {
         let mut seen = std::collections::BTreeSet::new();
         let mut completions = Vec::new();
         for document in &documents {
+            if let Some(expr) = &filter_expr {
+                if !expr.matches(&document.fields) {
+                    continue;
+                }
+            }
             for field_name in &suggester.search_fields {
                 for value in resolve_field_values(&document.fields, field_name) {
                     for word in field_words(value) {
@@ -1658,8 +1723,10 @@ impl SearchService {
         suggester_name: &str,
         search_text: &str,
         top: u64,
+        filter: Option<&str>,
     ) -> Result<Vec<Suggestion>, ApiError> {
         let (documents, suggester) = self.suggester_documents(index, suggester_name)?;
+        let filter_expr = filter.map(parse_filter_option).transpose()?;
         let needle = search_text.trim().to_lowercase();
         if needle.is_empty() {
             return Err(ApiError::bad_request(
@@ -1670,6 +1737,11 @@ impl SearchService {
         let limit = usize::try_from(top).unwrap_or(usize::MAX);
         let mut suggestions = Vec::new();
         for document in &documents {
+            if let Some(expr) = &filter_expr {
+                if !expr.matches(&document.fields) {
+                    continue;
+                }
+            }
             let mut matched = None;
             for field_name in &suggester.search_fields {
                 for value in resolve_field_values(&document.fields, field_name) {
@@ -1886,6 +1958,60 @@ fn merge_fields(existing: &Document, update: &Value) -> Option<Value> {
 /// otherwise by score descending with the key field as tie-breaker so ranking
 /// is deterministic. Match-all (unscored) queries carry equal scores, so they
 /// stay in key order via the tie-breaker.
+/// Whether an in-place index update is compatible with the stored documents:
+/// every field in the old schema must still exist in the new schema with the
+/// same name and type (and, for vector fields, the same dimensions). Adding
+/// fields or changing field attributes (`filterable`, `facetable`, `searchable`,
+/// analyzers, ...) is compatible; removing a field or changing its type or
+/// vector dimensions is not, in which case the index is replaced and its
+/// documents discarded.
+fn schema_compatible(old: &IndexDefinition, new: &IndexDefinition) -> bool {
+    let new_fields: BTreeMap<&str, &FieldDefinition> =
+        new.fields.iter().map(|f| (f.name.as_str(), f)).collect();
+    old.fields.iter().all(|old_field| {
+        new_fields
+            .get(old_field.name.as_str())
+            .is_some_and(|new_field| {
+                old_field.field_type == new_field.field_type
+                    && old_field.vector_dimensions == new_field.vector_dimensions
+            })
+    })
+}
+
+/// Fuses a full-text score list and per-vector-query score lists with weighted
+/// Reciprocal Rank Fusion (RRF). Each list is ranked by score (descending, key
+/// as tie-breaker); a document's fused score is the sum of
+/// `weight * 1 / (k + rank)` over the lists in which it appears, where `rank`
+/// is the 1-based position, `weight` is the list's weight, and `k` is the
+/// standard RRF constant (60). A document appearing in several lists
+/// accumulates all contributions, so it outranks documents in fewer lists, and
+/// a heavier list contributes more.
+fn rrf_fuse_weighted(
+    full_text: &BTreeMap<String, f32>,
+    full_text_weight: f32,
+    vector_lists: &[(f32, BTreeMap<String, f32>)],
+) -> BTreeMap<String, f32> {
+    let mut fused: BTreeMap<String, f32> = BTreeMap::new();
+    rrf_add_list(&mut fused, full_text_weight, full_text);
+    for (weight, list) in vector_lists {
+        rrf_add_list(&mut fused, *weight, list);
+    }
+    fused
+}
+
+/// Adds one ranked list's weighted RRF contribution to `fused`.
+fn rrf_add_list(fused: &mut BTreeMap<String, f32>, weight: f32, list: &BTreeMap<String, f32>) {
+    const K: f32 = 60.0;
+    let mut ranked: Vec<(&String, &f32)> = list.iter().collect();
+    ranked.sort_by(|x, y| y.1.total_cmp(x.1).then_with(|| x.0.cmp(y.0)));
+    let mut rank = 1.0f32;
+    for (key, _) in &ranked {
+        let contribution = weight * (1.0 / (K + rank));
+        *fused.entry((*key).clone()).or_insert(0.0) += contribution;
+        rank += 1.0;
+    }
+}
+
 fn order_scored(scored: &mut [(Document, f32)], orderby: &[OrderBy]) {
     if orderby.is_empty() {
         scored.sort_by(|a, b| {
@@ -2528,12 +2654,31 @@ fn parse_vector_query(
         .get("exhaustive")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    // `weight` is accepted but inert (no weighted fusion in the emulator).
+    // `weight` scales this query's contribution to the hybrid RRF fusion; it
+    // must be a finite positive number (default `1.0` when absent).
+    let weight = match obj.get("weight") {
+        None | Some(Value::Null) => 1.0,
+        Some(value) => {
+            let invalid = || {
+                ApiError::bad_request(
+                    "InvalidQuery",
+                    "Vector query 'weight' must be a finite positive number.",
+                )
+            };
+            let as_f64 = value.as_f64().ok_or_else(invalid)?;
+            let weight = finite_f32(as_f64).ok_or_else(invalid)?;
+            if weight <= 0.0 {
+                return Err(invalid());
+            }
+            weight
+        }
+    };
     Ok(VectorQuery {
         fields,
         vector,
         k,
         exhaustive,
+        weight,
     })
 }
 
@@ -3054,20 +3199,24 @@ fn validate_schema(
 
 /// Validates a single field's vector markers. A field is *attempting* to be
 /// a vector field when it carries a `dimensions` property or a
-/// `vectorSearchProfile`; such fields must be `Collection(Edm.Single)` with
-/// valid dimensions, a profile, `searchable: true`, and none of
-/// key/filterable/sortable/facetable. Plain `Collection(Edm.Single)` fields
-/// without vector markers are ordinary collections and pass through.
+/// `vectorSearchProfile`; such fields must be `Collection(Edm.Single)` or
+/// `Collection(Edm.Half)` (quantized) with valid dimensions, a profile,
+/// `searchable: true`, and none of key/filterable/sortable/facetable. Plain
+/// `Collection(Edm.Single)`/`Collection(Edm.Half)` fields without vector
+/// markers are ordinary collections and pass through.
 fn validate_vector_field(field: &FieldDefinition, max_dimension: usize) -> Result<(), ApiError> {
     let attempts_vector = field.has_dimensions_property() || field.vector_search_profile.is_some();
     if !attempts_vector {
         return Ok(());
     }
-    if field.field_type != "Edm.Collection(Edm.Single)" {
+    if !matches!(
+        field.field_type.as_str(),
+        "Edm.Collection(Edm.Single)" | "Edm.Collection(Edm.Half)"
+    ) {
         return Err(ApiError::bad_request(
             "InvalidIndex",
             format!(
-                "Unsupported vector field type {:?} for field {:?}; only 'Collection(Edm.Single)' is supported.",
+                "Unsupported vector field type {:?} for field {:?}; only 'Collection(Edm.Single)' and 'Collection(Edm.Half)' are supported.",
                 field.field_type, field.name
             ),
         ));
@@ -3374,7 +3523,7 @@ fn check_field_type(field: &FieldDefinition, value: &Value) -> Result<(), String
             "Edm.String" | "Edm.DateTimeOffset" | "Edm.Guid" => value.is_string(),
             "Edm.GeographyPoint" => is_geography_point(value),
             "Edm.Int32" | "Edm.Int64" => value.is_i64() || value.is_u64(),
-            "Edm.Single" | "Edm.Double" => value.is_number(),
+            "Edm.Single" | "Edm.Double" | "Edm.Half" => value.is_number(),
             "Edm.Boolean" => value.is_boolean(),
             _ => true,
         }
@@ -3593,6 +3742,92 @@ mod tests {
             results.iter().all(|r| r.succeeded),
             "upload failed: {results:?}"
         );
+    }
+
+    #[test]
+    fn rrf_fuse_weighted_ranks_documents_in_both_lists_highest() {
+        // "a" is top on both lists, "b" top on one, "c" top on the other.
+        let full_text = BTreeMap::from([("a".to_owned(), 0.9f32), ("b".to_owned(), 0.5f32)]);
+        let vector = BTreeMap::from([("a".to_owned(), 0.8f32), ("c".to_owned(), 0.7f32)]);
+        let fused = rrf_fuse_weighted(&full_text, 1.0, &[(1.0, vector)]);
+        // "a" appears in both lists (rank 1 + rank 1) → highest fused score.
+        assert!(fused["a"] > fused["b"]);
+        assert!(fused["a"] > fused["c"]);
+        // "b" and "c" each appear once at rank 1 → equal.
+        assert!((fused["b"] - fused["c"]).abs() < f32::EPSILON);
+        // Union: all three keys present.
+        assert_eq!(fused.len(), 3);
+    }
+
+    #[test]
+    fn rrf_fuse_weighted_scales_heavier_lists_more() {
+        // "a" is rank 1 on the full-text list; "b" is rank 1 on the vector
+        // list. With equal weights they tie; weighting the vector list higher
+        // lifts "b" above "a".
+        let full_text = BTreeMap::from([("a".to_owned(), 0.9f32)]);
+        let vector = BTreeMap::from([("b".to_owned(), 0.9f32)]);
+        let equal = rrf_fuse_weighted(&full_text, 1.0, &[(1.0, vector.clone())]);
+        assert!((equal["a"] - equal["b"]).abs() < f32::EPSILON);
+        let weighted = rrf_fuse_weighted(&full_text, 1.0, &[(2.0, vector)]);
+        assert!(weighted["b"] > weighted["a"]);
+    }
+
+    fn field(name: &str, field_type: &str) -> FieldDefinition {
+        ok(FieldDefinition::from_json(
+            json!({"name": name, "type": field_type}),
+        ))
+    }
+
+    fn definition(fields: Vec<FieldDefinition>) -> IndexDefinition {
+        IndexDefinition {
+            name: "items".to_owned(),
+            fields,
+            suggesters: Vec::new(),
+            vector_search: None,
+            raw: json!({}),
+        }
+    }
+
+    #[test]
+    fn schema_compatible_allows_added_fields_and_attribute_changes() {
+        let old = definition(vec![
+            field("id", "Edm.String"),
+            field("title", "Edm.String"),
+        ]);
+        // Adding a field and changing attributes (same name + type) is compatible.
+        let new = definition(vec![
+            field("id", "Edm.String"),
+            field("title", "Edm.String"),
+            field("price", "Edm.Double"),
+        ]);
+        assert!(schema_compatible(&old, &new));
+    }
+
+    #[test]
+    fn schema_compatible_rejects_removed_or_retyped_fields() {
+        let old = definition(vec![
+            field("id", "Edm.String"),
+            field("title", "Edm.String"),
+        ]);
+        // Removing a field is incompatible.
+        let removed = definition(vec![field("id", "Edm.String")]);
+        assert!(!schema_compatible(&old, &removed));
+        // Changing a field's type is incompatible.
+        let retyped = definition(vec![
+            field("id", "Edm.String"),
+            field("title", "Edm.Double"),
+        ]);
+        assert!(!schema_compatible(&old, &retyped));
+    }
+
+    #[test]
+    fn rrf_fuse_weighted_empty_side_is_noop_contribution() {
+        let full_text = BTreeMap::from([("a".to_owned(), 0.9f32)]);
+        let empty: BTreeMap<String, f32> = BTreeMap::new();
+        let fused = rrf_fuse_weighted(&full_text, 1.0, &[(1.0, empty)]);
+        assert_eq!(fused.len(), 1);
+        // Single list, rank 1 → 1/(60+1).
+        assert!((fused["a"] - 1.0 / 61.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -4315,17 +4550,17 @@ mod tests {
                 json!({"id": "3", "title": "Seattle Downtown", "tags": ["wifi"]}),
             ],
         );
-        let completions = ok(service.autocomplete("items", "sg", "bos", 5));
+        let completions = ok(service.autocomplete("items", "sg", "bos", 5, None));
         let texts: Vec<_> = completions.iter().map(|c| c.text.clone()).collect();
         assert_eq!(texts, vec!["Boston", "boston"]);
         assert_eq!(completions[0].query_plus_text, "bos Boston");
         // Case-insensitive: "BOS" matches the same words.
-        let completions = ok(service.autocomplete("items", "sg", "BOS", 5));
+        let completions = ok(service.autocomplete("items", "sg", "BOS", 5, None));
         assert_eq!(completions.len(), 2);
         // No match.
-        assert!(ok(service.autocomplete("items", "sg", "zzz", 5)).is_empty());
+        assert!(ok(service.autocomplete("items", "sg", "zzz", 5, None)).is_empty());
         // top limits the results.
-        let completions = ok(service.autocomplete("items", "sg", "bos", 1));
+        let completions = ok(service.autocomplete("items", "sg", "bos", 1, None));
         assert_eq!(completions.len(), 1);
     }
 
@@ -4341,7 +4576,7 @@ mod tests {
                 json!({"id": "3", "title": "Portland Lodge", "tags": ["wifi"]}),
             ],
         );
-        let suggestions = ok(service.suggest("items", "sg", "bos", 5));
+        let suggestions = ok(service.suggest("items", "sg", "bos", 5, None));
         assert_eq!(suggestions.len(), 2);
         // Documents come back in key order, with the matched word.
         assert_eq!(suggestions[0].document.key, "1");
@@ -4354,9 +4589,38 @@ mod tests {
             "Boston Harbor Hotel"
         );
         // top limits the results.
-        let suggestions = ok(service.suggest("items", "sg", "bos", 1));
+        let suggestions = ok(service.suggest("items", "sg", "bos", 1, None));
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].document.key, "1");
+    }
+
+    #[test]
+    fn suggest_and_autocomplete_filter_narrow_candidates() {
+        let service = service();
+        ok(service.create_index(&suggester_index_body()));
+        upload(
+            &service,
+            vec![
+                json!({"id": "1", "title": "Boston Harbor Hotel", "tags": ["spa"]}),
+                json!({"id": "2", "title": "Seattle Downtown", "tags": ["boston", "wifi"]}),
+            ],
+        );
+        // Without a filter, "bos" matches doc 1 (title) and doc 2 (tag).
+        assert_eq!(ok(service.suggest("items", "sg", "bos", 5, None)).len(), 2);
+        // A filter narrows the candidates: only the wifi-tagged doc (2) remains.
+        let suggestions =
+            ok(service.suggest("items", "sg", "bos", 5, Some("tags/any(t: t eq 'wifi')")));
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].document.key, "2");
+        // Autocomplete narrows the same way: "bos" only completes from doc 2's
+        // tag, not doc 1's title.
+        let completions =
+            ok(service.autocomplete("items", "sg", "bos", 5, Some("tags/any(t: t eq 'wifi')")));
+        let texts: Vec<_> = completions.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(texts, vec!["boston"]);
+        // An invalid filter is rejected.
+        let api_error = err(service.suggest("items", "sg", "bos", 5, Some("tags/any(t:")));
+        assert_eq!(api_error.code, "InvalidQuery");
     }
 
     #[test]
@@ -4364,17 +4628,17 @@ mod tests {
         let service = service();
         ok(service.create_index(&suggester_index_body()));
         // Missing index.
-        let api_error = err(service.autocomplete("missing", "sg", "bos", 5));
+        let api_error = err(service.autocomplete("missing", "sg", "bos", 5, None));
         assert_eq!(api_error.status, axum::http::StatusCode::NOT_FOUND);
         // Unknown suggester.
-        let api_error = err(service.autocomplete("items", "nope", "bos", 5));
+        let api_error = err(service.autocomplete("items", "nope", "bos", 5, None));
         assert_eq!(api_error.code, "InvalidQuery");
-        let api_error = err(service.suggest("items", "nope", "bos", 5));
+        let api_error = err(service.suggest("items", "nope", "bos", 5, None));
         assert_eq!(api_error.code, "InvalidQuery");
         // Empty search text.
-        let api_error = err(service.autocomplete("items", "sg", "   ", 5));
+        let api_error = err(service.autocomplete("items", "sg", "   ", 5, None));
         assert_eq!(api_error.code, "InvalidQuery");
-        let api_error = err(service.suggest("items", "sg", "", 5));
+        let api_error = err(service.suggest("items", "sg", "", 5, None));
         assert_eq!(api_error.code, "InvalidQuery");
     }
 
