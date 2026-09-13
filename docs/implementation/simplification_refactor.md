@@ -171,12 +171,14 @@ Move code only; no logic changes. Suggested target layout:
 
 ## 6. Optional smaller splits
 
-- [ ] **6.1 `vector/config.rs`** — `HnswParams`, `VectorAlgorithmKind`,
+- [x] **6.1 `vector/config.rs`** — `HnswParams`, `VectorAlgorithmKind`,
       `VectorAlgorithm`, `VectorSearchConfig`, `parse_vector_search`,
       `parse_algorithm`, `parse_hnsw_usize` (`vector/mod.rs:40-271`).
-- [ ] **6.2 `api/mod.rs`** — leave as one file unless 2.2-2.4 leave it
+- [x] **6.2 `api/mod.rs`** — leave as one file unless 2.2-2.4 leave it
       bloated; if the named-resource handlers still dominate, extract
-      `api/named_resources.rs`.
+      `api/named_resources.rs`. Done: extracted (1127 → 830 lines +
+      324-line `api/named_resources.rs` with the collection/PUT/GET/DELETE
+      handlers, segment parsers, and body validators).
 
 ## 7. Local simplifications (independent, low risk)
 
