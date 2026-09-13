@@ -2,6 +2,7 @@
 
 pub mod named_resources;
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use axum::extract::{Path, Request, State};
@@ -213,27 +214,9 @@ async fn upload_documents(
     let batch = parse_body(&body)?;
     // The SDK serializes an `IndexBatch` as `{"value": [...]}`; a bare array is
     // also accepted for direct HTTP use.
-    let actions = match batch {
-        Value::Array(items) => items,
-        Value::Object(map) => map
-            .get("value")
-            .and_then(Value::as_array)
-            .cloned()
-            .ok_or_else(|| {
-                ApiError::bad_request(
-                    "InvalidDocuments",
-                    "Document batch must be a JSON array of actions or an object with a \"value\" array.",
-                )
-            })?,
-        _ => {
-            return Err(ApiError::bad_request(
-                "InvalidDocuments",
-                "Document batch must be a JSON array of actions or an object with a \"value\" array.",
-            ))
-        }
-    };
+    let actions = batch_items(&batch)?;
     let mut batch = Vec::with_capacity(actions.len());
-    for action in &actions {
+    for action in actions {
         let action_type = action
             .get("@search.action")
             .and_then(Value::as_str)
@@ -359,7 +342,7 @@ async fn search_documents(
     let api_version = uri
         .query()
         .and_then(|q| query_param(q, "api-version"))
-        .map(str::to_owned);
+        .map(Cow::into_owned);
     let query = state.service.parse_search(&name, &raw)?;
     let outcome = state.service.search(&name, &query)?;
     let continuation = state.service.next_continuation(&query, &outcome);
@@ -437,18 +420,13 @@ async fn suggest_documents(
 async fn document_count(
     State(state): State<AppState>,
     Path(raw_name): Path<String>,
-) -> Result<(StatusCode, axum::http::HeaderMap, axum::body::Bytes), ApiError> {
+) -> Result<(StatusCode, [(&'static str, &'static str); 1], String), ApiError> {
     let name = parse_index_name(&raw_name)?;
     let count = state.service.count_documents(&name)?;
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert(
-        axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("application/json"),
-    );
     Ok((
         StatusCode::OK,
-        headers,
-        axum::body::Bytes::from(count.to_string()),
+        [("content-type", "application/json")],
+        count.to_string(),
     ))
 }
 
@@ -598,10 +576,16 @@ fn search_response(
 fn is_azure_surface_path(path: &str) -> bool {
     path == "/servicestats"
         || path == "/indexes"
-        || path.starts_with("/indexes(")
+        || is_named_segment(path, "/indexes")
         || ResourceKind::ALL.iter().any(|kind| {
-            path == kind.collection_path() || path.starts_with(kind.named_path_prefix())
+            path == kind.collection_path() || is_named_segment(path, kind.collection_path())
         })
+}
+
+/// Whether `path` is a named (`resource('name')`) segment of a collection: it
+/// starts with the collection path (e.g. `/indexes`) followed by `(`.
+fn is_named_segment(path: &str, collection: &str) -> bool {
+    path.starts_with(collection) && path.as_bytes().get(collection.len()) == Some(&b'(')
 }
 
 /// Authentication and API-version guard for the Azure-compatible surface.
@@ -633,7 +617,7 @@ async fn azure_guard(
         .uri()
         .query()
         .and_then(|q| query_param(q, "api-version"));
-    state.versions.check(api_version)?;
+    state.versions.check(api_version.as_deref())?;
     Ok(next.run(request).await)
 }
 
@@ -646,7 +630,7 @@ async fn request_logging(request: Request, next: middleware::Next) -> Response {
         .uri()
         .query()
         .and_then(|q| query_param(q, "api-version"))
-        .map(str::to_owned);
+        .map(Cow::into_owned);
     let index = extract_index(&path);
     let operation = operation_for(&method, &path);
     let client_request_id = request
@@ -713,13 +697,26 @@ fn parse_body(body: &axum::body::Bytes) -> Result<Value, ApiError> {
         .map_err(|e| ApiError::bad_request("InvalidRequest", format!("Invalid JSON body: {e}")))
 }
 
-fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
-    query.split('&').find_map(|pair| {
-        let mut parts = pair.splitn(2, '=');
-        let name = parts.next()?;
-        let value = parts.next().unwrap_or("");
-        (name == key).then_some(value)
-    })
+/// The document actions of an upload batch: a bare JSON array, or an object
+/// with a `"value"` array (the SDK's `IndexBatch` wire shape).
+fn batch_items(batch: &Value) -> Result<&Vec<Value>, ApiError> {
+    match batch {
+        Value::Array(items) => Ok(items),
+        _ => batch.get("value").and_then(Value::as_array).ok_or_else(|| {
+            ApiError::bad_request(
+                "InvalidDocuments",
+                "Document batch must be a JSON array of actions or an object with a \"value\" array.",
+            )
+        }),
+    }
+}
+
+/// The value of `key` in a `form_urlencoded` query string, percent-decoded.
+/// The value is borrowed from `query` unless decoding required allocation.
+fn query_param<'a>(query: &'a str, key: &str) -> Option<Cow<'a, str>> {
+    url::form_urlencoded::parse(query.as_bytes())
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value)
 }
 
 /// Extracts the suggest/autocomplete request parameters: the search text
@@ -733,11 +730,10 @@ fn suggest_request_params(
 ) -> Result<(String, String, u64, Option<String>), ApiError> {
     let param = |keys: &[&str]| -> Option<String> {
         keys.iter().find_map(|key| {
-            let key: &str = key;
-            raw.get(key)
-                .and_then(Value::as_str)
+            let from_body = raw.get(key).and_then(Value::as_str).map(Cow::Borrowed);
+            from_body
                 .or_else(|| query.and_then(|q| query_param(q, key)))
-                .map(str::to_owned)
+                .map(Cow::into_owned)
                 .filter(|s| !s.trim().is_empty())
         })
     };
@@ -753,7 +749,7 @@ fn suggest_request_params(
         None | Some(Value::Null) => {
             match query.and_then(|q| query_param(q, "top").or_else(|| query_param(q, "$top"))) {
                 None => 5,
-                Some(raw_top) => parse_top_param(raw_top)?,
+                Some(raw_top) => parse_top_param(raw_top.as_ref())?,
             }
         }
         Some(value) => value.as_u64().filter(|top| *top > 0).ok_or_else(|| {
@@ -817,7 +813,7 @@ fn operation_for(method: &axum::http::Method, path: &str) -> &'static str {
                 kind.list_operation()
             };
         }
-        if path.starts_with(kind.named_path_prefix()) {
+        if is_named_segment(path, kind.collection_path()) {
             return kind.named_operation(method.as_str());
         }
     }

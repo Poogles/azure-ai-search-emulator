@@ -182,69 +182,69 @@ Move code only; no logic changes. Suggested target layout:
 
 ## 7. Local simplifications (independent, low risk)
 
-- [ ] **7.1 Facet values as an enum.** Replace the `"s:…"`/`"n:…"`/`"b:…"`
+- [x] **7.1 Facet values as an enum.** Replace the `"s:…"`/`"n:…"`/`"b:…"`
       string round-trip in `facet_key`/`facet_value`
       (`service/mod.rs:2297-2318`) with a `FacetValue` enum; removes the lossy
       `o:{other}` fallback and the `i64`→`f64` re-parse.
-- [ ] **7.2 RRF rank as `usize`.** `rrf_add_list` (`service/mod.rs:2138-2148`)
+- [x] **7.2 RRF rank as `usize`.** `rrf_add_list` (`service/mod.rs:2138-2148`)
       increments a `f32` rank; use `usize` with `1.0 / (K + rank as f32)`.
-- [ ] **7.3 `compare_values` numeric precision.**
+- [x] **7.3 `compare_values` numeric precision.**
       (`service/mod.rs:2219-2224`) compares via `as_f64()`; try `as_i64`/
       `as_u64` before falling back to `f64` so large integer keys order
       exactly. Verify against existing orderby tests.
-- [ ] **7.4 `split_sentences`.** (`service/mod.rs:3208-3231`) replace the
+- [x] **7.4 `split_sentences`.** (`service/mod.rs:3208-3231`) replace the
       manual char-index/offset bookkeeping with a `char_indices` loop.
-- [ ] **7.5 Merge/MergeOrUpload arms.** `apply_document_action`
+- [x] **7.5 Merge/MergeOrUpload arms.** `apply_document_action`
       (`service/mod.rs:1165-1200`): extract a shared
       `merge_or_fallback` helper for the two near-identical arms.
-- [ ] **7.6 `upload_documents` batch parse.** (`api/mod.rs:399-479`) the
+- [x] **7.6 `upload_documents` batch parse.** (`api/mod.rs:399-479`) the
       `Array`/`Object`/`_` match duplicates the error message; extract a
       `batch_items(&Value) -> Result<&Vec<Value>, ApiError>` helper.
-- [ ] **7.7 `document_count` response.** (`api/mod.rs:628-644`) use the
+- [x] **7.7 `document_count` response.** (`api/mod.rs:628-644`) use the
       `(StatusCode, [(header, value)], body)` `IntoResponse` form instead of
       hand-building `HeaderMap` + `Bytes`.
-- [ ] **7.8 `query_param`.** (`api/mod.rs:1070-1077`) replace hand-rolled
+- [x] **7.8 `query_param`.** (`api/mod.rs:1070-1077`) replace hand-rolled
       query-string parsing with `url::form_urlencoded` (add the `url` dep if
       not present) or axum's `Query` extractor.
-- [ ] **7.9 No-op shadow.** `api/mod.rs:1090` `let key: &str = key;` is a
+- [x] **7.9 No-op shadow.** `api/mod.rs:1090` `let key: &str = key;` is a
       leftover; remove.
-- [ ] **7.10 `is_azure_surface_path` table.** (`api/mod.rs:789-801`) the
+- [x] **7.10 `is_azure_surface_path` table.** (`api/mod.rs:789-801`) the
       `path + "("` column is derivable; store 5 strings.
-- [ ] **7.11 `version_date` byte checks.** (`version/mod.rs:87-104`) the
+- [x] **7.11 `version_date` byte checks.** (`version/mod.rs:87-104`) the
       digit checks run `.chars().all(is_ascii_digit)` on already byte-checked
       slices; use byte-range checks.
-- [ ] **7.12 `Config::supports_api_version`.** (`config.rs:157-161`) builds a
+- [x] **7.12 `Config::supports_api_version`.** (`config.rs:157-161`) builds a
       throwaway `VersionAdapter` per call; store the adapter in `Config` or
       call the floor logic directly.
-- [ ] **7.13 Healthcheck split.** (`main.rs:127-128`) `text.split(...).next()`
+- [x] **7.13 Healthcheck split.** (`main.rs:127-128`) `text.split(...).next()`
       + `.nth(1)` splits twice; use `split_once`.
-- [ ] **7.14 `to_value` via serde.** `IndexingResultItem::to_value`
+- [x] **7.14 `to_value` via serde.** `IndexingResultItem::to_value`
       (`service/mod.rs:56-73`), `SynonymMap::to_value` (315-324),
       `NamedResource::to_value` (343-347) hand-build `Map`s; derive
       `Serialize` with `rename` attributes where the wire shape is fixed.
       `NamedResource` echoes an arbitrary stored body, so it may stay manual.
-- [ ] **7.15 `SearchableField` struct.** (`query/mod.rs:90`) replace the
+- [x] **7.15 `SearchableField` struct.** (`query/mod.rs:90`) replace the
       `(String, Field, Option<String>)` tuple with a named struct.
-- [ ] **7.16 `HnswBackend` match arms.** (`vector/mod.rs:318-345`) `insert`,
+- [x] **7.16 `HnswBackend` match arms.** (`vector/mod.rs:318-345`) `insert`,
       `search`, `len` each match two variants calling identical methods; add a
       single accessor or generic helper.
-- [ ] **7.17 `parse_hnsw_usize` callers.** (`vector/mod.rs:205-241`) let
+- [x] **7.17 `parse_hnsw_usize` callers.** (`vector/mod.rs:205-241`) let
       `HnswParams` parse the three fields from the params object in one call.
-- [ ] **7.18 `DateCompare` evaluation.** (`filter/mod.rs:293-303`) converts
+- [x] **7.18 `DateCompare` evaluation.** (`filter/mod.rs:293-303`) converts
       the evaluated `FilterValue` back to `Value` to call `compare`; add a
       `FilterValue`-native compare.
-- [ ] **7.19 `element_matches` invariant.** (`filter/mod.rs:436-446`) the
+- [x] **7.19 `element_matches` invariant.** (`filter/mod.rs:436-446`) the
       parser guarantees a `Compare` inner; make the invariant explicit
       (debug assert or dedicated inner type) instead of silent `false`.
-- [ ] **7.20 `quotes_balanced`.** (`query/mod.rs:1205-1222`) simplify the
+- [x] **7.20 `quotes_balanced`.** (`query/mod.rs:1205-1222`) simplify the
       manual index loop.
-- [ ] **7.21 Wildcard whitespace handling.** (`query/mod.rs:1109-1158`)
+- [x] **7.21 Wildcard whitespace handling.** (`query/mod.rs:1109-1158`)
       leading/trailing length via `take_while` + `len_utf8` sums; use
       `trim_start`/`trim_end`-based slicing.
-- [ ] **7.22 `dateadd_value` month units.** (`filter/mod.rs:568-601`) the
+- [x] **7.22 `dateadd_value` month units.** (`filter/mod.rs:568-601`) the
       Year/Quarter/Month arms repeat the same block; compute
       `months_per_unit` once and share.
-- [ ] **7.23 `SearchQuery` raw-state grouping.** Group `filter_raw`,
+- [x] **7.23 `SearchQuery` raw-state grouping.** Group `filter_raw`,
       `orderby_raw`, `vector_queries_raw` (token plumbing) into a
       `PagingState` sub-struct.
 
@@ -265,9 +265,9 @@ Move code only; no logic changes. Suggested target layout:
 
 ## Verification
 
-- [ ] **V.1** After each section: `make rust` (fmt, clippy `-D warnings`,
+- [x] **V.1** After each section: `make rust` (fmt, clippy `-D warnings`,
       `cargo test --all-targets`).
-- [ ] **V.2** After sections 2, 3, 7 (API-visible paths): `make test` (Python
+- [x] **V.2** After sections 2, 3, 7 (API-visible paths): `make test` (Python
       e2e) and `make test-csharp` (C# suite incl. fixture replay).
 - [ ] **V.3** Final: `make all` (rust + docker + e2e) and confirm the image
       size is still under 20 MB.

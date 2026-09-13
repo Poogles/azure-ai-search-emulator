@@ -37,18 +37,23 @@ pub(crate) fn build_lucene_query(
     }
     // Expand `prefix*` wildcards (Azure prefix semantics) before parsing:
     // Tantivy's parser strips a trailing `*` instead of wildcard-matching.
-    let field_names: Vec<String> = fields.iter().map(|(name, _, _)| name.clone()).collect();
+    let field_names: Vec<String> = fields
+        .iter()
+        .map(|searchable| searchable.name.clone())
+        .collect();
     let expanded = expand_trailing_wildcards(trimmed, &field_names);
-    let mut parser =
-        QueryParser::for_index(index, fields.iter().map(|(_, field, _)| *field).collect());
+    let mut parser = QueryParser::for_index(
+        index,
+        fields.iter().map(|searchable| searchable.field).collect(),
+    );
     if mode == SearchMode::All {
         parser.set_conjunction_by_default();
     }
     // Azure's full (Lucene) query type supports `term*` wildcards and regexes.
     parser.allow_regexes();
-    for (name, field, _) in fields {
-        if let Some(boost) = boosts.get(name) {
-            parser.set_field_boost(*field, *boost);
+    for searchable in fields {
+        if let Some(boost) = boosts.get(&searchable.name) {
+            parser.set_field_boost(searchable.field, *boost);
         }
     }
     parser
@@ -82,21 +87,12 @@ fn expand_trailing_wildcards(text: &str, field_names: &[String]) -> String {
 /// Expands trailing-wildcard tokens in an unquoted query segment, preserving
 /// leading and trailing whitespace.
 fn expand_unquoted_wildcards(segment: &str, field_names: &[String]) -> String {
-    let leading_len: usize = segment
-        .chars()
-        .take_while(|c| c.is_whitespace())
-        .map(char::len_utf8)
-        .sum();
-    let trailing_len: usize = segment
-        .chars()
-        .rev()
-        .take_while(|c| c.is_whitespace())
-        .map(char::len_utf8)
-        .sum();
-    if leading_len + trailing_len >= segment.len() {
+    let core = segment.trim();
+    if core.is_empty() {
         return segment.to_owned();
     }
-    let core = &segment[leading_len..segment.len() - trailing_len];
+    let leading_len = segment.len() - segment.trim_start().len();
+    let trailing_len = segment.len() - segment.trim_end().len();
     let expanded = core
         .split_whitespace()
         .map(|token| expand_token_wildcard(token, field_names))
@@ -178,19 +174,15 @@ fn expand_token_wildcard(token: &str, field_names: &[String]) -> String {
 /// Whether the Lucene query text has balanced quotes (`""` counts as an
 /// escaped literal quote, not two delimiters).
 fn quotes_balanced(text: &str) -> bool {
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0usize;
+    let mut chars = text.chars().peekable();
     let mut count = 0usize;
-    while i < chars.len() {
-        if chars[i] == '"' {
-            if chars.get(i + 1) == Some(&'"') {
-                i += 2;
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            if chars.peek() == Some(&'"') {
+                chars.next();
             } else {
                 count += 1;
-                i += 1;
             }
-        } else {
-            i += 1;
         }
     }
     count.is_multiple_of(2)

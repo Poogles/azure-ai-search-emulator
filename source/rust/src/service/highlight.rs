@@ -86,21 +86,15 @@ const MAX_HIGHLIGHT_FRAGMENTS: usize = 3;
 fn split_sentences(text: &str) -> Vec<&str> {
     let mut sentences = Vec::new();
     let mut start = 0usize;
-    let chars: Vec<char> = text.chars().collect();
-    let mut offset = 0usize;
-    for (i, &c) in chars.iter().enumerate() {
+    let mut chars = text.char_indices().peekable();
+    while let Some((offset, c)) = chars.next() {
         let is_terminator = matches!(c, '.' | '!' | '?' | '\n' | '\r');
-        if !is_terminator {
-            offset += c.len_utf8();
-            continue;
-        }
-        let next_is_boundary = chars.get(i + 1).is_none_or(|next| next.is_whitespace());
-        if next_is_boundary {
+        let next_is_boundary = chars.peek().is_none_or(|(_, next)| next.is_whitespace());
+        if is_terminator && next_is_boundary {
             let end = offset + c.len_utf8();
             sentences.push(&text[start..end]);
             start = end;
         }
-        offset += c.len_utf8();
     }
     if start < text.len() {
         sentences.push(&text[start..]);

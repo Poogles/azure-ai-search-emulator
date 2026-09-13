@@ -1,6 +1,7 @@
 //! Synonym maps: Solr-format rule parsing and validation.
 
-use serde_json::{Map, Value};
+use serde::Serialize;
+use serde_json::Value;
 
 use crate::error::ApiError;
 
@@ -80,7 +81,7 @@ fn split_synonym_terms(side: &str, rule_no: usize) -> Result<Vec<String>, String
 /// A synonym map: a named collection of synonym rules in Solr format.
 /// Synonym maps apply to search: query terms matching a rule's inputs also
 /// match its outputs (see `docs/supported_operations.md`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SynonymMap {
     pub name: String,
     /// Always `"solr"`; the only format Azure supports.
@@ -88,8 +89,10 @@ pub struct SynonymMap {
     /// The synonym rules joined by newlines (the wire format the SDKs use).
     pub synonyms: String,
     /// The parsed rules, for query-time expansion.
+    #[serde(skip)]
     pub(crate) rules: Vec<SynonymRule>,
     /// Opaque entity tag, bumped on every create or update.
+    #[serde(rename = "@odata.etag")]
     pub etag: String,
 }
 
@@ -97,14 +100,9 @@ impl SynonymMap {
     /// The JSON representation returned by the synonym-map routes.
     #[must_use]
     pub fn to_value(&self) -> Value {
-        Value::Object({
-            let mut map = Map::new();
-            map.insert("name".to_owned(), Value::String(self.name.clone()));
-            map.insert("format".to_owned(), Value::String(self.format.clone()));
-            map.insert("synonyms".to_owned(), Value::String(self.synonyms.clone()));
-            map.insert("@odata.etag".to_owned(), Value::String(self.etag.clone()));
-            map
-        })
+        // Serialization of this plain-data struct cannot fail; fall back to
+        // null rather than panicking in request handling.
+        serde_json::to_value(self).unwrap_or(Value::Null)
     }
 }
 

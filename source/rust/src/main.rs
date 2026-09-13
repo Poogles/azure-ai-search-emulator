@@ -124,8 +124,7 @@ fn run_healthcheck() -> anyhow::Result<()> {
         .read_to_end(&mut buffer)
         .context("healthcheck: read failed")?;
     let text = String::from_utf8_lossy(&buffer);
-    let head = text.split("\r\n\r\n").next().unwrap_or("");
-    let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or(("", ""));
     let status_code = head
         .lines()
         .next()

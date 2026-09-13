@@ -109,17 +109,6 @@ impl ResourceKind {
         }
     }
 
-    /// The kind's named path prefix with a leading slash, e.g. `/aliases(`.
-    #[must_use]
-    pub const fn named_path_prefix(self) -> &'static str {
-        match self {
-            ResourceKind::SynonymMap => "/synonymmaps(",
-            ResourceKind::Alias => "/aliases(",
-            ResourceKind::KnowledgeSource => "/knowledgesources(",
-            ResourceKind::KnowledgeBase => "/knowledgebases(",
-        }
-    }
-
     /// The lowercase label used in request-validation messages, e.g.
     /// `Invalid alias path segment ...`.
     #[must_use]

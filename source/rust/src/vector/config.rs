@@ -39,6 +39,55 @@ impl Default for HnswParams {
     }
 }
 
+impl HnswParams {
+    /// Parses the three HNSW fields from a kind-specific parameters object in
+    /// one call. The REST docs use camelCase (`efConstruction`) while the
+    /// pinned SDK serializes `snake_case` (`ef_construction`); both are
+    /// accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when a value is not a positive integer, `m`
+    /// is out of range, or an `ef` value is zero.
+    fn parse(params: &serde_json::Map<String, Value>, algorithm: &str) -> Result<Self, String> {
+        let m = parse_hnsw_usize(params, &["m"], DEFAULT_M, algorithm)?;
+        // `Hnsw::new` calls `std::process::exit(1)` when
+        // `max_nb_connection > 256`; reject before ever constructing.
+        if m == 0 || m > 256 {
+            return Err(format!(
+                "Invalid \"m\" value on algorithm {algorithm:?}; must be 1-256."
+            ));
+        }
+        let ef_construction = parse_hnsw_usize(
+            params,
+            &["efConstruction", "ef_construction"],
+            DEFAULT_EF_CONSTRUCTION,
+            algorithm,
+        )?;
+        let ef_search = parse_hnsw_usize(
+            params,
+            &["efSearch", "ef_search"],
+            DEFAULT_EF_SEARCH,
+            algorithm,
+        )?;
+        if ef_construction == 0 {
+            return Err(format!(
+                "Invalid \"efConstruction\" value on algorithm {algorithm:?}; must be a positive integer."
+            ));
+        }
+        if ef_search == 0 {
+            return Err(format!(
+                "Invalid \"efSearch\" value on algorithm {algorithm:?}; must be a positive integer."
+            ));
+        }
+        Ok(HnswParams {
+            m,
+            ef_construction,
+            ef_search,
+        })
+    }
+}
+
 /// The `kind` of a `vectorSearch.algorithms[]` entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VectorAlgorithmKind {
@@ -182,35 +231,7 @@ fn parse_algorithm(entry: &Value) -> Result<(String, VectorAlgorithm), String> {
                 .ok_or_else(|| format!("Unknown metric {metric_raw:?} on algorithm {name:?}."))?;
         }
         if matches!(kind, VectorAlgorithmKind::Hnsw) {
-            // The REST docs use camelCase (`efConstruction`) while the
-            // pinned SDK serializes snake_case (`ef_construction`); both
-            // are accepted.
-            params.m = parse_hnsw_usize(p, &["m"], DEFAULT_M, name)?;
-            // `Hnsw::new` calls `std::process::exit(1)` when
-            // `max_nb_connection > 256`; reject before ever constructing.
-            if params.m == 0 || params.m > 256 {
-                return Err(format!(
-                    "Invalid \"m\" value on algorithm {name:?}; must be 1-256."
-                ));
-            }
-            params.ef_construction = parse_hnsw_usize(
-                p,
-                &["efConstruction", "ef_construction"],
-                DEFAULT_EF_CONSTRUCTION,
-                name,
-            )?;
-            params.ef_search =
-                parse_hnsw_usize(p, &["efSearch", "ef_search"], DEFAULT_EF_SEARCH, name)?;
-            if params.ef_construction == 0 {
-                return Err(format!(
-                    "Invalid \"efConstruction\" value on algorithm {name:?}; must be a positive integer."
-                ));
-            }
-            if params.ef_search == 0 {
-                return Err(format!(
-                    "Invalid \"efSearch\" value on algorithm {name:?}; must be a positive integer."
-                ));
-            }
+            params = HnswParams::parse(p, name)?;
         }
     }
     Ok((

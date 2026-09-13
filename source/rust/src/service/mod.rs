@@ -17,7 +17,8 @@ pub use resources::{NamedResource, ResourceKind};
 pub use synonyms::SynonymMap;
 pub use types::{
     ActionKind, AutocompleteCompletion, DocumentAction, Facet, IndexingResultItem, OrderBy,
-    SearchField, SearchOutcome, SearchQuery, Suggestion, VectorFilterMode, VectorQuery,
+    PagingState, SearchField, SearchOutcome, SearchQuery, Suggestion, VectorFilterMode,
+    VectorQuery,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -584,40 +585,24 @@ impl SearchService {
                 Err(message) => batch.results.push(fail_result(key, 400, message)),
             },
             ActionKind::Merge => {
-                match self.merge_one(definition, key_name, &action.document, &batch.upserts) {
-                    MergeOutcome::Applied(doc) => {
-                        batch.record_upsert(doc);
-                        batch.results.push(ok_result(key, 200));
-                    }
-                    MergeOutcome::Missing => batch.results.push(fail_result(
+                self.merge_or_fallback(definition, key_name, key, action, batch, |key, batch| {
+                    batch.results.push(fail_result(
                         key.clone(),
                         404,
                         format!("Document with key {key:?} was not found in index {index:?}."),
-                    )),
-                    MergeOutcome::Invalid(message) => {
-                        batch.results.push(fail_result(key, 400, message));
-                    }
-                }
+                    ));
+                });
             }
             ActionKind::MergeOrUpload => {
-                match self.merge_one(definition, key_name, &action.document, &batch.upserts) {
-                    MergeOutcome::Applied(doc) => {
-                        batch.record_upsert(doc);
-                        batch.results.push(ok_result(key, 200));
-                    }
-                    MergeOutcome::Missing => {
-                        match validate_document(definition, &action.document) {
-                            Ok(doc) => {
-                                batch.record_upsert(doc);
-                                batch.results.push(ok_result(key, 201));
-                            }
-                            Err(message) => batch.results.push(fail_result(key, 400, message)),
+                self.merge_or_fallback(definition, key_name, key, action, batch, |key, batch| {
+                    match validate_document(definition, &action.document) {
+                        Ok(doc) => {
+                            batch.record_upsert(doc);
+                            batch.results.push(ok_result(key, 201));
                         }
+                        Err(message) => batch.results.push(fail_result(key, 400, message)),
                     }
-                    MergeOutcome::Invalid(message) => {
-                        batch.results.push(fail_result(key, 400, message));
-                    }
-                }
+                });
             }
             ActionKind::Delete => {
                 // A key upserted earlier in the same batch counts as present,
@@ -760,6 +745,33 @@ impl SearchService {
         }
     }
 
+    /// Applies a merge-family action (`merge` / `mergeOrUpload`): a successful
+    /// merge records the merged document (200) and an invalid document fails
+    /// (400); a missing document is delegated to `on_missing` (a 404 for
+    /// `merge`, an upload attempt for `mergeOrUpload`).
+    fn merge_or_fallback<F>(
+        &self,
+        definition: &IndexDefinition,
+        key_name: &str,
+        key: String,
+        action: &DocumentAction,
+        batch: &mut DocumentBatch,
+        on_missing: F,
+    ) where
+        F: FnOnce(String, &mut DocumentBatch),
+    {
+        match self.merge_one(definition, key_name, &action.document, &batch.upserts) {
+            MergeOutcome::Applied(doc) => {
+                batch.record_upsert(doc);
+                batch.results.push(ok_result(key, 200));
+            }
+            MergeOutcome::Missing => on_missing(key, batch),
+            MergeOutcome::Invalid(message) => {
+                batch.results.push(fail_result(key, 400, message));
+            }
+        }
+    }
+
     /// Parses and validates a search request body against the index schema.
     ///
     /// # Errors
@@ -858,9 +870,7 @@ impl SearchService {
             top,
             skip,
             filter,
-            filter_raw,
             orderby,
-            orderby_raw,
             select,
             facets,
             search_fields,
@@ -868,8 +878,12 @@ impl SearchService {
             highlight_pre_tag,
             highlight_post_tag,
             continuation,
+            paging: PagingState {
+                filter_raw,
+                orderby_raw,
+                vector_queries_raw,
+            },
             vector_queries,
-            vector_queries_raw,
             vector_filter_mode,
         })
     }
@@ -886,6 +900,7 @@ impl SearchService {
 
         // The request's vector-query identity, bound into continuation tokens.
         let current_vector_hash: Option<u64> = query
+            .paging
             .vector_queries_raw
             .as_ref()
             .map(|raw| vector_query_hash(raw, query.vector_filter_mode.as_str()));
@@ -1199,11 +1214,18 @@ impl SearchService {
         let (filter, orderby) = match &query.continuation {
             Some(raw) => match ContinuationToken::decode(raw) {
                 Ok(token) => (token.filter, token.orderby),
-                Err(_) => (query.filter_raw.clone(), query.orderby_raw.clone()),
+                Err(_) => (
+                    query.paging.filter_raw.clone(),
+                    query.paging.orderby_raw.clone(),
+                ),
             },
-            None => (query.filter_raw.clone(), query.orderby_raw.clone()),
+            None => (
+                query.paging.filter_raw.clone(),
+                query.paging.orderby_raw.clone(),
+            ),
         };
         let vector_query_hash = query
+            .paging
             .vector_queries_raw
             .as_ref()
             .map(|raw| vector_query_hash(raw, query.vector_filter_mode.as_str()));

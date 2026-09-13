@@ -200,12 +200,7 @@ impl FilterExpr {
                 let Some(actual) = left.evaluate(fields) else {
                     return false;
                 };
-                let actual_value = match &actual {
-                    FilterValue::Number(n) => Value::from(*n),
-                    FilterValue::String(s) => Value::String(s.clone()),
-                    _ => return false,
-                };
-                compare(&actual_value, *op, value)
+                compare_filter_values(&actual, *op, value)
             }
             FilterExpr::IsMatch { field, pattern } => {
                 let lowered = pattern.to_lowercase();
@@ -302,6 +297,10 @@ fn null_matches(op: FilterOp, value: &FilterValue) -> bool {
 /// Evaluates an `any`/`all` inner expression against a single collection
 /// element. The inner expression must be a comparison on the lambda variable.
 fn element_matches(inner: &FilterExpr, element: &Value) -> bool {
+    debug_assert!(
+        matches!(inner, FilterExpr::Compare { .. }),
+        "any/all inner must be a Compare on the lambda variable"
+    );
     match inner {
         FilterExpr::Compare { op, value, .. } => {
             if element.is_null() {
@@ -352,6 +351,40 @@ fn compare(actual: &Value, op: FilterOp, expected: &FilterValue) -> bool {
             },
             None => false,
         },
+    }
+}
+
+/// Compares an evaluated [`FilterValue`] (a date-function result) against an
+/// expected literal, mirroring [`compare`] without round-tripping through
+/// [`Value`]. Non-scalar actuals never occur here and never match.
+#[allow(clippy::float_cmp)]
+fn compare_filter_values(actual: &FilterValue, op: FilterOp, expected: &FilterValue) -> bool {
+    match actual {
+        FilterValue::Number(actual_number) => match expected {
+            FilterValue::Number(number) => match op {
+                FilterOp::Eq => *actual_number == *number,
+                FilterOp::Ne => *actual_number != *number,
+                FilterOp::Gt => *actual_number > *number,
+                FilterOp::Ge => *actual_number >= *number,
+                FilterOp::Lt => *actual_number < *number,
+                FilterOp::Le => *actual_number <= *number,
+            },
+            FilterValue::Null => matches!(op, FilterOp::Ne),
+            _ => false,
+        },
+        FilterValue::String(actual_text) => match expected {
+            FilterValue::String(text) => match op {
+                FilterOp::Eq => actual_text == text,
+                FilterOp::Ne => actual_text != text,
+                FilterOp::Gt => actual_text > text,
+                FilterOp::Ge => actual_text >= text,
+                FilterOp::Lt => actual_text < text,
+                FilterOp::Le => actual_text <= text,
+            },
+            FilterValue::Null => matches!(op, FilterOp::Ne),
+            _ => false,
+        },
+        FilterValue::Bool(_) | FilterValue::Null => false,
     }
 }
 

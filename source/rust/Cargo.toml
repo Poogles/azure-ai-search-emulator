@@ -31,6 +31,8 @@ hnsw_rs = { version = "0.3", features = ["simdeez_f"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Query-string parsing for the `api-version` / paging / suggest parameters.
+url = "2"
 
 [profile.release]
 strip = true

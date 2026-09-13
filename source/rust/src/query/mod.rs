@@ -65,7 +65,12 @@ const KEY_FIELD_NAME: &str = "__aisearch_key";
 
 /// A searchable field: the Azure field path, its Tantivy field, and the
 /// field's declared analyzer name (`None` for the English default).
-pub(crate) type SearchableField = (String, Field, Option<String>);
+#[derive(Debug, Clone)]
+pub(crate) struct SearchableField {
+    pub(crate) name: String,
+    pub(crate) field: Field,
+    pub(crate) analyzer: Option<String>,
+}
 
 /// Heap budget (bytes) for each per-index Tantivy writer.
 const WRITER_HEAP_BYTES: usize = 50_000_000;
@@ -105,9 +110,8 @@ struct EngineIndex {
     reader: IndexReader,
     writer: IndexWriter,
     key_field: Field,
-    /// Searchable fields as `(azure field name, tantivy field, analyzer)`
-    /// triples; `analyzer` is the field's declared Azure analyzer name
-    /// (`None` for the English default).
+    /// Searchable fields; `analyzer` is the field's declared Azure analyzer
+    /// name (`None` for the English default).
     searchable: Vec<SearchableField>,
 }
 
@@ -189,18 +193,18 @@ impl SearchEngine {
                 .delete_term(Term::from_field_text(engine.key_field, &document.key));
             let mut tantivy_doc = TantivyDocument::new();
             tantivy_doc.add_text(engine.key_field, &document.key);
-            for (field_name, field, _analyzer) in &engine.searchable {
-                for value in document.resolve_path(field_name) {
+            for searchable in &engine.searchable {
+                for value in document.resolve_path(&searchable.name) {
                     // A plain collection field (e.g. `Edm.Collection(Edm.String)`)
                     // resolves to a single JSON array; index each element.
                     if let Value::Array(items) = value {
                         for item in items {
                             if let Some(text) = text_representation(item) {
-                                tantivy_doc.add_text(*field, text);
+                                tantivy_doc.add_text(searchable.field, text);
                             }
                         }
                     } else if let Some(text) = text_representation(value) {
-                        tantivy_doc.add_text(*field, text);
+                        tantivy_doc.add_text(searchable.field, text);
                     }
                 }
             }
@@ -273,7 +277,7 @@ impl SearchEngine {
             Some(names) => engine
                 .searchable
                 .iter()
-                .filter(|(name, _, _)| names.contains(name))
+                .filter(|searchable| names.contains(&searchable.name))
                 .cloned()
                 .collect(),
             None => engine.searchable.clone(),
@@ -354,7 +358,11 @@ fn collect_searchable(
             // full-text indexed (their values are numeric arrays).
             let tantivy_field =
                 builder.add_text_field(&path, text_options_for(field.analyzer.as_deref()));
-            searchable.push((path, tantivy_field, field.analyzer.clone()));
+            searchable.push(SearchableField {
+                name: path,
+                field: tantivy_field,
+                analyzer: field.analyzer.clone(),
+            });
         }
     }
 }
@@ -446,27 +454,29 @@ fn clause_query(
     match clause {
         Clause::Term(term) => {
             let mut term_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-            for (name, field, analyzer) in fields {
-                let tokens = analyze_with(term, analyzer.as_deref());
+            for searchable in fields {
+                let tokens = analyze_with(term, searchable.analyzer.as_deref());
                 for token in &tokens {
-                    let term = Term::from_field_text(*field, token);
+                    let term = Term::from_field_text(searchable.field, token);
                     let query: Box<dyn Query> =
                         Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
-                    term_clauses
-                        .push((Occur::Should, maybe_boost(query, field_boost(boosts, name))));
+                    term_clauses.push((
+                        Occur::Should,
+                        maybe_boost(query, field_boost(boosts, &searchable.name)),
+                    ));
                 }
                 // Synonym expansions for this term, analyzed with the same
                 // field analyzer so `keyword` fields match verbatim forms and
                 // English fields match stemmed forms.
                 if let Some((_, expansions)) = synonyms.iter().find(|(raw, _)| raw == term) {
                     for expansion in expansions {
-                        for token in analyze_with(expansion, analyzer.as_deref()) {
-                            let term = Term::from_field_text(*field, &token);
+                        for token in analyze_with(expansion, searchable.analyzer.as_deref()) {
+                            let term = Term::from_field_text(searchable.field, &token);
                             let query: Box<dyn Query> =
                                 Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
                             term_clauses.push((
                                 Occur::Should,
-                                maybe_boost(query, field_boost(boosts, name)),
+                                maybe_boost(query, field_boost(boosts, &searchable.name)),
                             ));
                         }
                     }
@@ -486,26 +496,32 @@ fn clause_query(
                 return Box::new(EmptyQuery);
             }
             let mut fuzzy_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(fields.len());
-            for (name, field, _analyzer) in fields {
-                let term = Term::from_field_text(*field, &token);
+            for searchable in fields {
+                let term = Term::from_field_text(searchable.field, &token);
                 let query: Box<dyn Query> = Box::new(FuzzyTermQuery::new(term, *distance, true));
-                fuzzy_clauses.push((Occur::Should, maybe_boost(query, field_boost(boosts, name))));
+                fuzzy_clauses.push((
+                    Occur::Should,
+                    maybe_boost(query, field_boost(boosts, &searchable.name)),
+                ));
             }
             Box::new(BooleanQuery::new(fuzzy_clauses))
         }
         Clause::Phrase(phrase) => {
             let mut phrase_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-            for (name, field, analyzer) in fields {
-                let tokens = analyze_with(phrase, analyzer.as_deref());
+            for searchable in fields {
+                let tokens = analyze_with(phrase, searchable.analyzer.as_deref());
                 if tokens.is_empty() {
                     continue;
                 }
                 let terms = tokens
                     .iter()
-                    .map(|token| Term::from_field_text(*field, token))
+                    .map(|token| Term::from_field_text(searchable.field, token))
                     .collect();
                 let query: Box<dyn Query> = Box::new(PhraseQuery::new(terms));
-                phrase_clauses.push((Occur::Should, maybe_boost(query, field_boost(boosts, name))));
+                phrase_clauses.push((
+                    Occur::Should,
+                    maybe_boost(query, field_boost(boosts, &searchable.name)),
+                ));
             }
             if phrase_clauses.is_empty() {
                 return Box::new(EmptyQuery);

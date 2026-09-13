@@ -34,8 +34,8 @@ impl VersionAdapter {
 
     /// The earliest supported version (the acceptance floor), if any
     /// configured version carries a `YYYY-MM-DD` date prefix.
-    fn floor(&self) -> Option<&str> {
-        self.supported
+    fn floor_in(supported: &[String]) -> Option<&str> {
+        supported
             .iter()
             .filter_map(|v| version_date(v).map(|d| (d, v.as_str())))
             .min_by(|a, b| a.0.cmp(b.0))
@@ -46,12 +46,21 @@ impl VersionAdapter {
     /// or any well-formed version on or after the acceptance floor.
     #[must_use]
     pub fn is_supported(&self, version: &str) -> bool {
-        if self.supported.iter().any(|v| v == version) {
+        Self::is_supported_in(&self.supported, version)
+    }
+
+    /// Slice-based acceptance check, so callers holding the configured
+    /// versions (e.g. [`crate::config::Config`]) need not build a throwaway
+    /// adapter per call.
+    #[must_use]
+    pub fn is_supported_in(supported: &[String], version: &str) -> bool {
+        if supported.iter().any(|v| v == version) {
             return true;
         }
-        let (Some(candidate), Some(floor)) =
-            (version_date(version), self.floor().and_then(version_date))
-        else {
+        let (Some(candidate), Some(floor)) = (
+            version_date(version),
+            Self::floor_in(supported).and_then(version_date),
+        ) else {
             return false;
         };
         candidate >= floor
@@ -90,9 +99,9 @@ pub(crate) fn version_date(version: &str) -> Option<&str> {
     if bytes.len() == 10
         && bytes[4] == b'-'
         && bytes[7] == b'-'
-        && date[..4].chars().all(|c| c.is_ascii_digit())
-        && date[5..7].chars().all(|c| c.is_ascii_digit())
-        && date[8..10].chars().all(|c| c.is_ascii_digit())
+        && bytes[0..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
     {
         let month: u32 = date[5..7].parse().ok()?;
         let day: u32 = date[8..10].parse().ok()?;

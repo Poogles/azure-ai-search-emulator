@@ -53,6 +53,18 @@ enum HnswBackend {
     Euclidean(Hnsw<'static, f32, DistL2>),
 }
 
+/// Dispatches an identical method call to the inner HNSW graph, whichever
+/// distance kernel it uses. The two variants expose the same API on distinct
+/// types, so the match lives here once instead of at every call site.
+macro_rules! with_hnsw {
+    ($backend:expr, $hnsw:ident => $body:expr) => {
+        match $backend {
+            HnswBackend::Cosine($hnsw) => $body,
+            HnswBackend::Euclidean($hnsw) => $body,
+        }
+    };
+}
+
 impl HnswBackend {
     /// Builds the graph backend for `metric`, or `None` for `dotProduct`
     /// (unrepresentable as a non-negative HNSW distance; always scanned).
@@ -91,10 +103,7 @@ impl HnswBackend {
     }
 
     fn insert(&self, vector: &[f32], id: usize) {
-        match self {
-            HnswBackend::Cosine(hnsw) => hnsw.insert((vector, id)),
-            HnswBackend::Euclidean(hnsw) => hnsw.insert((vector, id)),
-        }
+        with_hnsw!(self, hnsw => hnsw.insert((vector, id)));
     }
 
     /// Approximate top-`k` (at most) as `(external id, distance)` pairs.
@@ -102,10 +111,7 @@ impl HnswBackend {
         if k == 0 {
             return Vec::new();
         }
-        let neighbours = match self {
-            HnswBackend::Cosine(hnsw) => hnsw.search(query, k, ef),
-            HnswBackend::Euclidean(hnsw) => hnsw.search(query, k, ef),
-        };
+        let neighbours = with_hnsw!(self, hnsw => hnsw.search(query, k, ef));
         neighbours
             .iter()
             .map(|n| (n.get_origin_id(), n.get_distance()))
@@ -113,10 +119,7 @@ impl HnswBackend {
     }
 
     fn len(&self) -> usize {
-        match self {
-            HnswBackend::Cosine(hnsw) => hnsw.get_nb_point(),
-            HnswBackend::Euclidean(hnsw) => hnsw.get_nb_point(),
-        }
+        with_hnsw!(self, hnsw => hnsw.get_nb_point())
     }
 }
 

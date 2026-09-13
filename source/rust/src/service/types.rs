@@ -2,7 +2,8 @@
 
 use std::collections::BTreeMap;
 
-use serde_json::{Map, Value};
+use serde::Serialize;
+use serde_json::Value;
 
 use crate::filter::FilterExpr;
 use crate::query::{QueryType, SearchMode};
@@ -10,32 +11,23 @@ use crate::storage::Document;
 
 /// Per-document result of an indexing operation, in the response shape
 /// expected by the pinned Python SDK (`azure-search-documents==11.6.0`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IndexingResultItem {
     pub key: String,
+    #[serde(rename = "status")]
     pub succeeded: bool,
+    #[serde(rename = "statusCode")]
     pub status_code: u16,
+    #[serde(rename = "errorMessage")]
     pub error_message: Option<String>,
 }
 
 impl IndexingResultItem {
+    #[must_use]
     pub fn to_value(&self) -> Value {
-        Value::Object({
-            let mut map = Map::new();
-            map.insert("key".to_owned(), Value::String(self.key.clone()));
-            map.insert("status".to_owned(), Value::Bool(self.succeeded));
-            map.insert(
-                "statusCode".to_owned(),
-                Value::from(u64::from(self.status_code)),
-            );
-            map.insert(
-                "errorMessage".to_owned(),
-                self.error_message
-                    .clone()
-                    .map_or(Value::Null, Value::String),
-            );
-            map
-        })
+        // Serialization of this plain-data struct cannot fail; fall back to
+        // null rather than panicking in request handling.
+        serde_json::to_value(self).unwrap_or(Value::Null)
     }
 }
 
@@ -67,11 +59,7 @@ pub struct SearchQuery {
     pub top: Option<u64>,
     pub skip: u64,
     pub filter: Option<FilterExpr>,
-    /// The raw `filter` string, preserved for continuation tokens.
-    pub filter_raw: Option<String>,
     pub orderby: Vec<OrderBy>,
-    /// The raw `orderby` string, preserved for continuation tokens.
-    pub orderby_raw: Option<String>,
     pub select: Vec<String>,
     pub facets: Vec<Facet>,
     pub search_fields: Vec<SearchField>,
@@ -81,13 +69,25 @@ pub struct SearchQuery {
     pub highlight_pre_tag: String,
     pub highlight_post_tag: String,
     pub continuation: Option<String>,
+    /// The raw request state bound into continuation tokens.
+    pub paging: PagingState,
     /// Parsed `vectorQueries` entries (wire shape; SDK key aliases already
     /// resolved).
     pub vector_queries: Vec<VectorQuery>,
-    /// The raw `vectorQueries` array, preserved to bind continuation tokens
-    /// to the vector query identity.
-    pub vector_queries_raw: Option<Value>,
     pub vector_filter_mode: VectorFilterMode,
+}
+
+/// The raw request state bound into continuation tokens: the raw `filter`,
+/// `orderby`, and `vectorQueries` values that must survive a token round-trip
+/// so later pages stay on the same result set and vector-query identity.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PagingState {
+    /// The raw `filter` string.
+    pub filter_raw: Option<String>,
+    /// The raw `orderby` string.
+    pub orderby_raw: Option<String>,
+    /// The raw `vectorQueries` array, binding tokens to the vector identity.
+    pub vector_queries_raw: Option<Value>,
 }
 
 /// One parsed `searchFields` entry: a field name with its score boost from an

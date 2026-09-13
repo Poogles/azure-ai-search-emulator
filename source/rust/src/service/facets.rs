@@ -20,7 +20,8 @@ pub(crate) fn compute_facets(documents: &[Document], facets: &[Facet]) -> Value 
             );
             continue;
         }
-        let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        let mut counts: std::collections::BTreeMap<String, (FacetValue, u64)> =
+            std::collections::BTreeMap::new();
         for document in documents {
             let Some(value) = document.fields.get(&facet.field) else {
                 continue;
@@ -35,20 +36,26 @@ pub(crate) fn compute_facets(documents: &[Document], facets: &[Facet]) -> Value 
                     continue;
                 }
                 let key = facet_key(&value);
-                *counts.entry(key).or_insert(0) += 1;
+                let entry = counts
+                    .entry(key)
+                    .or_insert_with(|| (FacetValue::classify(&value), 0));
+                entry.1 += 1;
             }
         }
-        let mut entries: Vec<(String, u64)> = counts.into_iter().collect();
-        entries.sort_by(|(a, ac), (b, bc)| bc.cmp(ac).then_with(|| a.cmp(b)));
+        let mut entries: Vec<(String, FacetValue, u64)> = counts
+            .into_iter()
+            .map(|(key, (value, count))| (key, value, count))
+            .collect();
+        entries.sort_by(|(a, _, ac), (b, _, bc)| bc.cmp(ac).then_with(|| a.cmp(b)));
         if let Some(limit) = facet.limit {
             entries.truncate(limit);
         }
         let items = entries
             .into_iter()
-            .map(|(key, count)| {
+            .map(|(_, value, count)| {
                 Value::Object({
                     let mut entry = Map::new();
-                    entry.insert("value".to_owned(), facet_value(&key));
+                    entry.insert("value".to_owned(), value.to_value());
                     entry.insert("count".to_owned(), Value::from(count));
                     entry
                 })
@@ -59,6 +66,10 @@ pub(crate) fn compute_facets(documents: &[Document], facets: &[Facet]) -> Value 
     Value::Object(map)
 }
 
+/// The sort/dedup key for a facet value: a type-prefixed string (`s:`/`n:`/
+/// `b:`/`o:`) so distinct values are unique and equal-count entries order
+/// deterministically. The emitted value itself is carried by [`FacetValue`],
+/// not re-parsed from this key.
 fn facet_key(value: &Value) -> String {
     match value {
         Value::String(s) => format!("s:{s}"),
@@ -68,16 +79,33 @@ fn facet_key(value: &Value) -> String {
     }
 }
 
-fn facet_value(key: &str) -> Value {
-    match key.split_once(':') {
-        Some(("s", rest)) => Value::String(rest.to_owned()),
-        Some(("n", rest)) => rest
-            .parse::<i64>()
-            .ok()
-            .map(Value::from)
-            .or_else(|| rest.parse::<f64>().ok().map(Value::from))
-            .unwrap_or_else(|| Value::String(rest.to_owned())),
-        Some(("b", rest)) => Value::Bool(rest == "true"),
-        _ => Value::String(key.to_owned()),
+/// A distinct facet value, classified by JSON type so the emitted value is the
+/// original (no lossy string round-trip: large integers keep their exact
+/// magnitude and non-scalar values are emitted as-is).
+#[derive(Clone)]
+enum FacetValue {
+    String(String),
+    Number(serde_json::Number),
+    Bool(bool),
+    Other(Value),
+}
+
+impl FacetValue {
+    fn classify(value: &Value) -> Self {
+        match value {
+            Value::String(s) => FacetValue::String(s.clone()),
+            Value::Number(n) => FacetValue::Number(n.clone()),
+            Value::Bool(b) => FacetValue::Bool(*b),
+            other => FacetValue::Other(other.clone()),
+        }
+    }
+
+    fn to_value(&self) -> Value {
+        match self {
+            FacetValue::String(s) => Value::String(s.clone()),
+            FacetValue::Number(n) => Value::Number(n.clone()),
+            FacetValue::Bool(b) => Value::Bool(*b),
+            FacetValue::Other(v) => v.clone(),
+        }
     }
 }

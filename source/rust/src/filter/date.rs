@@ -179,24 +179,14 @@ fn datepart_value(part: DatePart, dt: &DateTime<Utc>) -> f64 {
 /// string. Returns `None` on overflow or out-of-range intervals.
 fn dateadd_value(unit: DateUnit, interval: i64, dt: &DateTime<Utc>) -> Option<String> {
     let shifted = match unit {
-        DateUnit::Year => {
-            let months = u32::try_from(interval.abs().checked_mul(12)?).ok()?;
-            if interval >= 0 {
-                dt.checked_add_months(chrono::Months::new(months))?
-            } else {
-                dt.checked_sub_months(chrono::Months::new(months))?
-            }
-        }
-        DateUnit::Quarter => {
-            let months = u32::try_from(interval.abs().checked_mul(3)?).ok()?;
-            if interval >= 0 {
-                dt.checked_add_months(chrono::Months::new(months))?
-            } else {
-                dt.checked_sub_months(chrono::Months::new(months))?
-            }
-        }
-        DateUnit::Month => {
-            let months = u32::try_from(interval.abs()).ok()?;
+        DateUnit::Year | DateUnit::Quarter | DateUnit::Month => {
+            let months_per_unit = match unit {
+                DateUnit::Year => 12,
+                DateUnit::Quarter => 3,
+                _ => 1,
+            };
+            let months =
+                u32::try_from(interval.checked_abs()?.checked_mul(months_per_unit)?).ok()?;
             if interval >= 0 {
                 dt.checked_add_months(chrono::Months::new(months))?
             } else {

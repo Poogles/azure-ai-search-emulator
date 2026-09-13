@@ -31,15 +31,17 @@ pub(crate) fn rrf_fuse_weighted(
 }
 
 /// Adds one ranked list's weighted RRF contribution to `fused`.
+#[allow(clippy::cast_precision_loss)]
 fn rrf_add_list(fused: &mut BTreeMap<String, f32>, weight: f32, list: &BTreeMap<String, f32>) {
     const K: f32 = 60.0;
     let mut ranked: Vec<(&String, &f32)> = list.iter().collect();
     ranked.sort_by(|x, y| y.1.total_cmp(x.1).then_with(|| x.0.cmp(y.0)));
-    let mut rank = 1.0f32;
-    for (key, _) in &ranked {
-        let contribution = weight * (1.0 / (K + rank));
+    // Ranks are 1-based positions in a result list, far below the 2^24
+    // exact-integer limit of `f32`, so the cast is lossless in practice.
+    for (index, (key, _)) in ranked.iter().enumerate() {
+        let rank = index + 1;
+        let contribution = weight * (1.0 / (K + rank as f32));
         *fused.entry((*key).clone()).or_insert(0.0) += contribution;
-        rank += 1.0;
     }
 }
 
@@ -114,15 +116,29 @@ fn compare_field(a: &Document, b: &Document, field: &str, descending: bool) -> s
 
 fn compare_values(av: &Value, bv: &Value) -> std::cmp::Ordering {
     match (av, bv) {
-        (Value::Number(a), Value::Number(b)) => a
-            .as_f64()
-            .partial_cmp(&b.as_f64())
-            .unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Number(a), Value::Number(b)) => compare_numbers(a, b),
         (Value::String(a), Value::String(b)) => a.cmp(b),
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
         (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
         // Mixed types: order by type tag so the result is deterministic.
         _ => type_tag(av).cmp(&type_tag(bv)),
+    }
+}
+
+/// Compares two JSON numbers: integer values are compared in their native
+/// `i64`/`u64` form so large magnitudes order exactly (an `f64` comparison
+/// would round them together), falling back to `f64` for floats and mixed
+/// integer/float pairs.
+fn compare_numbers(a: &serde_json::Number, b: &serde_json::Number) -> std::cmp::Ordering {
+    match (a.as_i64(), b.as_i64()) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        _ => match (a.as_u64(), b.as_u64()) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            _ => a
+                .as_f64()
+                .partial_cmp(&b.as_f64())
+                .unwrap_or(std::cmp::Ordering::Equal),
+        },
     }
 }
 
