@@ -151,20 +151,20 @@ Move code only; no logic changes. Suggested target layout:
 
 ## 5. Split `query/mod.rs` (2225 lines)
 
-- [ ] **5.1 `query/analyzers.rs`** — the 26 `ANALYZER_*` consts,
+- [x] **5.1 `query/analyzers.rs`** — the 26 `ANALYZER_*` consts,
       `analyzer_tokenizer_name`, `language_analyzer`, `build_analyzer`,
       `register_analyzers`, `CjkTokenizer`, `CjkTokenStream`, `is_cjk_char`,
       `text_options_for`, `analyze`, `analyze_with`, `AnalyzeToken`,
       `analyze_with_offsets`, `analyze_with_offsets_and_analyzer`,
       `emulator_tokenizer_manager` (58-468).
-- [ ] **5.2 `query/simple.rs`** — `Clause`, `SearchMode`, `QueryType`,
+- [x] **5.2 `query/simple.rs`** — `Clause`, `SearchMode`, `QueryType`,
       `FullTextQuery`, `parse_search_text`, `read_clause`,
       `split_fuzzy_suffix` (470-695).
-- [ ] **5.3 `query/lucene.rs`** — `build_lucene_query`,
+- [x] **5.3 `query/lucene.rs`** — `build_lucene_query`,
       `expand_trailing_wildcards`, `expand_unquoted_wildcards`,
       `split_token_affixes`, `expand_token_wildcard`, `quotes_balanced`,
       `regex_escaped_prefix`, `lucene_query_terms` (1036-1277).
-- [ ] **5.4 `query/mod.rs` keeps** `SearchEngine`, `EngineIndex`,
+- [x] **5.4 `query/mod.rs` keeps** `SearchEngine`, `EngineIndex`,
       `build_schema`, `collect_searchable`, `text_representation`,
       `build_query`, `field_boost`, `maybe_boost`, `clause_query`, and its
       tests.
