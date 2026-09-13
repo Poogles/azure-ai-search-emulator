@@ -14,7 +14,7 @@
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde_json::{Map, Value};
 
-use crate::storage::{FieldDefinition, IndexDefinition};
+use crate::storage::{resolve_field_path, FieldDefinition, IndexDefinition};
 
 /// Comparison operators supported in filter expressions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,10 +259,10 @@ impl FilterExpr {
             FilterExpr::Or(clauses) => clauses.iter().any(|c| c.matches(fields)),
             FilterExpr::Not(inner) => !inner.matches(fields),
             FilterExpr::Compare { field, op, value } => {
-                compare_field_values(&resolve_paths(fields, field), *op, value)
+                compare_field_values(&resolve_field_path(fields, field), *op, value)
             }
             FilterExpr::In { field, values } => {
-                let resolved = resolve_paths(fields, field);
+                let resolved = resolve_field_path(fields, field);
                 if resolved.is_empty() {
                     // A missing field matches only a list containing `null`.
                     return values.iter().any(value_is_null);
@@ -277,7 +277,7 @@ impl FilterExpr {
                     StringFunc::EndsWith => text.ends_with(arg.as_str()),
                     StringFunc::Contains => text.contains(arg.as_str()),
                 };
-                flatten_values(&resolve_paths(fields, field))
+                flatten_values(&resolve_field_path(fields, field))
                     .iter()
                     .filter_map(|value| value.as_str())
                     .any(is_match)
@@ -303,13 +303,13 @@ impl FilterExpr {
             }
             FilterExpr::IsMatch { field, pattern } => {
                 let lowered = pattern.to_lowercase();
-                flatten_values(&resolve_paths(fields, field))
+                flatten_values(&resolve_field_path(fields, field))
                     .iter()
                     .filter_map(|value| value.as_str())
                     .any(|text| text.to_lowercase().contains(lowered.as_str()))
             }
             FilterExpr::IsEmpty { field } => {
-                let resolved = resolve_paths(fields, field);
+                let resolved = resolve_field_path(fields, field);
                 if resolved.is_empty() {
                     return true;
                 }
@@ -320,7 +320,7 @@ impl FilterExpr {
                         .all(|value| value.is_null() || value.as_str() == Some(""))
             }
             FilterExpr::IsNull { field } => {
-                let resolved = resolve_paths(fields, field);
+                let resolved = resolve_field_path(fields, field);
                 if resolved.is_empty() {
                     return true;
                 }
@@ -330,44 +330,6 @@ impl FilterExpr {
             }
         }
     }
-}
-
-/// Resolves a field path (`Address/StateProvince`, or a plain field name)
-/// against a document's field map, walking into complex-type objects. When a
-/// segment resolves to a JSON array (a collection field or a
-/// collection-of-complex field), the remaining path is resolved against every
-/// element, so a collection-of-complex path yields one value per element. A
-/// plain (non-collection) path yields at most one value.
-fn resolve_paths<'a>(fields: &'a Map<String, Value>, path: &str) -> Vec<&'a Value> {
-    let mut segments = path.split('/');
-    let Some(first) = segments.next() else {
-        return Vec::new();
-    };
-    let mut current = match fields.get(first) {
-        Some(value) => vec![value],
-        None => return Vec::new(),
-    };
-    for segment in segments {
-        let mut next = Vec::new();
-        for value in current {
-            match value {
-                Value::Array(items) => {
-                    for item in items {
-                        if let Some(sub) = item.as_object().and_then(|o| o.get(segment)) {
-                            next.push(sub);
-                        }
-                    }
-                }
-                _ => {
-                    if let Some(sub) = value.as_object().and_then(|o| o.get(segment)) {
-                        next.push(sub);
-                    }
-                }
-            }
-        }
-        current = next;
-    }
-    current
 }
 
 /// Flattens resolved path values one level: a single collection field becomes
@@ -526,7 +488,7 @@ fn normalize_datetime(text: &str) -> Option<String> {
 /// Resolves a field path to its first date/time value, parsed to UTC. Paths
 /// through collections resolve to the first parseable element.
 fn resolve_datetime(fields: &Map<String, Value>, field: &str) -> Option<DateTime<Utc>> {
-    for value in flatten_values(&resolve_paths(fields, field)) {
+    for value in flatten_values(&resolve_field_path(fields, field)) {
         if let Some(text) = value.as_str() {
             if let Some(dt) = parse_datetime(text) {
                 return Some(dt);
@@ -702,7 +664,7 @@ pub fn validate(expr: &FilterExpr, definition: &IndexDefinition) -> Result<(), S
                     "Filter operator {op:?} is not supported for boolean values in field {field:?}."
                 ));
             }
-            if op.is_ordering() && is_collection_type(&field_def.field_type) {
+            if op.is_ordering() && field_def.is_collection() {
                 return Err(format!(
                     "Filter operator {op:?} is not supported for collection field {field:?}; \
                      use any/all for collection filtering."
@@ -736,7 +698,7 @@ pub fn validate(expr: &FilterExpr, definition: &IndexDefinition) -> Result<(), S
         }
         FilterExpr::Any { field, inner } | FilterExpr::All { field, inner } => {
             let field_def = require_filterable(field, definition)?;
-            if !is_collection_type(&field_def.field_type) {
+            if !field_def.is_collection() {
                 return Err(format!(
                     "Field {field:?} is not a collection; any/all require a collection field."
                 ));
@@ -821,10 +783,6 @@ fn require_filterable<'a>(
         ));
     }
     Ok(field_def)
-}
-
-fn is_collection_type(field_type: &str) -> bool {
-    field_type.starts_with("Edm.Collection(")
 }
 
 // ---------------------------------------------------------------------------

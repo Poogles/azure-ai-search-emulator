@@ -33,6 +33,8 @@ use std::collections::BTreeMap;
 use hnsw_rs::prelude::{DistCosine, DistL2, Hnsw};
 use serde_json::Value;
 
+use crate::sync_util::{read_unpoisoned, write_unpoisoned};
+
 pub use distance::{brute_force_score, score_from_distance, Metric};
 
 /// Defaults from the spec (`docs/phase_2_1_vector_indexing.md`): missing
@@ -475,7 +477,7 @@ impl VectorIndex {
                     .map(|key| (key.clone(), score_from_distance(self.metric, distance)))
             })
             .collect();
-        sort_scored(&mut scored);
+        sort_scored(&mut scored, String::as_str);
         if scored.len() > k {
             scored.truncate(k);
         }
@@ -494,7 +496,7 @@ impl VectorIndex {
             .filter(|(key, _)| pre_filter.is_none_or(|f| f(key)))
             .map(|(key, vector)| (key.clone(), brute_force_score(self.metric, query, vector)))
             .collect();
-        sort_scored(&mut scored);
+        sort_scored(&mut scored, String::as_str);
         if scored.len() > k {
             scored.truncate(k);
         }
@@ -506,14 +508,15 @@ impl VectorIndex {
     }
 }
 
-/// Sorts `(key, score)` pairs by score descending, key ascending for
-/// determinism. `NaN` scores cannot occur (inputs are validated finite), so
-/// a fallback to `Equal` is safe.
-fn sort_scored(scored: &mut [(String, f32)]) {
+/// Sorts `(item, score)` pairs by score descending, with `key_of(item)`
+/// ascending as the tie-breaker, so ranking is deterministic. `NaN` scores
+/// cannot occur (inputs are validated finite), so a fallback to `Equal` is
+/// safe.
+pub fn sort_scored<T>(scored: &mut [(T, f32)], key_of: impl Fn(&T) -> &str) {
     scored.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| key_of(&a.0).cmp(key_of(&b.0)))
     });
 }
 
@@ -581,20 +584,14 @@ impl VectorEngine {
                 ),
             );
         }
-        let mut guard = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = write_unpoisoned(&self.inner);
         guard.insert(index.to_owned(), per_field);
         Ok(())
     }
 
     /// Drops all vector state for an emulator index.
     pub fn delete_index(&self, index: &str) {
-        let mut guard = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = write_unpoisoned(&self.inner);
         guard.remove(index);
     }
 
@@ -614,10 +611,7 @@ impl VectorEngine {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut guard = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = write_unpoisoned(&self.inner);
         let Some(per_field) = guard.get_mut(index) else {
             return Ok(());
         };
@@ -644,10 +638,7 @@ impl VectorEngine {
         if entries.is_empty() {
             return;
         }
-        let mut guard = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = write_unpoisoned(&self.inner);
         let Some(per_field) = guard.get_mut(index) else {
             return;
         };
@@ -671,10 +662,7 @@ impl VectorEngine {
         if keys.is_empty() {
             return;
         }
-        let mut guard = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = write_unpoisoned(&self.inner);
         let Some(per_field) = guard.get_mut(index) else {
             return;
         };
@@ -695,10 +683,7 @@ impl VectorEngine {
         exhaustive: bool,
         pre_filter: Option<&dyn Fn(&str) -> bool>,
     ) -> Vec<(String, f32)> {
-        let guard = self
-            .inner
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = read_unpoisoned(&self.inner);
         guard
             .get(index)
             .and_then(|per_field| per_field.get(field))
@@ -711,10 +696,7 @@ impl VectorEngine {
     /// `None` for unknown pairs. Used in tests.
     #[must_use]
     pub fn len(&self, index: &str, field: &str) -> Option<usize> {
-        let guard = self
-            .inner
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = read_unpoisoned(&self.inner);
         guard
             .get(index)
             .and_then(|per_field| per_field.get(field))
@@ -726,10 +708,7 @@ impl VectorEngine {
     /// (`exhaustiveKnn` profiles, `dotProduct` metrics). Used in tests.
     #[must_use]
     pub fn hnsw_len(&self, index: &str, field: &str) -> Option<usize> {
-        let guard = self
-            .inner
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = read_unpoisoned(&self.inner);
         guard
             .get(index)
             .and_then(|per_field| per_field.get(field))
@@ -738,10 +717,7 @@ impl VectorEngine {
 
     /// Clears all vector indexes.
     pub fn reset(&self) {
-        let mut guard = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = write_unpoisoned(&self.inner);
         guard.clear();
     }
 }

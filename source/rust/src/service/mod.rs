@@ -18,7 +18,8 @@ use crate::query::{
 use crate::storage::{
     Document, FieldDefinition, IndexDefinition, Storage, StorageError, Suggester,
 };
-use crate::vector::{parse_vector_search, vector_query_hash, VectorEngine};
+use crate::sync_util::{read_unpoisoned, write_unpoisoned};
+use crate::vector::{parse_vector_search, sort_scored, vector_query_hash, VectorEngine};
 
 /// Field types accepted by the schema validator.
 const SUPPORTED_FIELD_TYPES: &[&str] = &[
@@ -361,30 +362,42 @@ impl NamedResource {
     }
 }
 
+/// Builds a [`NamedResource`] from its name, etag, and stored request body.
+fn named_resource(name: &str, etag: String, raw: &Value) -> NamedResource {
+    NamedResource {
+        name: name.to_owned(),
+        etag,
+        raw: raw.clone(),
+    }
+}
+
 /// Service-level storage for a collection of named resources, keyed by name
-/// (sorted), with an incrementing etag counter. Mirrors the synonym-map
-/// storage pattern.
-#[derive(Debug, Default)]
-struct ResourceStore {
-    items: std::sync::RwLock<std::collections::BTreeMap<String, NamedResource>>,
+/// (sorted), with an incrementing etag counter. `T` is the stored resource
+/// type (a [`NamedResource`] for aliases, knowledge sources, and knowledge
+/// bases; a [`SynonymMap`] for synonym maps); `build` constructs it from its
+/// name and a fresh etag.
+#[derive(Debug)]
+struct ResourceStore<T> {
+    items: std::sync::RwLock<std::collections::BTreeMap<String, T>>,
     etags: AtomicU64,
 }
 
-impl ResourceStore {
-    fn lock_write(
-        &self,
-    ) -> std::sync::RwLockWriteGuard<'_, std::collections::BTreeMap<String, NamedResource>> {
-        self.items
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+impl<T> Default for ResourceStore<T> {
+    fn default() -> Self {
+        Self {
+            items: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+            etags: AtomicU64::new(0),
+        }
+    }
+}
+
+impl<T: Clone> ResourceStore<T> {
+    fn lock_write(&self) -> std::sync::RwLockWriteGuard<'_, std::collections::BTreeMap<String, T>> {
+        write_unpoisoned(&self.items)
     }
 
-    fn lock_read(
-        &self,
-    ) -> std::sync::RwLockReadGuard<'_, std::collections::BTreeMap<String, NamedResource>> {
-        self.items
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn lock_read(&self) -> std::sync::RwLockReadGuard<'_, std::collections::BTreeMap<String, T>> {
+        read_unpoisoned(&self.items)
     }
 
     /// Creates a new resource, failing if one with the same name exists.
@@ -392,21 +405,27 @@ impl ResourceStore {
     /// # Errors
     ///
     /// Returns [`ApiError::conflict`] if the name is already taken.
-    fn create(&self, name: &str, raw: &Value, code: &str) -> Result<NamedResource, ApiError> {
+    fn create<F>(&self, name: &str, kind: &str, code: &str, build: F) -> Result<T, ApiError>
+    where
+        F: FnOnce(&str, String) -> T,
+    {
         let mut items = self.lock_write();
         if items.contains_key(name) {
             return Err(ApiError::conflict(
                 code,
-                format!("A resource with name {name:?} already exists."),
+                format!("A {kind} with name {name:?} already exists."),
             ));
         }
-        Ok(self.insert(&mut items, name, raw))
+        Ok(self.insert(&mut items, name, build))
     }
 
     /// Creates or replaces a resource. Replacing issues a new etag.
-    fn create_or_update(&self, name: &str, raw: &Value) -> NamedResource {
+    fn create_or_update<F>(&self, name: &str, build: F) -> T
+    where
+        F: FnOnce(&str, String) -> T,
+    {
         let mut items = self.lock_write();
-        self.insert(&mut items, name, raw)
+        self.insert(&mut items, name, build)
     }
 
     /// Returns a clone of the resource with the given name.
@@ -414,7 +433,7 @@ impl ResourceStore {
     /// # Errors
     ///
     /// Returns [`ApiError::not_found`] if the resource does not exist.
-    fn get(&self, name: &str, kind: &str) -> Result<NamedResource, ApiError> {
+    fn get(&self, name: &str, kind: &str) -> Result<T, ApiError> {
         self.lock_read()
             .get(name)
             .cloned()
@@ -423,7 +442,7 @@ impl ResourceStore {
 
     /// Returns clones of all resources, sorted by name.
     #[must_use]
-    fn list(&self) -> Vec<NamedResource> {
+    fn list(&self) -> Vec<T> {
         self.lock_read().values().cloned().collect()
     }
 
@@ -453,12 +472,15 @@ impl ResourceStore {
         self.lock_write().clear();
     }
 
-    fn insert(
+    fn insert<F>(
         &self,
-        items: &mut std::collections::BTreeMap<String, NamedResource>,
+        items: &mut std::collections::BTreeMap<String, T>,
         name: &str,
-        raw: &Value,
-    ) -> NamedResource {
+        build: F,
+    ) -> T
+    where
+        F: FnOnce(&str, String) -> T,
+    {
         // Azure etags are quoted hex strings (e.g. `"0x8D..."`); SDKs echo
         // them back in `If-Match`, so match the shape, not just uniqueness.
         // +1 so the first etag is non-zero, as Azure's (timestamp-derived) are.
@@ -466,11 +488,7 @@ impl ResourceStore {
             "\"0x{:08X}\"",
             self.etags.fetch_add(1, Ordering::SeqCst) + 1
         );
-        let resource = NamedResource {
-            name: name.to_owned(),
-            etag,
-            raw: raw.clone(),
-        };
+        let resource = build(name, etag);
         items.insert(name.to_owned(), resource.clone());
         resource
     }
@@ -527,15 +545,13 @@ pub struct SearchService {
     /// default 3072).
     max_vector_dimension: usize,
     /// Service-level synonym maps, keyed by name (sorted).
-    synonym_maps: std::sync::RwLock<std::collections::BTreeMap<String, SynonymMap>>,
-    /// Counter for generated synonym-map etags.
-    synonym_map_etags: AtomicU64,
+    synonym_maps: ResourceStore<SynonymMap>,
     /// Service-level index aliases, keyed by name (sorted).
-    aliases: ResourceStore,
+    aliases: ResourceStore<NamedResource>,
     /// Service-level knowledge sources, keyed by name (sorted).
-    knowledge_sources: ResourceStore,
+    knowledge_sources: ResourceStore<NamedResource>,
     /// Service-level knowledge bases, keyed by name (sorted).
-    knowledge_bases: ResourceStore,
+    knowledge_bases: ResourceStore<NamedResource>,
 }
 
 impl SearchService {
@@ -550,8 +566,7 @@ impl SearchService {
             engine,
             vectors,
             max_vector_dimension,
-            synonym_maps: std::sync::RwLock::new(std::collections::BTreeMap::new()),
-            synonym_map_etags: AtomicU64::new(0),
+            synonym_maps: ResourceStore::default(),
             aliases: ResourceStore::default(),
             knowledge_sources: ResourceStore::default(),
             knowledge_bases: ResourceStore::default(),
@@ -573,30 +588,20 @@ impl SearchService {
     pub fn create_index(&self, raw: &Value) -> Result<Value, ApiError> {
         let definition = parse_index_definition(raw)?;
         validate_schema(&definition, self.max_vector_dimension)?;
-        // Index and alias names share the data-plane namespace (aliases
-        // resolve where index names are accepted), so neither may shadow the
-        // other.
-        if self.aliases.contains(&definition.name) {
-            return Err(ApiError::conflict(
-                "IndexAlreadyExists",
-                format!("An alias with name {:?} already exists.", definition.name),
-            ));
-        }
+        self.check_alias_collision(&definition.name)?;
         match self.storage.create_index(&definition) {
             Ok(()) => {
                 if let Err(e) = self
                     .engine
                     .create_index(&definition.name, &definition.fields)
                 {
-                    // Roll back storage: this index did not exist before, so
-                    // removing it restores the prior state and avoids
-                    // storage/engine divergence.
-                    self.storage.delete_index(&definition.name);
+                    // Roll back: this index did not exist before, so removing
+                    // it restores the prior state and avoids divergence.
+                    self.rollback_index(&definition.name);
                     return Err(engine_error(&definition.name, e));
                 }
                 if let Err(message) = self.create_vector_indexes(&definition) {
-                    self.storage.delete_index(&definition.name);
-                    self.engine.delete_index(&definition.name);
+                    self.rollback_index(&definition.name);
                     return Err(ApiError::bad_request("InvalidIndex", message));
                 }
                 Ok(definition.raw.clone())
@@ -626,12 +631,7 @@ impl SearchService {
     pub fn create_or_update_index(&self, raw: &Value) -> Result<Value, ApiError> {
         let definition = parse_index_definition(raw)?;
         validate_schema(&definition, self.max_vector_dimension)?;
-        if self.aliases.contains(&definition.name) {
-            return Err(ApiError::conflict(
-                "IndexAlreadyExists",
-                format!("An alias with name {:?} already exists.", definition.name),
-            ));
-        }
+        self.check_alias_collision(&definition.name)?;
         // In-place update: capture the stored documents when the index exists
         // and the schema change is compatible with them; otherwise the index
         // is replaced and its documents are discarded.
@@ -649,40 +649,34 @@ impl SearchService {
             .engine
             .create_index(&definition.name, &definition.fields)
         {
-            // Engine rebuild failed; remove the upserted index so storage and
-            // engine stay consistent (both absent). The caller can retry.
-            self.storage.delete_index(&definition.name);
+            // Engine rebuild failed; roll the index back to absent so storage,
+            // engine, and vectors stay consistent. The caller can retry.
+            self.rollback_index(&definition.name);
             return Err(engine_error(&definition.name, e));
         }
         // Rebuild the vector indexes; preserved vectors are re-inserted below.
         self.vectors.delete_index(&definition.name);
         if let Err(message) = self.create_vector_indexes(&definition) {
-            self.storage.delete_index(&definition.name);
-            self.engine.delete_index(&definition.name);
+            self.rollback_index(&definition.name);
             return Err(ApiError::bad_request("InvalidIndex", message));
         }
         // Re-materialize preserved documents: engine, vectors, then storage
         // (the same order as a fresh upload). A failure rolls the index back
         // to absent so storage/engine/vectors never diverge.
         if !preserved.is_empty() {
-            let rollback = |name: &str| {
-                self.storage.delete_index(name);
-                self.engine.delete_index(name);
-                self.vectors.delete_index(name);
-            };
             if let Err(e) = self.engine.index_documents(&definition.name, &preserved) {
-                rollback(&definition.name);
+                self.rollback_index(&definition.name);
                 return Err(engine_error(&definition.name, e));
             }
             if let Err(message) = self.apply_vector_changes(&definition, &preserved, &[]) {
-                rollback(&definition.name);
+                self.rollback_index(&definition.name);
                 return Err(ApiError::internal(format!(
                     "Vector re-indexing failed for index {:?}: {message}",
                     definition.name
                 )));
             }
             if let Err(e) = self.storage.put_documents(&definition.name, preserved) {
-                rollback(&definition.name);
+                self.rollback_index(&definition.name);
                 return Err(ApiError::not_found(e.to_string()));
             }
         }
@@ -748,6 +742,28 @@ impl SearchService {
             .create_index(&definition.name, definition.vector_search.as_ref(), &fields)
     }
 
+    /// Index and alias names share the data-plane namespace (aliases resolve
+    /// where index names are accepted), so an index may not shadow an alias.
+    fn check_alias_collision(&self, name: &str) -> Result<(), ApiError> {
+        if self.aliases.contains(name) {
+            return Err(ApiError::conflict(
+                "IndexAlreadyExists",
+                format!("An alias with name {name:?} already exists."),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Removes an index from storage, the search engine, and the vector
+    /// engine. Deleting a non-existent index is a no-op in all three, so this
+    /// is safe to call after any partial creation to restore the prior state
+    /// and avoid storage/engine/vectors divergence.
+    fn rollback_index(&self, name: &str) {
+        self.storage.delete_index(name);
+        self.engine.delete_index(name);
+        self.vectors.delete_index(name);
+    }
+
     /// Creates a new synonym map.
     ///
     /// # Errors
@@ -762,17 +778,21 @@ impl SearchService {
         synonyms: &str,
     ) -> Result<SynonymMap, ApiError> {
         validate_synonym_map(name, format, synonyms)?;
-        let mut maps = self
-            .synonym_maps
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if maps.contains_key(name) {
-            return Err(ApiError::conflict(
-                "SynonymMapAlreadyExists",
-                format!("A synonym map with name {name:?} already exists."),
-            ));
-        }
-        self.insert_synonym_map(&mut maps, name, format, synonyms)
+        let rules = parse_synonym_rules(synonyms).map_err(|e| {
+            ApiError::bad_request("InvalidSynonymMap", format!("Invalid synonym rules: {e}"))
+        })?;
+        self.synonym_maps.create(
+            name,
+            "synonym map",
+            "SynonymMapAlreadyExists",
+            |name, etag| SynonymMap {
+                name: name.to_owned(),
+                format: format.to_owned(),
+                synonyms: synonyms.to_owned(),
+                rules: rules.clone(),
+                etag,
+            },
+        )
     }
 
     /// Creates or replaces a synonym map. Replacing a map issues a new etag.
@@ -788,11 +808,18 @@ impl SearchService {
         synonyms: &str,
     ) -> Result<SynonymMap, ApiError> {
         validate_synonym_map(name, format, synonyms)?;
-        let mut maps = self
+        let rules = parse_synonym_rules(synonyms).map_err(|e| {
+            ApiError::bad_request("InvalidSynonymMap", format!("Invalid synonym rules: {e}"))
+        })?;
+        Ok(self
             .synonym_maps
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.insert_synonym_map(&mut maps, name, format, synonyms)
+            .create_or_update(name, |name, etag| SynonymMap {
+                name: name.to_owned(),
+                format: format.to_owned(),
+                synonyms: synonyms.to_owned(),
+                rules,
+                etag,
+            }))
     }
 
     /// Returns a clone of the synonym map with the given name.
@@ -801,13 +828,7 @@ impl SearchService {
     ///
     /// Returns an [`ApiError`] if the map does not exist.
     pub fn get_synonym_map(&self, name: &str) -> Result<SynonymMap, ApiError> {
-        let maps = self
-            .synonym_maps
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        maps.get(name)
-            .cloned()
-            .ok_or_else(|| ApiError::not_found(format!("Synonym map {name:?} was not found.")))
+        self.synonym_maps.get(name, "Synonym map")
     }
 
     /// Returns the raw synonym outputs for a query word: the union of outputs
@@ -816,12 +837,8 @@ impl SearchService {
     /// search (the emulator does not track per-field map associations).
     fn synonym_expansions(&self, word: &str) -> Vec<String> {
         let lowered = word.to_lowercase();
-        let maps = self
-            .synonym_maps
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut outputs = std::collections::BTreeSet::new();
-        for map in maps.values() {
+        let mut outputs = BTreeSet::new();
+        for map in self.synonym_maps.list() {
             for rule in &map.rules {
                 if rule.inputs.iter().any(|input| input == &lowered) {
                     outputs.extend(rule.outputs.iter().cloned());
@@ -835,11 +852,7 @@ impl SearchService {
     /// Returns clones of all synonym maps, sorted by name.
     #[must_use]
     pub fn list_synonym_maps(&self) -> Vec<SynonymMap> {
-        let maps = self
-            .synonym_maps
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        maps.values().cloned().collect()
+        self.synonym_maps.list()
     }
 
     /// Deletes a synonym map by name.
@@ -848,42 +861,7 @@ impl SearchService {
     ///
     /// Returns an [`ApiError`] if the map does not exist.
     pub fn delete_synonym_map(&self, name: &str) -> Result<(), ApiError> {
-        let mut maps = self
-            .synonym_maps
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if maps.remove(name).is_some() {
-            Ok(())
-        } else {
-            Err(ApiError::not_found(format!(
-                "Synonym map {name:?} was not found."
-            )))
-        }
-    }
-
-    fn insert_synonym_map(
-        &self,
-        maps: &mut std::collections::BTreeMap<String, SynonymMap>,
-        name: &str,
-        format: &str,
-        synonyms: &str,
-    ) -> Result<SynonymMap, ApiError> {
-        let rules = parse_synonym_rules(synonyms).map_err(|e| {
-            ApiError::bad_request("InvalidSynonymMap", format!("Invalid synonym rules: {e}"))
-        })?;
-        let etag = self
-            .synonym_map_etags
-            .fetch_add(1, Ordering::SeqCst)
-            .to_string();
-        let map = SynonymMap {
-            name: name.to_owned(),
-            format: format.to_owned(),
-            synonyms: synonyms.to_owned(),
-            rules,
-            etag,
-        };
-        maps.insert(name.to_owned(), map.clone());
-        Ok(map)
+        self.synonym_maps.delete(name, "Synonym map")
     }
 
     // ------------------------------------------------------------------
@@ -899,7 +877,10 @@ impl SearchService {
     /// namespace, so neither may shadow the other).
     pub fn create_alias(&self, name: &str, raw: &Value) -> Result<NamedResource, ApiError> {
         self.reject_alias_index_collision(name)?;
-        self.aliases.create(name, raw, "AliasAlreadyExists")
+        self.aliases
+            .create(name, "resource", "AliasAlreadyExists", |name, etag| {
+                named_resource(name, etag, raw)
+            })
     }
 
     /// Creates or replaces an index alias.
@@ -913,7 +894,9 @@ impl SearchService {
         raw: &Value,
     ) -> Result<NamedResource, ApiError> {
         self.reject_alias_index_collision(name)?;
-        Ok(self.aliases.create_or_update(name, raw))
+        Ok(self
+            .aliases
+            .create_or_update(name, |name, etag| named_resource(name, etag, raw)))
     }
 
     fn reject_alias_index_collision(&self, name: &str) -> Result<(), ApiError> {
@@ -964,13 +947,18 @@ impl SearchService {
         name: &str,
         raw: &Value,
     ) -> Result<NamedResource, ApiError> {
-        self.knowledge_sources
-            .create(name, raw, "KnowledgeSourceAlreadyExists")
+        self.knowledge_sources.create(
+            name,
+            "resource",
+            "KnowledgeSourceAlreadyExists",
+            |name, etag| named_resource(name, etag, raw),
+        )
     }
 
     /// Creates or replaces a knowledge source.
     pub fn create_or_update_knowledge_source(&self, name: &str, raw: &Value) -> NamedResource {
-        self.knowledge_sources.create_or_update(name, raw)
+        self.knowledge_sources
+            .create_or_update(name, |name, etag| named_resource(name, etag, raw))
     }
 
     /// Returns a clone of the knowledge source with the given name.
@@ -1011,13 +999,18 @@ impl SearchService {
         name: &str,
         raw: &Value,
     ) -> Result<NamedResource, ApiError> {
-        self.knowledge_bases
-            .create(name, raw, "KnowledgeBaseAlreadyExists")
+        self.knowledge_bases.create(
+            name,
+            "resource",
+            "KnowledgeBaseAlreadyExists",
+            |name, etag| named_resource(name, etag, raw),
+        )
     }
 
     /// Creates or replaces a knowledge base.
     pub fn create_or_update_knowledge_base(&self, name: &str, raw: &Value) -> NamedResource {
-        self.knowledge_bases.create_or_update(name, raw)
+        self.knowledge_bases
+            .create_or_update(name, |name, etag| named_resource(name, etag, raw))
     }
 
     /// Returns a clone of the knowledge base with the given name.
@@ -1794,7 +1787,7 @@ impl SearchService {
                 }
             }
             for field_name in &suggester.search_fields {
-                for value in resolve_field_values(&document.fields, field_name) {
+                for value in document.resolve_path(field_name) {
                     for word in field_words(value) {
                         if word.to_lowercase().contains(&needle) && seen.insert(word.clone()) {
                             completions.push(AutocompleteCompletion {
@@ -1848,7 +1841,7 @@ impl SearchService {
             }
             let mut matched = None;
             for field_name in &suggester.search_fields {
-                for value in resolve_field_values(&document.fields, field_name) {
+                for value in document.resolve_path(field_name) {
                     for word in field_words(value) {
                         if word.to_lowercase().contains(&needle) {
                             matched = Some(word);
@@ -1909,11 +1902,7 @@ impl SearchService {
         self.storage.reset();
         self.engine.reset();
         self.vectors.reset();
-        let mut maps = self
-            .synonym_maps
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        maps.clear();
+        self.synonym_maps.clear();
         self.aliases.clear();
         self.knowledge_sources.clear();
         self.knowledge_bases.clear();
@@ -1938,55 +1927,10 @@ impl SearchService {
         alias.target_index().unwrap_or_else(|| name.to_owned())
     }
 
-    /// Analyzer names accepted by the analyze-text endpoint (see
-    /// [`crate::query::analyzer_tokenizer_name`] for the mapping): the
-    /// standard/English aliases, `keyword` (single verbatim token),
-    /// `whitespace` (whitespace split, no lowercasing), `alphanum`
-    /// (punctuation split, no lowercasing), `latin` (lowercasing only),
-    /// `ngram` / `edgeNgram` (character n-grams), CJK (bigrams), and the
-    /// `*.microsoft` language analyzers. Unknown names are rejected
-    /// explicitly rather than silently mapped.
-    const KNOWN_ANALYZERS: &'static [&'static str] = &[
-        "standard",
-        "standard.lucene",
-        "standard.asciiFolding",
-        "keyword",
-        "whitespace",
-        "alphanum",
-        "latin",
-        "ngram",
-        "ngram.microsoft",
-        "ngram.lucene",
-        "edgeNgram",
-        "edgeNgram.microsoft",
-        "edgeNgram.lucene",
-        "simple",
-        "classic",
-        "stop",
-        "en.microsoft",
-        "en.lucene",
-        "chinese",
-        "japanese",
-        "korean",
-        "thai",
-        "vietnamese",
-        "ar.microsoft",
-        "da.microsoft",
-        "de.microsoft",
-        "el.microsoft",
-        "es.microsoft",
-        "fi.microsoft",
-        "fr.microsoft",
-        "hu.microsoft",
-        "it.microsoft",
-        "nl.microsoft",
-        "no.microsoft",
-        "pt.microsoft",
-        "ro.microsoft",
-        "ru.microsoft",
-        "sv.microsoft",
-        "tr.microsoft",
-    ];
+    /// Analyzer names accepted by the analyze-text endpoint; the single
+    /// source of truth is [`crate::query::KNOWN_ANALYZERS`]. Unknown names
+    /// are rejected explicitly rather than silently mapped.
+    const KNOWN_ANALYZERS: &'static [&'static str] = crate::query::KNOWN_ANALYZERS;
 
     /// Validates analyze-text parameters against the index schema: `field`,
     /// when given, must exist in the schema; `analyzer`, when given, must be
@@ -2089,10 +2033,6 @@ fn merge_fields(existing: &Document, update: &Value) -> Option<Value> {
     Some(Value::Object(merged))
 }
 
-/// Orders scored `(document, score)` pairs: by `orderby` when given,
-/// otherwise by score descending with the key field as tie-breaker so ranking
-/// is deterministic. Match-all (unscored) queries carry equal scores, so they
-/// stay in key order via the tie-breaker.
 /// Whether an in-place index update is compatible with the stored documents:
 /// every field in the old schema must still exist in the new schema with the
 /// same name and type (and, for vector fields, the same dimensions). Adding
@@ -2147,13 +2087,13 @@ fn rrf_add_list(fused: &mut BTreeMap<String, f32>, weight: f32, list: &BTreeMap<
     }
 }
 
+/// Orders scored `(document, score)` pairs: by `orderby` when given,
+/// otherwise by score descending with the key field as tie-breaker so ranking
+/// is deterministic. Match-all (unscored) queries carry equal scores, so they
+/// stay in key order via the tie-breaker.
 fn order_scored(scored: &mut [(Document, f32)], orderby: &[OrderBy]) {
     if orderby.is_empty() {
-        scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.key.cmp(&b.0.key))
-        });
+        sort_scored(scored, |doc: &Document| doc.key.as_str());
     } else {
         scored.sort_by(|a, b| compare_scored(a, b, orderby));
     }
@@ -3047,44 +2987,6 @@ fn key_display(value: &Value) -> Option<String> {
     }
 }
 
-/// Resolves a field path (`Address/City`, or a plain field name) against a
-/// document's field map, walking into complex-type objects. When a segment
-/// resolves to a JSON array (a collection field or a collection-of-complex
-/// field), the remaining path is resolved against every element, so a
-/// collection-of-complex path yields one value per element. A plain
-/// (non-collection) path yields at most one value.
-fn resolve_field_values<'a>(fields: &'a Map<String, Value>, path: &str) -> Vec<&'a Value> {
-    let mut segments = path.split('/');
-    let Some(first) = segments.next() else {
-        return Vec::new();
-    };
-    let mut current = match fields.get(first) {
-        Some(value) => vec![value],
-        None => return Vec::new(),
-    };
-    for segment in segments {
-        let mut next = Vec::new();
-        for value in current {
-            match value {
-                Value::Array(items) => {
-                    for item in items {
-                        if let Some(sub) = item.as_object().and_then(|o| o.get(segment)) {
-                            next.push(sub);
-                        }
-                    }
-                }
-                _ => {
-                    if let Some(sub) = value.as_object().and_then(|o| o.get(segment)) {
-                        next.push(sub);
-                    }
-                }
-            }
-        }
-        current = next;
-    }
-    current
-}
-
 /// Builds the engine-level full-text query for a search: parses the search
 /// text (simple-query clauses, or raw Lucene text for `queryType=full`),
 /// attaches synonym expansions for single-term clauses, and applies the
@@ -3324,7 +3226,7 @@ fn highlight_document(
         // or a path through a collection-of-complex field); every string
         // value with a query-term match contributes fragments.
         let mut fragments = Vec::new();
-        for value in resolve_field_values(&doc.fields, field) {
+        for value in doc.resolve_path(field) {
             let texts: Vec<&str> = match value {
                 Value::String(text) => vec![text.as_str()],
                 Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
@@ -3369,13 +3271,6 @@ fn parse_index_definition(raw: &Value) -> Result<IndexDefinition, ApiError> {
         .map_err(|message| ApiError::bad_request("InvalidIndex", message))
 }
 
-/// Whether a field type is a complex type: a single `Edm.ComplexType` object
-/// or a collection of them (`Edm.Collection(Edm.ComplexType)`). Both carry
-/// subfields and share the same validation and indexing rules.
-fn is_complex_type(field_type: &str) -> bool {
-    field_type == "Edm.ComplexType" || field_type == "Edm.Collection(Edm.ComplexType)"
-}
-
 fn validate_schema(
     definition: &IndexDefinition,
     max_vector_dimension: usize,
@@ -3391,7 +3286,7 @@ fn validate_schema(
             ));
         }
         if field.is_key {
-            if is_complex_type(&field.field_type) {
+            if field.is_complex_type() {
                 return Err(ApiError::bad_request(
                     "InvalidIndex",
                     format!(
@@ -3402,7 +3297,7 @@ fn validate_schema(
             }
             key_count += 1;
         }
-        if is_complex_type(&field.field_type) {
+        if field.is_complex_type() {
             if field.searchable || field.sortable || field.facetable {
                 return Err(ApiError::bad_request(
                     "InvalidIndex",
@@ -3723,15 +3618,9 @@ fn validate_document(definition: &IndexDefinition, document: &Value) -> Result<D
     let key_value = obj
         .get(&key_name)
         .ok_or_else(|| format!("Document is missing the key field {key_name:?}."))?;
-    let key = match key_value {
-        Value::String(s) => s.clone(),
-        Value::Number(n) => n.to_string(),
-        other => {
-            return Err(format!(
-                "Key field {key_name:?} must be a string or number, got {other:?}."
-            ))
-        }
-    };
+    let key = key_display(key_value).ok_or_else(|| {
+        format!("Key field {key_name:?} must be a string or number, got {key_value:?}.")
+    })?;
     for (name, value) in obj {
         let field = definition
             .field(name)
@@ -3745,11 +3634,12 @@ fn validate_document(definition: &IndexDefinition, document: &Value) -> Result<D
 }
 
 fn check_field_type(field: &FieldDefinition, value: &Value) -> Result<(), String> {
-    if field.field_type == "Edm.ComplexType" {
-        return check_complex_value(field, value);
-    }
-    if field.field_type == "Edm.Collection(Edm.ComplexType)" {
-        return check_complex_collection_value(field, value);
+    if field.is_complex_type() {
+        return if field.is_collection() {
+            check_complex_collection_value(field, value)
+        } else {
+            check_complex_value(field, value)
+        };
     }
     if field.is_vector_field() {
         return check_vector_value(field, value);
@@ -3764,14 +3654,7 @@ fn check_field_type(field: &FieldDefinition, value: &Value) -> Result<(), String
             .as_array()
             .is_some_and(|items| items.iter().all(|item| type_ok(inner, item)))
     } else {
-        match field_type.as_str() {
-            "Edm.String" | "Edm.DateTimeOffset" | "Edm.Guid" => value.is_string(),
-            "Edm.GeographyPoint" => is_geography_point(value),
-            "Edm.Int32" | "Edm.Int64" => value.is_i64() || value.is_u64(),
-            "Edm.Single" | "Edm.Double" | "Edm.Half" => value.is_number(),
-            "Edm.Boolean" => value.is_boolean(),
-            _ => true,
-        }
+        type_ok(field_type, value)
     };
     if ok {
         Ok(())
@@ -3905,6 +3788,10 @@ fn is_geography_point(value: &Value) -> bool {
         })
 }
 
+/// Whether a value is compatible with a scalar `Edm.*` field type. The single
+/// scalar type check: used directly for scalar fields and per-element for
+/// `Edm.Collection(...)` fields. Unknown types pass (schema validation has
+/// already rejected unsupported types).
 fn type_ok(inner: &str, value: &Value) -> bool {
     match inner {
         "Edm.String" | "Edm.DateTimeOffset" | "Edm.Guid" => value.is_string(),
@@ -3937,21 +3824,8 @@ const UNSUPPORTED_SEARCH_OPTIONS: &[&str] = &[
 mod tests {
     use super::*;
     use crate::storage::InMemoryStorage;
+    use crate::testutil::{err, ok};
     use serde_json::json;
-
-    fn ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
-        match result {
-            Ok(value) => value,
-            Err(err) => panic!("expected Ok, got Err: {err:?}"),
-        }
-    }
-
-    fn err<T, E: std::fmt::Debug>(result: Result<T, E>) -> E {
-        match result {
-            Ok(_) => panic!("expected Err, got Ok"),
-            Err(err) => err,
-        }
-    }
 
     fn service() -> SearchService {
         SearchService::new(

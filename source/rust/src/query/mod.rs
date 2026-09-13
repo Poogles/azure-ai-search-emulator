@@ -33,7 +33,7 @@
 
 use std::collections::BTreeMap;
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 use tantivy::collector::TopDocs;
 use tantivy::query::{
     AllQuery, BooleanQuery, BoostQuery, EmptyQuery, FuzzyTermQuery, Occur, PhraseQuery, Query,
@@ -51,6 +51,7 @@ use tantivy::tokenizer::{
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
 
 use crate::storage::{Document, FieldDefinition};
+use crate::sync_util::{read_unpoisoned, write_unpoisoned};
 
 /// Reserved Tantivy field name used to store each document's key.
 const KEY_FIELD_NAME: &str = "__aisearch_key";
@@ -118,6 +119,52 @@ impl std::fmt::Display for QueryError {
 }
 
 impl std::error::Error for QueryError {}
+
+/// The analyzer names the emulator recognizes: the names with explicit arms
+/// in [`analyzer_tokenizer_name`] plus the standard/English aliases that fall
+/// through to the default. The analyze-text endpoint uses this to reject
+/// unknown names explicitly rather than silently mapping them.
+pub const KNOWN_ANALYZERS: &[&str] = &[
+    "standard",
+    "standard.lucene",
+    "standard.asciiFolding",
+    "keyword",
+    "whitespace",
+    "alphanum",
+    "latin",
+    "ngram",
+    "ngram.microsoft",
+    "ngram.lucene",
+    "edgeNgram",
+    "edgeNgram.microsoft",
+    "edgeNgram.lucene",
+    "simple",
+    "classic",
+    "stop",
+    "en.microsoft",
+    "en.lucene",
+    "chinese",
+    "japanese",
+    "korean",
+    "thai",
+    "vietnamese",
+    "ar.microsoft",
+    "da.microsoft",
+    "de.microsoft",
+    "el.microsoft",
+    "es.microsoft",
+    "fi.microsoft",
+    "fr.microsoft",
+    "hu.microsoft",
+    "it.microsoft",
+    "nl.microsoft",
+    "no.microsoft",
+    "pt.microsoft",
+    "ro.microsoft",
+    "ru.microsoft",
+    "sv.microsoft",
+    "tr.microsoft",
+];
 
 /// Maps an Azure analyzer name (or `None` for the index default) to the
 /// registered tokenizer name used for both indexing and querying. Unknown
@@ -742,10 +789,7 @@ impl SearchEngine {
         let writer = index
             .writer(WRITER_HEAP_BYTES)
             .map_err(|e| QueryError::Engine(e.to_string()))?;
-        let mut guard = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = write_unpoisoned(&self.inner);
         if guard.contains_key(name) {
             return Err(QueryError::Engine(format!(
                 "search index {name:?} already exists"
@@ -766,10 +810,7 @@ impl SearchEngine {
 
     /// Removes the Tantivy index for `name`, if present.
     pub fn delete_index(&self, name: &str) {
-        let mut guard = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = write_unpoisoned(&self.inner);
         guard.remove(name);
     }
 
@@ -782,10 +823,7 @@ impl SearchEngine {
     /// Returns [`QueryError::IndexNotFound`] if the index does not exist, or
     /// [`QueryError::Engine`] if a Tantivy operation fails.
     pub fn index_documents(&self, name: &str, documents: &[Document]) -> Result<(), QueryError> {
-        let mut guard = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = write_unpoisoned(&self.inner);
         let engine = guard
             .get_mut(name)
             .ok_or_else(|| QueryError::IndexNotFound(name.to_owned()))?;
@@ -796,7 +834,7 @@ impl SearchEngine {
             let mut tantivy_doc = TantivyDocument::new();
             tantivy_doc.add_text(engine.key_field, &document.key);
             for (field_name, field, _analyzer) in &engine.searchable {
-                for value in resolve_doc_paths(&document.fields, field_name) {
+                for value in document.resolve_path(field_name) {
                     // A plain collection field (e.g. `Edm.Collection(Edm.String)`)
                     // resolves to a single JSON array; index each element.
                     if let Value::Array(items) = value {
@@ -839,10 +877,7 @@ impl SearchEngine {
         if keys.is_empty() {
             return Ok(());
         }
-        let mut guard = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = write_unpoisoned(&self.inner);
         let engine = guard
             .get_mut(name)
             .ok_or_else(|| QueryError::IndexNotFound(name.to_owned()))?;
@@ -874,10 +909,7 @@ impl SearchEngine {
         name: &str,
         query: &FullTextQuery,
     ) -> Result<BTreeMap<String, f32>, QueryError> {
-        let guard = self
-            .inner
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = read_unpoisoned(&self.inner);
         let engine = guard
             .get(name)
             .ok_or_else(|| QueryError::IndexNotFound(name.to_owned()))?;
@@ -927,10 +959,7 @@ impl SearchEngine {
 
     /// Clears all Tantivy indexes.
     pub fn reset(&self) {
-        let mut guard = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = write_unpoisoned(&self.inner);
         guard.clear();
     }
 }
@@ -959,9 +988,7 @@ fn collect_searchable(
         } else {
             format!("{prefix}/{}", field.name)
         };
-        if field.field_type == "Edm.ComplexType"
-            || field.field_type == "Edm.Collection(Edm.ComplexType)"
-        {
+        if field.is_complex_type() {
             // Complex types (single or collection) index their searchable
             // subfields under the field path; a collection contributes one
             // value per element at index time.
@@ -994,43 +1021,6 @@ fn text_representation(value: &Value) -> Option<std::borrow::Cow<'_, str>> {
         }
         _ => None,
     }
-}
-
-/// Resolves a field path (`Address/City`, or a plain field name) against a
-/// document's field map, walking into complex-type objects. When a segment
-/// resolves to a JSON array (a collection field), the remaining path is
-/// resolved against every element, so a collection-of-complex path yields one
-/// value per element. A plain (non-collection) path yields at most one value.
-fn resolve_doc_paths<'a>(fields: &'a Map<String, Value>, path: &str) -> Vec<&'a Value> {
-    let mut segments = path.split('/');
-    let Some(first) = segments.next() else {
-        return Vec::new();
-    };
-    let mut current = match fields.get(first) {
-        Some(value) => vec![value],
-        None => return Vec::new(),
-    };
-    for segment in segments {
-        let mut next = Vec::new();
-        for value in current {
-            match value {
-                Value::Array(items) => {
-                    for item in items {
-                        if let Some(sub) = item.as_object().and_then(|o| o.get(segment)) {
-                            next.push(sub);
-                        }
-                    }
-                }
-                _ => {
-                    if let Some(sub) = value.as_object().and_then(|o| o.get(segment)) {
-                        next.push(sub);
-                    }
-                }
-            }
-        }
-        current = next;
-    }
-    current
 }
 
 /// Builds the Tantivy query for a `queryType=full` (Lucene) search text:

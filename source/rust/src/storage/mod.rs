@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
+use crate::sync_util::{read_unpoisoned, write_unpoisoned};
+
 /// A single field definition from an index schema.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::struct_excessive_bools)]
@@ -136,6 +138,23 @@ impl FieldDefinition {
             return false;
         };
         obj.contains_key("dimensions") || obj.contains_key("vector_search_dimensions")
+    }
+
+    /// Whether this field is a complex type: a single `Edm.ComplexType`
+    /// object or a collection of them (`Edm.Collection(Edm.ComplexType)`).
+    /// Both carry subfields and share the same validation and indexing rules.
+    #[must_use]
+    pub fn is_complex_type(&self) -> bool {
+        matches!(
+            self.field_type.as_str(),
+            "Edm.ComplexType" | "Edm.Collection(Edm.ComplexType)"
+        )
+    }
+
+    /// Whether this field is a collection type (`Edm.Collection(...)`).
+    #[must_use]
+    pub fn is_collection(&self) -> bool {
+        self.field_type.starts_with("Edm.Collection(")
     }
 }
 
@@ -312,6 +331,56 @@ impl Document {
     pub fn to_value(&self) -> Value {
         Value::Object(self.fields.clone())
     }
+
+    /// Resolves a field path (`Address/City`, or a plain field name) against
+    /// this document's field map, walking into complex-type objects. When a
+    /// segment resolves to a JSON array (a collection field or a
+    /// collection-of-complex field), the remaining path is resolved against
+    /// every element, so a collection-of-complex path yields one value per
+    /// element. A plain (non-collection) path yields at most one value.
+    #[must_use]
+    pub fn resolve_path(&self, path: &str) -> Vec<&Value> {
+        resolve_field_path(&self.fields, path)
+    }
+}
+
+/// Resolves a field path (`Address/City`, or a plain field name) against a
+/// document's field map, walking into complex-type objects. When a segment
+/// resolves to a JSON array (a collection field or a collection-of-complex
+/// field), the remaining path is resolved against every element, so a
+/// collection-of-complex path yields one value per element. A plain
+/// (non-collection) path yields at most one value.
+#[must_use]
+pub fn resolve_field_path<'a>(fields: &'a Map<String, Value>, path: &str) -> Vec<&'a Value> {
+    let mut segments = path.split('/');
+    let Some(first) = segments.next() else {
+        return Vec::new();
+    };
+    let mut current = match fields.get(first) {
+        Some(value) => vec![value],
+        None => return Vec::new(),
+    };
+    for segment in segments {
+        let mut next = Vec::new();
+        for value in current {
+            match value {
+                Value::Array(items) => {
+                    for item in items {
+                        if let Some(sub) = item.as_object().and_then(|o| o.get(segment)) {
+                            next.push(sub);
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(sub) = value.as_object().and_then(|o| o.get(segment)) {
+                        next.push(sub);
+                    }
+                }
+            }
+        }
+        current = next;
+    }
+    current
 }
 
 /// Errors produced by the storage layer.
@@ -411,10 +480,7 @@ impl InMemoryStorage {
 
 impl Storage for InMemoryStorage {
     fn create_index(&self, index: &IndexDefinition) -> Result<(), StorageError> {
-        let mut indexes = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut indexes = write_unpoisoned(&self.inner);
         if indexes.contains_key(&index.name) {
             return Err(StorageError::IndexAlreadyExists(index.name.clone()));
         }
@@ -429,10 +495,7 @@ impl Storage for InMemoryStorage {
     }
 
     fn upsert_index(&self, index: &IndexDefinition) {
-        let mut indexes = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut indexes = write_unpoisoned(&self.inner);
         indexes.insert(
             index.name.clone(),
             IndexEntry {
@@ -443,34 +506,22 @@ impl Storage for InMemoryStorage {
     }
 
     fn get_index(&self, name: &str) -> Option<IndexDefinition> {
-        let indexes = self
-            .inner
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let indexes = read_unpoisoned(&self.inner);
         indexes.get(name).map(|entry| entry.definition.clone())
     }
 
     fn delete_index(&self, name: &str) -> bool {
-        let mut indexes = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut indexes = write_unpoisoned(&self.inner);
         indexes.remove(name).is_some()
     }
 
     fn list_index_names(&self) -> Vec<String> {
-        let indexes = self
-            .inner
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let indexes = read_unpoisoned(&self.inner);
         indexes.keys().cloned().collect()
     }
 
     fn put_documents(&self, index: &str, documents: Vec<Document>) -> Result<(), StorageError> {
-        let mut indexes = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut indexes = write_unpoisoned(&self.inner);
         let entry = indexes
             .get_mut(index)
             .ok_or_else(|| StorageError::IndexNotFound(index.to_owned()))?;
@@ -481,10 +532,7 @@ impl Storage for InMemoryStorage {
     }
 
     fn get_document(&self, index: &str, key: &str) -> Result<Option<Document>, StorageError> {
-        let indexes = self
-            .inner
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let indexes = read_unpoisoned(&self.inner);
         let entry = indexes
             .get(index)
             .ok_or_else(|| StorageError::IndexNotFound(index.to_owned()))?;
@@ -492,10 +540,7 @@ impl Storage for InMemoryStorage {
     }
 
     fn delete_documents(&self, index: &str, keys: &[String]) -> Result<(), StorageError> {
-        let mut indexes = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut indexes = write_unpoisoned(&self.inner);
         let entry = indexes
             .get_mut(index)
             .ok_or_else(|| StorageError::IndexNotFound(index.to_owned()))?;
@@ -506,10 +551,7 @@ impl Storage for InMemoryStorage {
     }
 
     fn get_documents(&self, index: &str) -> Result<Vec<Document>, StorageError> {
-        let indexes = self
-            .inner
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let indexes = read_unpoisoned(&self.inner);
         let entry = indexes
             .get(index)
             .ok_or_else(|| StorageError::IndexNotFound(index.to_owned()))?;
@@ -517,10 +559,7 @@ impl Storage for InMemoryStorage {
     }
 
     fn reset(&self) {
-        let mut indexes = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut indexes = write_unpoisoned(&self.inner);
         indexes.clear();
     }
 }
@@ -528,21 +567,8 @@ impl Storage for InMemoryStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{err, ok};
     use serde_json::json;
-
-    fn ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
-        match result {
-            Ok(value) => value,
-            Err(err) => panic!("expected Ok, got Err: {err:?}"),
-        }
-    }
-
-    fn err<T, E: std::fmt::Debug>(result: Result<T, E>) -> E {
-        match result {
-            Ok(_) => panic!("expected Err, got Ok"),
-            Err(err) => err,
-        }
-    }
 
     fn test_index(name: &str) -> IndexDefinition {
         ok(IndexDefinition::from_json(json!({

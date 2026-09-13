@@ -164,6 +164,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{err, ok};
 
     fn from_pairs(pairs: &[(&str, &str)]) -> Result<Config, ConfigError> {
         Config::from_values(|key| {
@@ -172,20 +173,6 @@ mod tests {
                 .find(|(k, _)| *k == key)
                 .map(|(_, v)| v.to_string())
         })
-    }
-
-    fn ok(result: Result<Config, ConfigError>) -> Config {
-        match result {
-            Ok(config) => config,
-            Err(err) => panic!("expected Ok, got Err: {err}"),
-        }
-    }
-
-    fn err(result: Result<Config, ConfigError>) -> ConfigError {
-        match result {
-            Ok(_) => panic!("expected Err, got Ok"),
-            Err(err) => err,
-        }
     }
 
     #[test]
