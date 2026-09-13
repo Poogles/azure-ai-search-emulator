@@ -137,16 +137,16 @@ Move code only; no logic changes. Suggested target layout:
 
 ## 4. Split `filter/mod.rs` (2300 lines)
 
-- [ ] **4.1 `filter/parser.rs`** — `Token`, `tokenize`, `is_number_start`,
+- [x] **4.1 `filter/parser.rs`** — `Token`, `tokenize`, `is_number_start`,
       `split_lambda_field`, `Parser`, `describe_token`, `parse_filter`
       (830-1575).
-- [ ] **4.2 `filter/date.rs`** — `DatePart`, `DateUnit`, `DateRef`,
+- [x] **4.2 `filter/date.rs`** — `DatePart`, `DateUnit`, `DateRef`,
       `DateExpr`, `DateOperand`, `parse_datetime`, `normalize_datetime`,
       `resolve_datetime`, `datepart_value`, `dateadd_value`,
       `datediff_value` (89-188, 499-680, 789-809).
-- [ ] **4.3 `filter/validate.rs`** — `validate`, `require_filterable`,
+- [x] **4.3 `filter/validate.rs`** — `validate`, `require_filterable`,
       `is_collection_type` (682-828).
-- [ ] **4.4 `filter/mod.rs` keeps** `FilterExpr`, `FilterOp`, `FilterValue`,
+- [x] **4.4 `filter/mod.rs` keeps** `FilterExpr`, `FilterOp`, `FilterValue`,
       `StringFunc`, evaluation, and its tests.
 
 ## 5. Split `query/mod.rs` (2225 lines)
