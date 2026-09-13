@@ -209,7 +209,7 @@ Route: `POST /indexes('{name}')/docs/search.post.search?api-version=...`.
 | Autocomplete | `SearchClient.autocomplete(search_text=..., suggester_name=..., filter=...)` (`/docs/search.post.autocomplete`) | Supported (prefix/infix match against the suggester's fields; optional `filter` narrows candidates; returns `text` + `queryPlusText`) |
 | Analyze text | `SearchIndexClient.analyze_text(...)` (`/search.analyze`) | Supported (English analyzer; `keyword`/`whitespace` tokenize as documented; `analyzer`/`field` validated) |
 | Service statistics | `SearchIndexClient.get_service_statistics()` (`/servicestats`) | Supported (static response: zero counters, default limits) |
-| `queryType` other than `simple` | — | Unsupported (explicit) |
+| Query type | `queryType=` (`simple`/`full`) | Supported (`simple` is the default; `full` is Lucene syntax: `AND`/`OR`/`NOT`, `field:term`, `term~N`, `term*`, ranges, `^N` boosts; other values rejected with `400 InvalidQuery`) |
 
 The full list of search options rejected with `400 UnsupportedQuery`: `scoringProfile`, `scoringParameters`, `scoringStatistics`, `minimumCoverage`, `answers`, `captions`, `semantic`, `semanticConfiguration`, `semanticQuery`, `semanticErrorHandling`, `semanticMaxWaitInMilliseconds`, `debug`.
 
@@ -311,12 +311,12 @@ Matching is case-insensitive prefix or infix matching of the search text against
 | `400` | `InvalidIndexName` | Malformed `indexes('name')` path segment |
 | `400` | `InvalidRequest` | Missing or invalid JSON request body; analyze-text with an unknown `analyzer` or `field` |
 | `400` | `InvalidDocuments` | Document batch is not an array or `{"value": [...]}` object |
-| `400` | `InvalidQuery` | Search body is not a JSON object; `top`/`skip` not non-negative integers; invalid search text (incl. bad fuzzy distance), `searchMode`, filter (incl. `in`, string functions), orderby, select, facets, searchFields (incl. bad weights), or highlight options; invalid continuation token; autocomplete/suggest missing `search`/`suggesterName`, empty search text, unknown suggester, or invalid `top` |
+| `400` | `InvalidQuery` | Search body is not a JSON object; `top`/`skip` not non-negative integers; invalid search text (incl. bad fuzzy distance), `searchMode`, `queryType`, filter (incl. `in`, string functions), orderby, select, facets, searchFields (incl. bad weights), or highlight options; invalid continuation token; autocomplete/suggest missing `search`/`suggesterName`, empty search text, unknown suggester, or invalid `top` |
 | `400` | `InvalidSynonymMap` | Missing/empty synonym-map name, format other than `solr`, empty synonyms, malformed `synonymmaps('name')` path segment, path/body name mismatch on `PUT` |
 | `400` | `InvalidAlias` | Missing/empty alias name, missing/empty `indexes`, malformed `aliases('name')` path segment, path/body name mismatch on `PUT` |
 | `400` | `InvalidKnowledgeSource` | Missing/empty source name or `kind`, missing `searchIndexParameters.searchIndexName` for searchIndex sources, malformed `knowledgesources('name')` path segment, path/body name mismatch on `PUT` |
 | `400` | `InvalidKnowledgeBase` | Missing/empty base name, missing/empty `knowledgeSources`, malformed `knowledgebases('name')` path segment, path/body name mismatch on `PUT` |
-| `400` | `UnsupportedQuery` | Unsupported search option or `queryType` |
+| `400` | `UnsupportedQuery` | Unsupported search option (see list above) or `kind: "text"` vectorizer query |
 | `400` | `UnsupportedAction` | Unknown document action (only `upload`, `merge`, `mergeOrUpload`, `delete` are supported) |
 | `404` | `ResourceNotFound` | Get/delete/upload/search/autocomplete/suggest/get-document/retrieve on a missing index, document, synonym map, alias, knowledge source, or knowledge base |
 | `409` | `IndexAlreadyExists` | `POST /indexes` with an existing name, or a name taken by an alias |

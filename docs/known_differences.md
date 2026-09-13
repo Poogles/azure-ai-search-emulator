@@ -19,7 +19,6 @@ Differences fall into two categories:
 | Scoring profiles, parameters, statistics              | Rejected                          | Scoring is BM25 (see below); custom scoring profiles are not applied.                               |
 | Semantic queries                                      | Rejected                          | No model inference in the emulator (initial design non-goal).                                       |
 | Vectorizer (`kind: "text"`) queries                   | Rejected (`400 UnsupportedQuery`) | No vectorizer in the emulator; callers must supply raw vectors.                                     |
-| `queryType` other than `simple` (e.g. `full`/Lucene)  | Rejected                          | Only simple-query semantics are implemented (plus trailing-`~` fuzzy terms).                        |
 
 ## Silently different (operation succeeds, result may differ from Azure)
 
@@ -48,6 +47,7 @@ Differences fall into two categories:
 ### Query matching
 
 - **Simple** query semantics with `+`/`-` modifiers, `"quoted phrases"`, and Lucene-style fuzzy terms (`term~` for the default edit distance 2 like Azure, `term~N` for an explicit distance 0-2; distances above 2 are rejected explicitly). A multi-term search combines required clauses with OR (`searchMode=any`, the default, matching Azure) or AND (`searchMode=all`).
+- **Full** (`queryType=full`) query semantics are parsed by Tantivy's Lucene query parser: `AND`/`OR`/`NOT`, `field:term`, `term~N` fuzzy, `term*` wildcards, ranges, and `^N` boosts. Azure's `full` type is also Lucene syntax, but the parsers are not identical, so exotic Lucene constructs may behave differently.
 - Fuzzy terms are lowercased only (no stemming, stopword removal, or punctuation splitting), matching Azure. Fuzzy matches do not produce highlight fragments (highlighting matches analyzed query terms exactly).
 - Tokenization uses an English analyzer: lowercasing, punctuation splitting, English stopword removal, and English stemming — approximating Azure's basic English analyzer. `running` matches `run`; `the` is a stopword and matches nothing (a stopword-only query returns no documents).
 - `searchFields` weights (`field^N`, with a finite positive `N`) scale the field's BM25 contribution to `@search.score`.

@@ -524,7 +524,6 @@ def test_unsupported_query_options_rejected(priced_docs: SearchClient) -> None:
     cases = [
         {"scoring_profile": "profile"},
         {"semantic_configuration_name": "config"},
-        {"query_type": "full"},
     ]
     for options in cases:
         with pytest.raises(HttpResponseError) as exc_info:
@@ -533,6 +532,17 @@ def test_unsupported_query_options_rejected(priced_docs: SearchClient) -> None:
         response = exc_info.value.response
         assert response is not None
         assert json.loads(response.text())["error"]["code"] == "UnsupportedQuery"
+
+    # queryType=full (Lucene) is supported; an unknown queryType is a
+    # malformed query, not an unsupported option.
+    found = list(priced_docs.search(search_text="red OR blue", query_type="full"))
+    assert {doc["id"] for doc in found} == {"1", "2"}
+    with pytest.raises(HttpResponseError) as exc_info:
+        list(priced_docs.search(search_text="*", query_type="basic"))
+    assert exc_info.value.status_code == 400
+    response = exc_info.value.response
+    assert response is not None
+    assert json.loads(response.text())["error"]["code"] == "InvalidQuery"
 
     # An invalid searchMode is a malformed query, not an unsupported option.
     with pytest.raises(HttpResponseError) as exc_info:

@@ -627,7 +627,6 @@ public class SdkTests : EmulatorTestBase
         {
             new SearchOptions { ScoringProfile = "profile" },
             new SearchOptions { SemanticSearch = new SemanticSearchOptions { SemanticConfigurationName = "config" } },
-            new SearchOptions { QueryType = SearchQueryType.Full },
         };
         foreach (var options in cases)
         {
@@ -636,6 +635,18 @@ public class SdkTests : EmulatorTestBase
             Assert.Equal(400, ex.Status);
             Assert.Equal("UnsupportedQuery", ex.ErrorCode);
         }
+
+        // queryType=full (Lucene) is supported; an unknown queryType is a
+        // malformed query, not an unsupported option. (The SDK's SearchQueryType
+        // enum cannot express unknown values, so this goes over raw HTTP.)
+        var lucene = await RunSearch<SearchDocument>(
+            searchClient, new SearchOptions { QueryType = SearchQueryType.Full }, "red OR blue");
+        Assert.Equal(new[] { "1", "2" }, lucene.Select(d => (string)d["id"]).OrderBy(x => x));
+        var (queryTypeStatus, queryTypeBody) = await RawPostAsync(
+            $"{BaseUrl}/indexes('{IndexName}')/docs/search.post.search?api-version={ApiVersion}",
+            """{"search": "*", "queryType": "basic"}""");
+        Assert.Equal(400, queryTypeStatus);
+        AssertAzureError(queryTypeBody, "InvalidQuery");
 
         // An invalid searchMode is a malformed query, not an unsupported option.
         // (The SDK's SearchMode type cannot express invalid values, so this goes
