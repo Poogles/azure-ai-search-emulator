@@ -96,17 +96,17 @@ code paths, the e2e suite (`make test`) green.
 
 Move code only; no logic changes. Suggested target layout:
 
-- [ ] **3.1 `service/types.rs`** — `IndexingResultItem`, `DocumentAction`,
+- [x] **3.1 `service/types.rs`** — `IndexingResultItem`, `DocumentAction`,
       `ActionKind`, `SearchQuery`, `SearchField`, `VectorQuery`,
       `VectorFilterMode`, `Facet`, `OrderBy`, `SearchOutcome`,
       `AutocompleteCompletion`, `Suggestion` (currently lines 45-221).
-- [ ] **3.2 `service/continuation.rs`** — `ContinuationToken` (479-520).
-- [ ] **3.3 `service/resources.rs`** — `NamedResource`, `ResourceStore`
+- [x] **3.2 `service/continuation.rs`** — `ContinuationToken` (479-520).
+- [x] **3.3 `service/resources.rs`** — `NamedResource`, `ResourceStore`
       (327-477).
-- [ ] **3.4 `service/synonyms.rs`** — `SynonymRule`, `parse_synonym_rules`,
+- [x] **3.4 `service/synonyms.rs`** — `SynonymRule`, `parse_synonym_rules`,
       `split_synonym_terms`, `SynonymMap`, `validate_synonym_map` (229-325,
       3686-3713).
-- [ ] **3.5 `service/parsing.rs`** — all search-option parsers:
+- [x] **3.5 `service/parsing.rs`** — all search-option parsers:
       `parse_orderby`, `parse_select`, `parse_facets`, `split_facet_string`,
       `parse_facet_entry`, `parse_search_mode`, `parse_paging_options`,
       `parse_vector_options`, `parse_vector_filter_mode`, `parse_vector_queries`,
@@ -114,23 +114,23 @@ Move code only; no logic changes. Suggested target layout:
       `parse_vector_query_vector`, `parse_search_fields`,
       `parse_highlight_options`, `string_items`, `parse_filter_option`
       (2320-3033).
-- [ ] **3.6 `service/validation.rs`** — `validate_schema`,
+- [x] **3.6 `service/validation.rs`** — `validate_schema`,
       `validate_vector_field`, `validate_vector_search_config`,
       `validate_suggesters`, `validate_subfields`, `validate_document`,
       `check_field_type`, `check_vector_value`, `check_complex_value`,
       `check_complex_collection_value`, `is_geography_point`, `type_ok`,
       `finite_f32`, `SUPPORTED_FIELD_TYPES` (3367-3934).
-- [ ] **3.7 `service/highlight.rs`** — `page_highlights`,
+- [x] **3.7 `service/highlight.rs`** — `page_highlights`,
       `highlight_raw_terms`, `split_sentences`, `wrap_matched_words`,
       `highlight_fragments`, `highlight_document` (3134-3350).
-- [ ] **3.8 `service/facets.rs`** — `compute_facets`, `facet_key`,
+- [x] **3.8 `service/facets.rs`** — `compute_facets`, `facet_key`,
       `facet_value` (2244-2318).
-- [ ] **3.9 `service/ordering.rs`** — `order_scored`, `compare_scored`,
+- [x] **3.9 `service/ordering.rs`** — `order_scored`, `compare_scored`,
       `compare_field`, `compare_values`, `type_tag`, `rrf_fuse_weighted`,
       `rrf_add_list` (2092-2242).
-- [ ] **3.10 Move tests with their code.** The `mod tests` block
+- [x] **3.10 Move tests with their code.** The `mod tests` block
       (3936-5257) splits across the new modules as the code moves.
-- [ ] **3.11 Shrink `SearchService::parse_search`** (1350-1454) and
+- [x] **3.11 Shrink `SearchService::parse_search`** (1350-1454) and
       `SearchService::search` (1463-1591) into named helpers once the
       helpers live in their own modules: e.g. `merge_scores`, `paginate`,
       `project_page` for `search`; keep `parse_search` a thin checklist.
