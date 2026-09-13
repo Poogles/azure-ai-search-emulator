@@ -32,7 +32,7 @@ _authentication._enforce_https = _no_op_enforce_https
 
 IMAGE_NAME = "aisearch-emulator"
 CONTAINER_PORT = 8080
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 BUILD_CONTEXT = REPO_ROOT / "source" / "rust"
 
 

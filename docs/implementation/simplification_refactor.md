@@ -76,19 +76,19 @@ code paths, the e2e suite (`make test`) green.
 
 ## 2. Data-driven named resources
 
-- [ ] **2.1 `ResourceKind` enum.** Model the four named resource kinds
+- [x] **2.1 `ResourceKind` enum.** Model the four named resource kinds
       (synonym maps, aliases, knowledge sources, knowledge bases) as data:
       path prefix, kind label, conflict error code, not-found label.
-- [ ] **2.2 Collapse service CRUD.** Replace the 15 one-line delegations in
+- [x] **2.2 Collapse service CRUD.** Replace the 15 one-line delegations in
       `SearchService` (`service/mod.rs:889-1045`, plus the synonym-map methods
       if 1.9 landed) with generic methods keyed by `ResourceKind`. Keep the
       public method names stable (the API layer and tests call them) or update
       call sites in the same change.
-- [ ] **2.3 Collapse API dispatch.** `create_or_update_index`, `get_index`,
+- [x] **2.3 Collapse API dispatch.** `create_or_update_index`, `get_index`,
       `delete_index` (`api/mod.rs:131-298`) each repeat the same 4-prefix
       dispatch. One helper that maps a raw path segment to
       `(ResourceKind, name)` and dispatches generically.
-- [ ] **2.4 `operation_for` table.** Replace the 90-line if-chain
+- [x] **2.4 `operation_for` table.** Replace the 90-line if-chain
       (`api/mod.rs:1138-1231`) with a `(path-prefix, method) → name` lookup
       table.
 

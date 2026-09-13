@@ -371,6 +371,231 @@ fn named_resource(name: &str, etag: String, raw: &Value) -> NamedResource {
     }
 }
 
+/// The four kinds of named resources managed at the service level: synonym
+/// maps, index aliases, knowledge sources, and knowledge bases. Each kind is
+/// modeled as data: its OData-style path prefix, the labels and error codes
+/// used in its error messages, and (for the [`NamedResource`] kinds) its slot
+/// in [`SearchService::named_resources`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    SynonymMap,
+    Alias,
+    KnowledgeSource,
+    KnowledgeBase,
+}
+
+impl ResourceKind {
+    /// All four kinds.
+    pub const ALL: [ResourceKind; 4] = [
+        ResourceKind::SynonymMap,
+        ResourceKind::Alias,
+        ResourceKind::KnowledgeSource,
+        ResourceKind::KnowledgeBase,
+    ];
+
+    /// The kind's collection name, e.g. `aliases`.
+    #[must_use]
+    pub const fn collection_name(self) -> &'static str {
+        match self {
+            ResourceKind::SynonymMap => "synonymmaps",
+            ResourceKind::Alias => "aliases",
+            ResourceKind::KnowledgeSource => "knowledgesources",
+            ResourceKind::KnowledgeBase => "knowledgebases",
+        }
+    }
+
+    /// The kind's collection path, e.g. `/aliases`.
+    #[must_use]
+    pub const fn collection_path(self) -> &'static str {
+        match self {
+            ResourceKind::SynonymMap => "/synonymmaps",
+            ResourceKind::Alias => "/aliases",
+            ResourceKind::KnowledgeSource => "/knowledgesources",
+            ResourceKind::KnowledgeBase => "/knowledgebases",
+        }
+    }
+
+    /// The OData-style path prefix of the kind's named segments, e.g.
+    /// `aliases(`.
+    #[must_use]
+    pub const fn path_prefix(self) -> &'static str {
+        match self {
+            ResourceKind::SynonymMap => "synonymmaps(",
+            ResourceKind::Alias => "aliases(",
+            ResourceKind::KnowledgeSource => "knowledgesources(",
+            ResourceKind::KnowledgeBase => "knowledgebases(",
+        }
+    }
+
+    /// The kind's named path prefix with a leading slash, e.g. `/aliases(`.
+    #[must_use]
+    pub const fn named_path_prefix(self) -> &'static str {
+        match self {
+            ResourceKind::SynonymMap => "/synonymmaps(",
+            ResourceKind::Alias => "/aliases(",
+            ResourceKind::KnowledgeSource => "/knowledgesources(",
+            ResourceKind::KnowledgeBase => "/knowledgebases(",
+        }
+    }
+
+    /// The lowercase label used in request-validation messages, e.g.
+    /// `Invalid alias path segment ...`.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            ResourceKind::SynonymMap => "synonym map",
+            ResourceKind::Alias => "alias",
+            ResourceKind::KnowledgeSource => "knowledge source",
+            ResourceKind::KnowledgeBase => "knowledge base",
+        }
+    }
+
+    /// The capitalized label used in not-found messages, e.g.
+    /// `Alias "x" was not found.`.
+    #[must_use]
+    pub const fn not_found_label(self) -> &'static str {
+        match self {
+            ResourceKind::SynonymMap => "Synonym map",
+            ResourceKind::Alias => "Alias",
+            ResourceKind::KnowledgeSource => "Knowledge source",
+            ResourceKind::KnowledgeBase => "Knowledge base",
+        }
+    }
+
+    /// The label used in create-conflict messages (`A {kind} with name ...
+    /// already exists.`). Only synonym maps name themselves; the other kinds
+    /// share the generic `resource` label.
+    #[must_use]
+    pub const fn conflict_kind(self) -> &'static str {
+        match self {
+            ResourceKind::SynonymMap => "synonym map",
+            ResourceKind::Alias | ResourceKind::KnowledgeSource | ResourceKind::KnowledgeBase => {
+                "resource"
+            }
+        }
+    }
+
+    /// The error code for a create conflict, e.g. `AliasAlreadyExists`.
+    #[must_use]
+    pub const fn conflict_code(self) -> &'static str {
+        match self {
+            ResourceKind::SynonymMap => "SynonymMapAlreadyExists",
+            ResourceKind::Alias => "AliasAlreadyExists",
+            ResourceKind::KnowledgeSource => "KnowledgeSourceAlreadyExists",
+            ResourceKind::KnowledgeBase => "KnowledgeBaseAlreadyExists",
+        }
+    }
+
+    /// The error code for invalid request segments and bodies, e.g.
+    /// `InvalidAlias`.
+    #[must_use]
+    pub const fn invalid_code(self) -> &'static str {
+        match self {
+            ResourceKind::SynonymMap => "InvalidSynonymMap",
+            ResourceKind::Alias => "InvalidAlias",
+            ResourceKind::KnowledgeSource => "InvalidKnowledgeSource",
+            ResourceKind::KnowledgeBase => "InvalidKnowledgeBase",
+        }
+    }
+
+    /// The error for a malformed named path segment of this kind. `raw` is
+    /// the full segment. Synonym maps report the segment with the prefix
+    /// stripped (a pre-existing message quirk); the other kinds report the
+    /// full segment.
+    #[must_use]
+    pub fn invalid_segment_error(self, raw: &str) -> ApiError {
+        let shown = match self {
+            ResourceKind::SynonymMap => raw
+                .strip_prefix(self.path_prefix())
+                .unwrap_or(raw)
+                .to_owned(),
+            _ => raw.to_owned(),
+        };
+        ApiError::bad_request(
+            self.invalid_code(),
+            format!(
+                "Invalid {} path segment {shown:?}; expected {}'name').",
+                self.label(),
+                self.collection_name()
+            ),
+        )
+    }
+
+    /// The logging operation name for `POST` on the kind's collection, e.g.
+    /// `createAlias`.
+    #[must_use]
+    pub const fn create_operation(self) -> &'static str {
+        match self {
+            ResourceKind::SynonymMap => "createSynonymMap",
+            ResourceKind::Alias => "createAlias",
+            ResourceKind::KnowledgeSource => "createKnowledgeSource",
+            ResourceKind::KnowledgeBase => "createKnowledgeBase",
+        }
+    }
+
+    /// The logging operation name for `GET` on the kind's collection, e.g.
+    /// `listAliases`.
+    #[must_use]
+    pub const fn list_operation(self) -> &'static str {
+        match self {
+            ResourceKind::SynonymMap => "listSynonymMaps",
+            ResourceKind::Alias => "listAliases",
+            ResourceKind::KnowledgeSource => "listKnowledgeSources",
+            ResourceKind::KnowledgeBase => "listKnowledgeBases",
+        }
+    }
+
+    /// The logging operation name for a method on the kind's named segments,
+    /// e.g. `getAlias`; `unknown` for methods the route does not serve.
+    #[must_use]
+    pub fn named_operation(self, method: &str) -> &'static str {
+        match self {
+            ResourceKind::SynonymMap => match method {
+                "GET" => "getSynonymMap",
+                "PUT" => "createOrUpdateSynonymMap",
+                "DELETE" => "deleteSynonymMap",
+                _ => "unknown",
+            },
+            ResourceKind::Alias => match method {
+                "GET" => "getAlias",
+                "PUT" => "createOrUpdateAlias",
+                "DELETE" => "deleteAlias",
+                _ => "unknown",
+            },
+            ResourceKind::KnowledgeSource => match method {
+                "GET" => "getKnowledgeSource",
+                "PUT" => "createOrUpdateKnowledgeSource",
+                "DELETE" => "deleteKnowledgeSource",
+                _ => "unknown",
+            },
+            ResourceKind::KnowledgeBase => match method {
+                "GET" => "getKnowledgeBase",
+                "PUT" => "createOrUpdateKnowledgeBase",
+                "POST" => "retrieveKnowledgeBase",
+                "DELETE" => "deleteKnowledgeBase",
+                _ => "unknown",
+            },
+        }
+    }
+
+    /// The slot of this kind in [`SearchService::named_resources`]. Only the
+    /// [`NamedResource`] kinds (alias, knowledge source, knowledge base) have
+    /// slots; synonym maps are stored separately.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called for [`ResourceKind::SynonymMap`].
+    #[must_use]
+    pub fn named_index(self) -> usize {
+        match self {
+            ResourceKind::Alias => 0,
+            ResourceKind::KnowledgeSource => 1,
+            ResourceKind::KnowledgeBase => 2,
+            ResourceKind::SynonymMap => panic!("synonym maps are not stored as NamedResource"),
+        }
+    }
+}
+
 /// Service-level storage for a collection of named resources, keyed by name
 /// (sorted), with an incrementing etag counter. `T` is the stored resource
 /// type (a [`NamedResource`] for aliases, knowledge sources, and knowledge
@@ -405,15 +630,18 @@ impl<T: Clone> ResourceStore<T> {
     /// # Errors
     ///
     /// Returns [`ApiError::conflict`] if the name is already taken.
-    fn create<F>(&self, name: &str, kind: &str, code: &str, build: F) -> Result<T, ApiError>
+    fn create<F>(&self, kind: ResourceKind, name: &str, build: F) -> Result<T, ApiError>
     where
         F: FnOnce(&str, String) -> T,
     {
         let mut items = self.lock_write();
         if items.contains_key(name) {
             return Err(ApiError::conflict(
-                code,
-                format!("A {kind} with name {name:?} already exists."),
+                kind.conflict_code(),
+                format!(
+                    "A {} with name {name:?} already exists.",
+                    kind.conflict_kind()
+                ),
             ));
         }
         Ok(self.insert(&mut items, name, build))
@@ -433,11 +661,13 @@ impl<T: Clone> ResourceStore<T> {
     /// # Errors
     ///
     /// Returns [`ApiError::not_found`] if the resource does not exist.
-    fn get(&self, name: &str, kind: &str) -> Result<T, ApiError> {
-        self.lock_read()
-            .get(name)
-            .cloned()
-            .ok_or_else(|| ApiError::not_found(format!("{kind} {name:?} was not found.")))
+    fn get(&self, kind: ResourceKind, name: &str) -> Result<T, ApiError> {
+        self.lock_read().get(name).cloned().ok_or_else(|| {
+            ApiError::not_found(format!(
+                "{} {name:?} was not found.",
+                kind.not_found_label()
+            ))
+        })
     }
 
     /// Returns clones of all resources, sorted by name.
@@ -457,13 +687,14 @@ impl<T: Clone> ResourceStore<T> {
     /// # Errors
     ///
     /// Returns [`ApiError::not_found`] if the resource does not exist.
-    fn delete(&self, name: &str, kind: &str) -> Result<(), ApiError> {
+    fn delete(&self, kind: ResourceKind, name: &str) -> Result<(), ApiError> {
         let mut items = self.lock_write();
         if items.remove(name).is_some() {
             Ok(())
         } else {
             Err(ApiError::not_found(format!(
-                "{kind} {name:?} was not found."
+                "{} {name:?} was not found.",
+                kind.not_found_label()
             )))
         }
     }
@@ -546,12 +777,10 @@ pub struct SearchService {
     max_vector_dimension: usize,
     /// Service-level synonym maps, keyed by name (sorted).
     synonym_maps: ResourceStore<SynonymMap>,
-    /// Service-level index aliases, keyed by name (sorted).
-    aliases: ResourceStore<NamedResource>,
-    /// Service-level knowledge sources, keyed by name (sorted).
-    knowledge_sources: ResourceStore<NamedResource>,
-    /// Service-level knowledge bases, keyed by name (sorted).
-    knowledge_bases: ResourceStore<NamedResource>,
+    /// Service-level named resources (aliases, knowledge sources, knowledge
+    /// bases), one store per [`ResourceKind`] (see
+    /// [`ResourceKind::named_index`]), keyed by name (sorted).
+    named_resources: [ResourceStore<NamedResource>; 3],
 }
 
 impl SearchService {
@@ -567,10 +796,21 @@ impl SearchService {
             vectors,
             max_vector_dimension,
             synonym_maps: ResourceStore::default(),
-            aliases: ResourceStore::default(),
-            knowledge_sources: ResourceStore::default(),
-            knowledge_bases: ResourceStore::default(),
+            named_resources: [
+                ResourceStore::default(),
+                ResourceStore::default(),
+                ResourceStore::default(),
+            ],
         }
+    }
+
+    /// The named-resource store for a [`NamedResource`] kind.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called for [`ResourceKind::SynonymMap`].
+    fn named_store(&self, kind: ResourceKind) -> &ResourceStore<NamedResource> {
+        &self.named_resources[kind.named_index()]
     }
 
     #[must_use]
@@ -745,7 +985,7 @@ impl SearchService {
     /// Index and alias names share the data-plane namespace (aliases resolve
     /// where index names are accepted), so an index may not shadow an alias.
     fn check_alias_collision(&self, name: &str) -> Result<(), ApiError> {
-        if self.aliases.contains(name) {
+        if self.named_store(ResourceKind::Alias).contains(name) {
             return Err(ApiError::conflict(
                 "IndexAlreadyExists",
                 format!("An alias with name {name:?} already exists."),
@@ -781,18 +1021,14 @@ impl SearchService {
         let rules = parse_synonym_rules(synonyms).map_err(|e| {
             ApiError::bad_request("InvalidSynonymMap", format!("Invalid synonym rules: {e}"))
         })?;
-        self.synonym_maps.create(
-            name,
-            "synonym map",
-            "SynonymMapAlreadyExists",
-            |name, etag| SynonymMap {
+        self.synonym_maps
+            .create(ResourceKind::SynonymMap, name, |name, etag| SynonymMap {
                 name: name.to_owned(),
                 format: format.to_owned(),
                 synonyms: synonyms.to_owned(),
                 rules: rules.clone(),
                 etag,
-            },
-        )
+            })
     }
 
     /// Creates or replaces a synonym map. Replacing a map issues a new etag.
@@ -828,7 +1064,7 @@ impl SearchService {
     ///
     /// Returns an [`ApiError`] if the map does not exist.
     pub fn get_synonym_map(&self, name: &str) -> Result<SynonymMap, ApiError> {
-        self.synonym_maps.get(name, "Synonym map")
+        self.synonym_maps.get(ResourceKind::SynonymMap, name)
     }
 
     /// Returns the raw synonym outputs for a query word: the union of outputs
@@ -861,180 +1097,92 @@ impl SearchService {
     ///
     /// Returns an [`ApiError`] if the map does not exist.
     pub fn delete_synonym_map(&self, name: &str) -> Result<(), ApiError> {
-        self.synonym_maps.delete(name, "Synonym map")
+        self.synonym_maps.delete(ResourceKind::SynonymMap, name)
     }
 
     // ------------------------------------------------------------------
-    // Index aliases
+    // Named resources (aliases, knowledge sources, knowledge bases)
     // ------------------------------------------------------------------
 
-    /// Creates a new index alias.
+    /// Creates a new named resource (alias, knowledge source, or knowledge
+    /// base).
     ///
     /// # Errors
     ///
-    /// Returns [`ApiError::conflict`] if an alias with the same name exists,
-    /// or if an index with the same name exists (the two share the data-plane
-    /// namespace, so neither may shadow the other).
-    pub fn create_alias(&self, name: &str, raw: &Value) -> Result<NamedResource, ApiError> {
-        self.reject_alias_index_collision(name)?;
-        self.aliases
-            .create(name, "resource", "AliasAlreadyExists", |name, etag| {
-                named_resource(name, etag, raw)
-            })
-    }
-
-    /// Creates or replaces an index alias.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ApiError::conflict`] if an index with the same name exists.
-    pub fn create_or_update_alias(
+    /// Returns [`ApiError::conflict`] if a resource of the same kind and name
+    /// exists, or — for aliases — if an index with the same name exists (the
+    /// two share the data-plane namespace, so neither may shadow the other).
+    pub fn create_named_resource(
         &self,
+        kind: ResourceKind,
         name: &str,
         raw: &Value,
     ) -> Result<NamedResource, ApiError> {
-        self.reject_alias_index_collision(name)?;
+        if kind == ResourceKind::Alias {
+            self.reject_alias_index_collision(name)?;
+        }
+        self.named_store(kind)
+            .create(kind, name, |name, etag| named_resource(name, etag, raw))
+    }
+
+    /// Creates or replaces a named resource (alias, knowledge source, or
+    /// knowledge base). Replacing a resource issues a new etag.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::conflict`] when `kind` is an alias and an index
+    /// with the same name exists.
+    pub fn create_or_update_named_resource(
+        &self,
+        kind: ResourceKind,
+        name: &str,
+        raw: &Value,
+    ) -> Result<NamedResource, ApiError> {
+        if kind == ResourceKind::Alias {
+            self.reject_alias_index_collision(name)?;
+        }
         Ok(self
-            .aliases
+            .named_store(kind)
             .create_or_update(name, |name, etag| named_resource(name, etag, raw)))
     }
 
     fn reject_alias_index_collision(&self, name: &str) -> Result<(), ApiError> {
         if self.storage.get_index(name).is_some() {
             return Err(ApiError::conflict(
-                "AliasAlreadyExists",
+                ResourceKind::Alias.conflict_code(),
                 format!("An index with name {name:?} already exists."),
             ));
         }
         Ok(())
     }
 
-    /// Returns a clone of the alias with the given name.
+    /// Returns a clone of the named resource with the given name.
     ///
     /// # Errors
     ///
-    /// Returns [`ApiError::not_found`] if the alias does not exist.
-    pub fn get_alias(&self, name: &str) -> Result<NamedResource, ApiError> {
-        self.aliases.get(name, "Alias")
-    }
-
-    /// Returns clones of all aliases, sorted by name.
-    #[must_use]
-    pub fn list_aliases(&self) -> Vec<NamedResource> {
-        self.aliases.list()
-    }
-
-    /// Deletes an alias by name.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ApiError::not_found`] if the alias does not exist.
-    pub fn delete_alias(&self, name: &str) -> Result<(), ApiError> {
-        self.aliases.delete(name, "Alias")
-    }
-
-    // ------------------------------------------------------------------
-    // Knowledge sources
-    // ------------------------------------------------------------------
-
-    /// Creates a new knowledge source.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ApiError::conflict`] if a source with the same name exists.
-    pub fn create_knowledge_source(
+    /// Returns [`ApiError::not_found`] if the resource does not exist.
+    pub fn get_named_resource(
         &self,
+        kind: ResourceKind,
         name: &str,
-        raw: &Value,
     ) -> Result<NamedResource, ApiError> {
-        self.knowledge_sources.create(
-            name,
-            "resource",
-            "KnowledgeSourceAlreadyExists",
-            |name, etag| named_resource(name, etag, raw),
-        )
+        self.named_store(kind).get(kind, name)
     }
 
-    /// Creates or replaces a knowledge source.
-    pub fn create_or_update_knowledge_source(&self, name: &str, raw: &Value) -> NamedResource {
-        self.knowledge_sources
-            .create_or_update(name, |name, etag| named_resource(name, etag, raw))
-    }
-
-    /// Returns a clone of the knowledge source with the given name.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ApiError::not_found`] if the source does not exist.
-    pub fn get_knowledge_source(&self, name: &str) -> Result<NamedResource, ApiError> {
-        self.knowledge_sources.get(name, "Knowledge source")
-    }
-
-    /// Returns clones of all knowledge sources, sorted by name.
+    /// Returns clones of all named resources of the given kind, sorted by
+    /// name.
     #[must_use]
-    pub fn list_knowledge_sources(&self) -> Vec<NamedResource> {
-        self.knowledge_sources.list()
+    pub fn list_named_resources(&self, kind: ResourceKind) -> Vec<NamedResource> {
+        self.named_store(kind).list()
     }
 
-    /// Deletes a knowledge source by name.
+    /// Deletes a named resource by name.
     ///
     /// # Errors
     ///
-    /// Returns [`ApiError::not_found`] if the source does not exist.
-    pub fn delete_knowledge_source(&self, name: &str) -> Result<(), ApiError> {
-        self.knowledge_sources.delete(name, "Knowledge source")
-    }
-
-    // ------------------------------------------------------------------
-    // Knowledge bases
-    // ------------------------------------------------------------------
-
-    /// Creates a new knowledge base.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ApiError::conflict`] if a base with the same name exists.
-    pub fn create_knowledge_base(
-        &self,
-        name: &str,
-        raw: &Value,
-    ) -> Result<NamedResource, ApiError> {
-        self.knowledge_bases.create(
-            name,
-            "resource",
-            "KnowledgeBaseAlreadyExists",
-            |name, etag| named_resource(name, etag, raw),
-        )
-    }
-
-    /// Creates or replaces a knowledge base.
-    pub fn create_or_update_knowledge_base(&self, name: &str, raw: &Value) -> NamedResource {
-        self.knowledge_bases
-            .create_or_update(name, |name, etag| named_resource(name, etag, raw))
-    }
-
-    /// Returns a clone of the knowledge base with the given name.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ApiError::not_found`] if the base does not exist.
-    pub fn get_knowledge_base(&self, name: &str) -> Result<NamedResource, ApiError> {
-        self.knowledge_bases.get(name, "Knowledge base")
-    }
-
-    /// Returns clones of all knowledge bases, sorted by name.
-    #[must_use]
-    pub fn list_knowledge_bases(&self) -> Vec<NamedResource> {
-        self.knowledge_bases.list()
-    }
-
-    /// Deletes a knowledge base by name.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ApiError::not_found`] if the base does not exist.
-    pub fn delete_knowledge_base(&self, name: &str) -> Result<(), ApiError> {
-        self.knowledge_bases.delete(name, "Knowledge base")
+    /// Returns [`ApiError::not_found`] if the resource does not exist.
+    pub fn delete_named_resource(&self, kind: ResourceKind, name: &str) -> Result<(), ApiError> {
+        self.named_store(kind).delete(kind, name)
     }
 
     /// Returns a single document by key.
@@ -1903,9 +2051,9 @@ impl SearchService {
         self.engine.reset();
         self.vectors.reset();
         self.synonym_maps.clear();
-        self.aliases.clear();
-        self.knowledge_sources.clear();
-        self.knowledge_bases.clear();
+        for store in &self.named_resources {
+            store.clear();
+        }
     }
 
     fn require_index(&self, name: &str) -> Result<IndexDefinition, ApiError> {
@@ -1921,7 +2069,7 @@ impl SearchService {
     /// routes (search, documents, suggest, autocomplete, analyze) accept an
     /// alias name anywhere an index name is accepted.
     fn resolve_index_name(&self, name: &str) -> String {
-        let Ok(alias) = self.aliases.get(name, "Alias") else {
+        let Ok(alias) = self.get_named_resource(ResourceKind::Alias, name) else {
             return name.to_owned();
         };
         alias.target_index().unwrap_or_else(|| name.to_owned())
