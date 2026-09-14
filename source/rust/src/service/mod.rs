@@ -43,10 +43,10 @@ use self::parsing::{
     parse_vector_options, UNSUPPORTED_SEARCH_OPTIONS,
 };
 use self::resources::{named_resource, ResourceStore};
-use self::synonyms::{parse_synonym_rules, validate_synonym_map};
+use self::synonyms::{parse_synonym_rules, validate_synonym_map, SynonymRule};
 use self::types::KeyPredicate;
 use self::validation::{
-    finite_f32, key_display, key_field_name, validate_document, validate_schema,
+    key_display, key_field_name, parse_finite_f32_array, validate_document, validate_schema,
 };
 
 /// The resolved state of a search: the effective paging parameters plus the
@@ -317,16 +317,13 @@ impl SearchService {
         format: &str,
         synonyms: &str,
     ) -> Result<SynonymMap, ApiError> {
-        validate_synonym_map(name, format, synonyms)?;
-        let rules = parse_synonym_rules(synonyms).map_err(|e| {
-            ApiError::bad_request("InvalidSynonymMap", format!("Invalid synonym rules: {e}"))
-        })?;
+        let rules = Self::parse_validated_map(name, format, synonyms)?;
         self.synonym_maps
             .create(ResourceKind::SynonymMap, name, |name, etag| SynonymMap {
                 name: name.to_owned(),
                 format: format.to_owned(),
                 synonyms: synonyms.to_owned(),
-                rules: rules.clone(),
+                rules,
                 etag,
             })
     }
@@ -343,10 +340,7 @@ impl SearchService {
         format: &str,
         synonyms: &str,
     ) -> Result<SynonymMap, ApiError> {
-        validate_synonym_map(name, format, synonyms)?;
-        let rules = parse_synonym_rules(synonyms).map_err(|e| {
-            ApiError::bad_request("InvalidSynonymMap", format!("Invalid synonym rules: {e}"))
-        })?;
+        let rules = Self::parse_validated_map(name, format, synonyms)?;
         Ok(self
             .synonym_maps
             .create_or_update(name, |name, etag| SynonymMap {
@@ -356,6 +350,23 @@ impl SearchService {
                 rules,
                 etag,
             }))
+    }
+
+    /// Validates a synonym map definition and parses its rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] (`400 InvalidSynonymMap`) if the definition is
+    /// invalid or the rules cannot be parsed.
+    fn parse_validated_map(
+        name: &str,
+        format: &str,
+        synonyms: &str,
+    ) -> Result<Vec<SynonymRule>, ApiError> {
+        validate_synonym_map(name, format, synonyms)?;
+        parse_synonym_rules(synonyms).map_err(|e| {
+            ApiError::bad_request("InvalidSynonymMap", format!("Invalid synonym rules: {e}"))
+        })
     }
 
     /// Returns a clone of the synonym map with the given name.
@@ -704,18 +715,12 @@ impl SearchService {
                                 field.name
                             ));
                         };
-                        let mut vector = Vec::with_capacity(items.len());
-                        for item in items {
-                            match item.as_f64().and_then(finite_f32) {
-                                Some(narrowed) => vector.push(narrowed),
-                                None => {
-                                    return Err(format!(
-                                        "Field {:?} must contain only finite numeric values.",
-                                        field.name
-                                    ));
-                                }
-                            }
-                        }
+                        let vector = parse_finite_f32_array(items).map_err(|_| {
+                            format!(
+                                "Field {:?} must contain only finite numeric values.",
+                                field.name
+                            )
+                        })?;
                         entries.push((document.key.clone(), field.name.clone(), vector));
                     }
                     None => {

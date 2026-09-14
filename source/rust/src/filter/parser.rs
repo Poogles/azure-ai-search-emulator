@@ -390,23 +390,14 @@ impl Parser {
         Ok(FilterExpr::StringFunc { func, field, arg })
     }
 
-    /// Expects a `,` separator in a function argument list.
-    fn expect_comma(&mut self, func: &str) -> Result<(), String> {
+    /// Expects a specific token, reporting `ctx` (the expected token plus its
+    /// context, e.g. `',' in dateadd arguments`) when a different token is
+    /// found.
+    fn expect_token(&mut self, expected: &Token, ctx: &str) -> Result<(), String> {
         match self.next() {
-            Some(Token::Comma) => Ok(()),
+            Some(token) if token == *expected => Ok(()),
             other => Err(format!(
-                "Expected ',' in {func} arguments, found {}.",
-                describe_token(other.as_ref())
-            )),
-        }
-    }
-
-    /// Expects a `)` closing a function argument list.
-    fn expect_rparen(&mut self, func: &str) -> Result<(), String> {
-        match self.next() {
-            Some(Token::RParen) => Ok(()),
-            other => Err(format!(
-                "Expected ')' to close {func} arguments, found {}.",
+                "Expected {ctx}, found {}.",
                 describe_token(other.as_ref())
             )),
         }
@@ -453,9 +444,9 @@ impl Parser {
                  week, day, hour, minute, second, dayofweek, dayofyear."
             )
         })?;
-        self.expect_comma("datepart")?;
+        self.expect_token(&Token::Comma, "',' in datepart arguments")?;
         let field = self.expect_ident("field name")?;
-        self.expect_rparen("datepart")?;
+        self.expect_token(&Token::RParen, "')' to close datepart arguments")?;
         Ok(DateExpr::DatePart { part, field })
     }
 
@@ -469,7 +460,7 @@ impl Parser {
                  month, week, day, hour, minute, second."
             )
         })?;
-        self.expect_comma("dateadd")?;
+        self.expect_token(&Token::Comma, "',' in dateadd arguments")?;
         let interval = match self.next() {
             Some(Token::Number(n)) if n.fract() == 0.0 => {
                 // `as` saturates on overflow; the `try_from` below
@@ -487,9 +478,9 @@ impl Parser {
                 ))
             }
         };
-        self.expect_comma("dateadd")?;
+        self.expect_token(&Token::Comma, "',' in dateadd arguments")?;
         let field = self.expect_ident("field name")?;
-        self.expect_rparen("dateadd")?;
+        self.expect_token(&Token::RParen, "')' to close dateadd arguments")?;
         Ok(DateExpr::DateAdd {
             unit,
             interval,
@@ -507,11 +498,11 @@ impl Parser {
                  month, week, day, hour, minute, second."
             )
         })?;
-        self.expect_comma("datediff")?;
+        self.expect_token(&Token::Comma, "',' in datediff arguments")?;
         let start = self.parse_date_ref("datediff")?;
-        self.expect_comma("datediff")?;
+        self.expect_token(&Token::Comma, "',' in datediff arguments")?;
         let end = self.parse_date_ref("datediff")?;
-        self.expect_rparen("datediff")?;
+        self.expect_token(&Token::RParen, "')' to close datediff arguments")?;
         Ok(DateExpr::DateDiff { unit, start, end })
     }
 
@@ -548,7 +539,7 @@ impl Parser {
                 ))
             }
         };
-        self.expect_rparen("utcdatetime")?;
+        self.expect_token(&Token::RParen, "')' to close utcdatetime arguments")?;
         normalize_datetime(&literal).ok_or_else(|| {
             format!(
                 "Invalid date {literal:?} in utcdatetime; expected ISO-8601 \
@@ -598,7 +589,7 @@ impl Parser {
                 ))
             }
         };
-        self.expect_comma(&format!("search.{name}"))?;
+        self.expect_token(&Token::Comma, &format!("',' in search.{name} arguments"))?;
         // The field list is a field name or a comma-separated string
         // of field names (the documented Azure form).
         let mut fields = Vec::new();
@@ -636,7 +627,10 @@ impl Parser {
                 }
             }
         }
-        self.expect_rparen(&format!("search.{name}"))?;
+        self.expect_token(
+            &Token::RParen,
+            &format!("')' to close search.{name} arguments"),
+        )?;
         Ok(fields
             .into_iter()
             .map(|field| FilterExpr::IsMatch {
@@ -649,7 +643,10 @@ impl Parser {
     /// Parses `isempty(field)` / `isnull(field)` after `(`.
     fn parse_isempty_isnull(&mut self, name: &str) -> Result<FilterExpr, String> {
         let field = self.expect_ident("field name")?;
-        self.expect_rparen(&format!("search.{name}"))?;
+        self.expect_token(
+            &Token::RParen,
+            &format!("')' to close search.{name} arguments"),
+        )?;
         match name {
             "isempty" => Ok(FilterExpr::IsEmpty { field }),
             _ => Ok(FilterExpr::IsNull { field }),

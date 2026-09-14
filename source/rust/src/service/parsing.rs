@@ -8,7 +8,7 @@ use crate::query::SearchMode;
 use crate::storage::IndexDefinition;
 
 use super::types::{Facet, OrderBy, SearchField, VectorFilterMode, VectorQuery};
-use super::validation::finite_f32;
+use super::validation::{finite_f32, parse_finite_f32_array, FiniteF32ArrayError};
 
 pub(crate) fn parse_filter_option(raw: &str) -> Result<FilterExpr, ApiError> {
     filter::parse_filter(raw)
@@ -607,31 +607,19 @@ impl VectorFieldSet {
             )
         })?;
         self.check_vector_len(items.len())?;
-        let mut vector = Vec::with_capacity(items.len());
-        for item in items {
-            match item.as_f64().and_then(finite_f32) {
-                Some(narrowed) => vector.push(narrowed),
-                None if item.is_number() => {
-                    return Err(ApiError::bad_request(
-                        "InvalidQuery",
-                        format!(
-                            "Vector query for {:?} contains non-finite values.",
-                            self.first_field()
-                        ),
-                    ));
-                }
-                None => {
-                    return Err(ApiError::bad_request(
-                        "InvalidQuery",
-                        format!(
-                            "Vector query for {:?} must contain only numeric values.",
-                            self.first_field()
-                        ),
-                    ));
-                }
-            }
-        }
-        Ok(vector)
+        parse_finite_f32_array(items).map_err(|error| {
+            let message = match error {
+                FiniteF32ArrayError::NonFinite => format!(
+                    "Vector query for {:?} contains non-finite values.",
+                    self.first_field()
+                ),
+                FiniteF32ArrayError::NonNumeric => format!(
+                    "Vector query for {:?} must contain only numeric values.",
+                    self.first_field()
+                ),
+            };
+            ApiError::bad_request("InvalidQuery", message)
+        })
     }
 
     /// Checks a vector's length against the shared dimension.

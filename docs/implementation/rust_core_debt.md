@@ -78,51 +78,71 @@ suite (`make test`) green.
 
 ## 2. Deduplication (remaining)
 
-- [ ] **2.1 Synonym-map prelude.** `service/mod.rs:295-340`
+- [x] **2.1 Synonym-map prelude.** `service/mod.rs:295-340`
   `create_synonym_map` vs `create_or_update_synonym_map` share validate +
   `parse_synonym_rules` + `map_err`. Extract
   `parse_validated_map(name, format, synonyms)`; removes `rules.clone()` at
   `:310`.
-- [ ] **2.2 Finite-`f32` array parse.** Third copy of array-of-finite-`f64` ->
+- [x] **2.2 Finite-`f32` array parse.** Third copy of array-of-finite-`f64` ->
   `Vec<f32>`: `service/mod.rs:688-699`, `validation.rs:434-453`
   `check_vector_value`, `parsing.rs:598-616`. Single
   `validation::parse_finite_f32_array(items, field_name)` used by all three.
-- [ ] **2.3 Null-ordering helper.** `filter/mod.rs:252-295`
+  (Implemented as `parse_finite_f32_array(items) -> Result<Vec<f32>,
+  FiniteF32ArrayError>`; each caller maps the two variants to its own message.)
+- [x] **2.3 Null-ordering helper.** `filter/mod.rs:252-295`
   `compare_field_values` + `null_matches` special-case `Null` in 3 places.
   Single `null_ordering_result(op, has_null: bool) -> Option<bool>`.
-- [ ] **2.4 OData segment parser.** `api/mod.rs:663-687`
+  (Implemented as `null_comparison(op, actual_null, expected_null) -> bool`,
+  which covers the `Null`-vs-`Null` and value-vs-`Null` cases the three sites
+  needed.)
+- [x] **2.4 OData segment parser.** `api/mod.rs:663-687`
   `parse_index_name`/`parse_document_key` +
   `named_resources.rs:170-216` segment parsers + `extract_index:773-778` all do
   strip-prefix/suffix/unquote/empty-check -> `bad_request`. One generic
   `parse_odata_segment(raw, prefix, kind_label, code)`; thin wrappers only.
-- [ ] **2.5 Route-match table.** `api/mod.rs:576-589` +
+  (Plus `unquote_name`/`split_odata_segment` helpers in `named_resources.rs`.)
+- [x] **2.5 Route-match table.** `api/mod.rs:576-589` +
   `:783-826` both iterate `ResourceKind::ALL` for collection/named checks and
   can drift from the router (`:56-107`). Single
   `match_azure_route(path) -> Option<(ResourceKind, bool)>` shared by router,
   auth/version guard, and `operation_for`. Add
   `const AZURE_COLLECTIONS: &[&str]` + `named_collection!` macro for the five
   `post(create).get(list)` pairs.
-- [ ] **2.6 Storage path walk.** `storage/mod.rs:312-384` `field_path` vs
+  (Done for the guard + `operation_for`. The router itself stays explicit:
+  axum handlers are per-collection closures, so a data-driven router /
+  `named_collection!` macro is not feasible without a large router rewrite —
+  out of scope for a dedup pass.)
+- [x] **2.6 Storage path walk.** `storage/mod.rs:312-384` `field_path` vs
   `resolve_field_path` walk `split('/')` twice (schema vs docs, incl.
   copy-pasted docstring `:335-353`). Share segment-iteration skeleton or a
   generic `resolve_path_segments`.
-- [ ] **2.7 Hnsw/vector grouping.** `vector/mod.rs:77-101` Cosine/Euclidean arms
+  (Implemented as `path_segments(path) -> (&str, Split)` shared by both; the
+  copy-pasted docstring on `Document::resolve_path` now points at
+  `resolve_field_path`.)
+- [x] **2.7 Hnsw/vector grouping.** `vector/mod.rs:77-101` Cosine/Euclidean arms
   differ only by `DistCosine`/`DistL2` (extend the existing `with_hnsw!` macro
   at `:59-66`). `vector/mod.rs:390-449` groups by field 3x
   (`upsert_documents`/`remove_entries`/`delete_documents`) -> generic
   `group_by_field`. `vector/mod.rs:243-280` `hnsw_search` vs `brute_force`
   share `sort -> truncate(k)` -> `top_k` helper.
-- [ ] **2.8 Small uniqueness/bool helpers.** `validation.rs:51-59,240-337`
+  (The build arms use a generic `build_graph<D>` fn rather than extending the
+  `with_hnsw!` macro — a typed fn is cleaner for the `Hnsw::new` + param setup;
+  the macro is kept for the insert/search/get_nb_point dispatch.)
+- [x] **2.8 Small uniqueness/bool helpers.** `validation.rs:51-59,240-337`
   3x `BTreeSet::insert` + `bad_request("Duplicate ...")` ->
   `ensure_unique(seen, name, what)`. `storage/mod.rs:92-112`
   (+ `Suggester::from_json:207-222`, `IndexDefinition::from_json:258-283`) 6x
   `get(..).and_then(as_bool).unwrap_or(..)` -> `get_bool(obj, key, default)`
   (+ `get_opt_string`). `filter/parser.rs:381-400`
   `expect_comma`/`expect_rparen` -> single `expect_token(tok, ctx)`.
-- [ ] **2.9 Config parse helpers.** `config.rs:96-144` `from_values` repeats
+  (`ensure_unique` takes a `message: impl FnOnce() -> String` closure since the
+  three duplicate messages differ; `get_opt_string` applied to `analyzer`.)
+- [x] **2.9 Config parse helpers.** `config.rs:96-144` `from_values` repeats
   empty-means-unset + parse + `map_err` 5x. Add `get_nonempty()`,
   `parse_with(key, raw, parse, err_ctor)`, `parse_bool_extended()`; uniform
   messages (~30% smaller file).
+  (`parse_with` takes the already-looked-up `Option<String>` rather than a key,
+  since the empty-means-unset lookup is the local `get_nonempty` closure.)
 
 ## 3. Stringly-typed surfaces (compiler-checked replacements)
 

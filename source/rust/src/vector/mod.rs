@@ -31,7 +31,7 @@ pub mod distance;
 
 use std::collections::BTreeMap;
 
-use hnsw_rs::prelude::{DistCosine, DistL2, Hnsw};
+use hnsw_rs::prelude::{DistCosine, DistL2, Distance, Hnsw};
 use serde_json::Value;
 
 use crate::sync_util::{read_unpoisoned, write_unpoisoned};
@@ -70,35 +70,10 @@ impl HnswBackend {
     /// (unrepresentable as a non-negative HNSW distance; always scanned).
     fn build(metric: Metric, params: HnswParams, capacity_hint: usize) -> Option<Self> {
         let max_elements = capacity_hint.max(HNSW_MAX_ELEMENTS_HINT);
-        // `extend_candidates` + `keeping_pruned` are hnsw_rs's own remedies
-        // for small datasets, where the pruning heuristic can otherwise make
-        // it difficult to return the requested number of neighbours.
         match metric {
-            Metric::Cosine => {
-                let mut hnsw = Hnsw::new(
-                    params.m,
-                    max_elements,
-                    HNSW_MAX_LAYER,
-                    params.ef_construction,
-                    DistCosine,
-                );
-                hnsw.set_extend_candidates(true);
-                hnsw.set_keeping_pruned(true);
-                Some(HnswBackend::Cosine(hnsw))
-            }
+            Metric::Cosine => Some(HnswBackend::Cosine(build_graph(params, max_elements))),
             Metric::DotProduct => None,
-            Metric::Euclidean => {
-                let mut hnsw = Hnsw::new(
-                    params.m,
-                    max_elements,
-                    HNSW_MAX_LAYER,
-                    params.ef_construction,
-                    DistL2,
-                );
-                hnsw.set_extend_candidates(true);
-                hnsw.set_keeping_pruned(true);
-                Some(HnswBackend::Euclidean(hnsw))
-            }
+            Metric::Euclidean => Some(HnswBackend::Euclidean(build_graph(params, max_elements))),
         }
     }
 
@@ -121,6 +96,26 @@ impl HnswBackend {
     fn len(&self) -> usize {
         with_hnsw!(self, hnsw => hnsw.get_nb_point())
     }
+}
+
+/// Builds a fresh HNSW graph with the small-dataset remedies enabled
+/// (`extend_candidates` + `keeping_pruned`, `hnsw_rs`'s own fixes for the
+/// pruning heuristic, which can otherwise make it difficult to return the
+/// requested number of neighbours on small data).
+fn build_graph<D>(params: HnswParams, max_elements: usize) -> Hnsw<'static, f32, D>
+where
+    D: Distance<f32> + Send + Sync + Default,
+{
+    let mut hnsw = Hnsw::new(
+        params.m,
+        max_elements,
+        HNSW_MAX_LAYER,
+        params.ef_construction,
+        D::default(),
+    );
+    hnsw.set_extend_candidates(true);
+    hnsw.set_keeping_pruned(true);
+    hnsw
 }
 
 /// A per-field vector index: the raw vectors (source of truth) plus an
@@ -244,7 +239,7 @@ impl VectorIndex {
         let Some(backend) = &self.hnsw else {
             return Vec::new();
         };
-        let mut scored: Vec<(String, f32)> = backend
+        let scored: Vec<(String, f32)> = backend
             .search(query, k, ef)
             .into_iter()
             .filter_map(|(id, distance)| {
@@ -253,11 +248,7 @@ impl VectorIndex {
                     .map(|key| (key.clone(), score_from_distance(self.metric, distance)))
             })
             .collect();
-        sort_scored(&mut scored, String::as_str);
-        if scored.len() > k {
-            scored.truncate(k);
-        }
-        scored
+        top_k(scored, k)
     }
 
     fn brute_force(
@@ -266,17 +257,13 @@ impl VectorIndex {
         k: usize,
         pre_filter: Option<&dyn Fn(&str) -> bool>,
     ) -> Vec<(String, f32)> {
-        let mut scored: Vec<(String, f32)> = self
+        let scored: Vec<(String, f32)> = self
             .vectors
             .iter()
             .filter(|(key, _)| pre_filter.is_none_or(|f| f(key)))
             .map(|(key, vector)| (key.clone(), brute_force_score(self.metric, query, vector)))
             .collect();
-        sort_scored(&mut scored, String::as_str);
-        if scored.len() > k {
-            scored.truncate(k);
-        }
-        scored
+        top_k(scored, k)
     }
 
     fn len(&self) -> usize {
@@ -294,6 +281,26 @@ pub fn sort_scored<T>(scored: &mut [(T, f32)], key_of: impl Fn(&T) -> &str) {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| key_of(&a.0).cmp(key_of(&b.0)))
     });
+}
+
+/// Sorts `(key, score)` pairs by score (descending, key as tie-breaker) and
+/// keeps only the top `k`.
+fn top_k(mut scored: Vec<(String, f32)>, k: usize) -> Vec<(String, f32)> {
+    sort_scored(&mut scored, String::as_str);
+    scored.truncate(k);
+    scored
+}
+
+/// Groups `(field, item)` pairs by field name: a `BTreeMap` of field to its
+/// items, fields sorted, item order preserved within each field.
+fn group_by_field<'a, T>(
+    items: impl IntoIterator<Item = (&'a str, T)>,
+) -> BTreeMap<&'a str, Vec<T>> {
+    let mut by_field: BTreeMap<&'a str, Vec<T>> = BTreeMap::new();
+    for (field, item) in items {
+        by_field.entry(field).or_default().push(item);
+    }
+    by_field
 }
 
 /// The per-service vector store: one [`VectorIndex`] per (index, field).
@@ -393,13 +400,11 @@ impl VectorEngine {
         };
         // Group entries by field so each touched field's graph is rebuilt
         // once for the whole batch.
-        let mut by_field: BTreeMap<&str, Vec<(&str, &[f32])>> = BTreeMap::new();
-        for (key, field, vector) in entries {
-            by_field
-                .entry(field.as_str())
-                .or_default()
-                .push((key.as_str(), vector.as_slice()));
-        }
+        let by_field = group_by_field(
+            entries
+                .iter()
+                .map(|(key, field, vector)| (field.as_str(), (key.as_str(), vector.as_slice()))),
+        );
         for (field, field_entries) in by_field {
             if let Some(vector_index) = per_field.get_mut(field) {
                 vector_index.upsert_many(&field_entries)?;
@@ -418,13 +423,11 @@ impl VectorEngine {
         let Some(per_field) = guard.get_mut(index) else {
             return;
         };
-        let mut by_field: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for (key, field) in entries {
-            by_field
-                .entry(field.as_str())
-                .or_default()
-                .push(key.as_str());
-        }
+        let by_field = group_by_field(
+            entries
+                .iter()
+                .map(|(key, field)| (field.as_str(), key.as_str())),
+        );
         for (field, keys) in by_field {
             if let Some(vector_index) = per_field.get_mut(field) {
                 vector_index.remove_many(&keys);

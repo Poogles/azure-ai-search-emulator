@@ -163,6 +163,43 @@ fn list_named_resources(state: &AppState, kind: ResourceKind) -> Json<Value> {
     Json(serde_json::json!({ "value": value }))
 }
 
+/// The quoted name inside an `OData` segment fragment: strips the surrounding
+/// single quotes and rejects an empty name.
+pub(crate) fn unquote_name(fragment: &str) -> Option<&str> {
+    fragment
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .filter(|s| !s.is_empty())
+}
+
+/// Splits an OData-style path segment `{prefix}'name')` into its name:
+/// strips the prefix and closing paren, then the surrounding quotes.
+fn split_odata_segment<'a>(raw: &'a str, prefix: &str) -> Option<&'a str> {
+    raw.strip_prefix(prefix)
+        .and_then(|s| s.strip_suffix(')'))
+        .and_then(unquote_name)
+}
+
+/// Parses an OData-style path segment (`indexes('name')`, `docs('key')`,
+/// `aliases('name')`, ...) into its name. `prefix` is the segment's resource
+/// prefix (e.g. `aliases(`); `kind_label` and `code` shape the error for a
+/// malformed segment.
+pub(crate) fn parse_odata_segment(
+    raw: &str,
+    prefix: &str,
+    kind_label: &str,
+    code: &str,
+) -> Result<String, ApiError> {
+    split_odata_segment(raw, prefix)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                code,
+                format!("Invalid {kind_label} path segment {raw:?}; expected {prefix}'name')."),
+            )
+        })
+}
+
 /// Parses an OData-style named resource path segment
 /// (`synonymmaps('name')`, `aliases('name')`, `knowledgesources('name')`,
 /// `knowledgebases('name')`) into its kind and name. Returns `Ok(None)` when
@@ -171,48 +208,14 @@ pub(crate) fn parse_named_resource_segment(
     raw: &str,
 ) -> Result<Option<(ResourceKind, String)>, ApiError> {
     for kind in ResourceKind::ALL {
-        if let Some(inner) = raw.strip_prefix(kind.path_prefix()) {
-            let name = inner
-                .strip_suffix(')')
-                .and_then(|s| s.strip_prefix('\''))
-                .and_then(|s| s.strip_suffix('\''))
-                .filter(|s| !s.is_empty())
+        if raw.starts_with(kind.path_prefix()) {
+            let name = split_odata_segment(raw, kind.path_prefix())
                 .map(str::to_owned)
                 .ok_or_else(|| kind.invalid_segment_error(raw))?;
             return Ok(Some((kind, name)));
         }
     }
     Ok(None)
-}
-
-/// Parses an OData-style named path segment: `docs('key')`,
-/// `aliases('name')`, `knowledgesources('name')`, `knowledgebases('name')`.
-/// `raw` is the full path segment; `prefix` is its resource prefix
-/// (e.g. `aliases(`).
-pub(crate) fn parse_named_segment(
-    raw: &str,
-    prefix: &str,
-    kind: &str,
-    code: &str,
-) -> Result<String, ApiError> {
-    let invalid = || {
-        ApiError::bad_request(
-            code,
-            format!("Invalid {kind} path segment {raw:?}; expected {prefix}'name')."),
-        )
-    };
-    let inner = raw
-        .strip_prefix(prefix)
-        .and_then(|s| s.strip_suffix(')'))
-        .ok_or_else(invalid)?;
-    let name = inner
-        .strip_prefix('\'')
-        .and_then(|s| s.strip_suffix('\''))
-        .ok_or_else(invalid)?;
-    if name.is_empty() {
-        return Err(invalid());
-    }
-    Ok(name.to_owned())
 }
 
 /// Extracts a non-empty `name` from a resource body.

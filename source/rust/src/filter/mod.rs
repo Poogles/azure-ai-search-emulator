@@ -251,23 +251,21 @@ fn flatten_values<'a>(values: &[&'a Value]) -> Vec<&'a Value> {
 ///   and ordering operators when any value satisfies them.
 fn compare_field_values(values: &[&Value], op: FilterOp, expected: &FilterValue) -> bool {
     if values.is_empty() {
-        return null_matches(op, expected);
+        return null_comparison(op, true, value_is_null(expected));
     }
     if values.len() == 1 && !values[0].is_array() {
         let actual = values[0];
         if actual.is_null() {
-            return null_matches(op, expected);
+            return null_comparison(op, true, value_is_null(expected));
         }
         return compare(actual, op, expected);
     }
     let flat = flatten_values(values);
     if matches!(expected, FilterValue::Null) {
+        // A collection matches `null` when any element is null (`eq`) or
+        // none is (`ne`); ordering operators never match.
         let has_null = flat.iter().any(|value| value.is_null());
-        return match op {
-            FilterOp::Eq => has_null,
-            FilterOp::Ne => !has_null,
-            _ => false,
-        };
+        return null_comparison(op, has_null, true);
     }
     match op {
         // Collection field compared to a scalar: `eq` matches when any
@@ -284,12 +282,13 @@ fn value_is_null(value: &FilterValue) -> bool {
     matches!(value, FilterValue::Null)
 }
 
-/// Whether a `null` (or missing) value satisfies a comparison against
-/// `value`.
-fn null_matches(op: FilterOp, value: &FilterValue) -> bool {
+/// Whether a comparison with a `null` side holds: `eq` matches when both
+/// sides are null, `ne` when exactly one is, and ordering operators never
+/// match a null side.
+fn null_comparison(op: FilterOp, actual_null: bool, expected_null: bool) -> bool {
     match op {
-        FilterOp::Eq => value_is_null(value),
-        FilterOp::Ne => !value_is_null(value),
+        FilterOp::Eq => actual_null == expected_null,
+        FilterOp::Ne => actual_null != expected_null,
         _ => false,
     }
 }
@@ -304,7 +303,7 @@ fn element_matches(inner: &FilterExpr, element: &Value) -> bool {
     match inner {
         FilterExpr::Compare { op, value, .. } => {
             if element.is_null() {
-                return null_matches(*op, value);
+                return null_comparison(*op, true, value_is_null(value));
             }
             compare(element, *op, value)
         }
@@ -317,10 +316,8 @@ fn element_matches(inner: &FilterExpr, element: &Value) -> bool {
 #[allow(clippy::float_cmp)]
 fn compare(actual: &Value, op: FilterOp, expected: &FilterValue) -> bool {
     match expected {
-        // `actual` is known to be present and non-null here, so it equals
-        // `null` only for `eq` (never) and differs from `null` for `ne`
-        // (always). Ordering comparisons against `null` never match.
-        FilterValue::Null => matches!(op, FilterOp::Ne),
+        // `actual` is known to be present and non-null here.
+        FilterValue::Null => null_comparison(op, false, true),
         FilterValue::String(text) => match actual.as_str() {
             Some(actual_text) => match op {
                 FilterOp::Eq => actual_text == text.as_str(),

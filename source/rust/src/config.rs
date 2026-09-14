@@ -68,6 +68,31 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// Parses a non-empty value with `parse`, returning `default` when the value
+/// is unset and `err(raw)` when it is present but fails to parse.
+fn parse_with<T, E>(
+    raw: Option<String>,
+    default: T,
+    parse: impl Fn(&str) -> Result<T, E>,
+    err: impl Fn(String) -> ConfigError,
+) -> Result<T, ConfigError> {
+    match raw {
+        None => Ok(default),
+        Some(raw) => parse(&raw).map_err(|_| err(raw)),
+    }
+}
+
+/// Parses an extended boolean (`true`/`1` or `false`/`0`), returning `default`
+/// when unset and rejecting any other value.
+fn parse_bool_extended(key: &str, raw: Option<&str>, default: bool) -> Result<bool, ConfigError> {
+    match raw {
+        None => Ok(default),
+        Some("true" | "1") => Ok(true),
+        Some("false" | "0") => Ok(false),
+        Some(other) => Err(ConfigError::InvalidBool(format!("{key}={other:?}"))),
+    }
+}
+
 impl Config {
     /// Loads configuration from `EMULATOR_*` environment variables, applying
     /// defaults for any variable that is unset or empty.
@@ -92,21 +117,22 @@ impl Config {
     {
         // An empty value is treated as unset so that `VAR=` does not override
         // the default.
-        let get = |key: &str| lookup(key).filter(|value| !value.is_empty());
-        let port = match get("EMULATOR_PORT") {
-            None => DEFAULT_PORT,
-            Some(raw) => raw
-                .parse::<u16>()
-                .map_err(|_| ConfigError::InvalidPort(raw))?,
-        };
+        let get_nonempty = |key: &str| lookup(key).filter(|value| !value.is_empty());
 
-        let storage_mode = match get("EMULATOR_STORAGE__MODE").as_deref() {
+        let port = parse_with(
+            get_nonempty("EMULATOR_PORT"),
+            DEFAULT_PORT,
+            str::parse::<u16>,
+            ConfigError::InvalidPort,
+        )?;
+
+        let storage_mode = match get_nonempty("EMULATOR_STORAGE__MODE").as_deref() {
             None | Some("memory") => StorageMode::Memory,
             Some("file") => StorageMode::File,
             Some(other) => return Err(ConfigError::InvalidStorageMode(other.to_owned())),
         };
 
-        let api_versions = match get("EMULATOR_API_VERSIONS") {
+        let api_versions = match get_nonempty("EMULATOR_API_VERSIONS") {
             None => vec![DEFAULT_API_VERSION.to_owned()],
             Some(raw) => {
                 let versions: Vec<String> = raw
@@ -122,26 +148,21 @@ impl Config {
             }
         };
 
-        let log_level = get("EMULATOR_LOG_LEVEL").unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_owned());
+        let log_level =
+            get_nonempty("EMULATOR_LOG_LEVEL").unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_owned());
 
-        let enable_admin = match get("EMULATOR_ENABLE_ADMIN").as_deref() {
-            None | Some("true" | "1") => true,
-            Some("false" | "0") => false,
-            Some(other) => {
-                return Err(ConfigError::InvalidBool(format!(
-                    "EMULATOR_ENABLE_ADMIN={other:?}"
-                )))
-            }
-        };
+        let enable_admin = parse_bool_extended(
+            "EMULATOR_ENABLE_ADMIN",
+            get_nonempty("EMULATOR_ENABLE_ADMIN").as_deref(),
+            true,
+        )?;
 
-        let max_vector_dimension = match get("EMULATOR_VECTOR__MAX_DIMENSION") {
-            None => DEFAULT_VECTOR_MAX_DIMENSION,
-            Some(raw) => raw
-                .parse::<usize>()
-                .ok()
-                .filter(|n| *n > 0)
-                .ok_or(ConfigError::InvalidMaxVectorDimension(raw))?,
-        };
+        let max_vector_dimension = parse_with(
+            get_nonempty("EMULATOR_VECTOR__MAX_DIMENSION"),
+            DEFAULT_VECTOR_MAX_DIMENSION,
+            |s| s.parse::<usize>().ok().filter(|n| *n > 0).ok_or(()),
+            ConfigError::InvalidMaxVectorDimension,
+        )?;
 
         Ok(Config {
             port,

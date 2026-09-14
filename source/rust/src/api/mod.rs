@@ -22,7 +22,7 @@ use crate::version::VersionAdapter;
 use named_resources::{
     create_alias, create_knowledge_base, create_knowledge_source, create_or_update_named_resource,
     create_synonym_map, list_aliases, list_knowledge_bases, list_knowledge_sources,
-    list_synonym_maps, parse_named_resource_segment, parse_named_segment,
+    list_synonym_maps, parse_named_resource_segment, parse_odata_segment, unquote_name,
 };
 
 #[derive(Clone)]
@@ -263,7 +263,7 @@ fn knowledge_base_retrieve(
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
     let knowledge_base = ResourceKind::KnowledgeBase;
-    let name = match parse_named_segment(
+    let name = match parse_odata_segment(
         raw_name,
         knowledge_base.path_prefix(),
         knowledge_base.label(),
@@ -575,6 +575,24 @@ fn build_next_page_params(raw_request: &Value, token: &str, next_skip: u64) -> V
 // Middleware
 // ---------------------------------------------------------------------------
 
+/// Matches a request path against the named-resource collection routes:
+/// returns the kind and whether the path is a named (`resource('name')`)
+/// segment rather than the bare collection. `None` for every other path
+/// (index routes, document subpaths, `/servicestats`, ...). The single
+/// collection/named check shared by the auth guard and the operation logger.
+fn match_azure_route(path: &str) -> Option<(ResourceKind, bool)> {
+    for kind in ResourceKind::ALL {
+        let collection = kind.collection_path();
+        if path == collection {
+            return Some((kind, false));
+        }
+        if is_named_segment(path, collection) {
+            return Some((kind, true));
+        }
+    }
+    None
+}
+
 /// Whether a request path is on the Azure-compatible surface that requires
 /// an API key and a supported `api-version`: the collection and named
 /// (`resource('name')`) routes for indexes, synonym maps, aliases, knowledge
@@ -583,9 +601,7 @@ fn is_azure_surface_path(path: &str) -> bool {
     path == "/servicestats"
         || path == "/indexes"
         || is_named_segment(path, "/indexes")
-        || ResourceKind::ALL.iter().any(|kind| {
-            path == kind.collection_path() || is_named_segment(path, kind.collection_path())
-        })
+        || match_azure_route(path).is_some()
 }
 
 /// Whether `path` is a named (`resource('name')`) segment of a collection: it
@@ -667,29 +683,12 @@ async fn request_logging(request: Request, next: middleware::Next) -> Response {
 
 /// Parses the OData-style index path segment `indexes('name')`.
 fn parse_index_name(raw: &str) -> Result<String, ApiError> {
-    let invalid = || {
-        ApiError::bad_request(
-            "InvalidIndexName",
-            format!("Invalid index path segment {raw:?}; expected indexes('name')."),
-        )
-    };
-    let inner = raw
-        .strip_prefix("indexes(")
-        .and_then(|s| s.strip_suffix(')'))
-        .ok_or_else(invalid)?;
-    let name = inner
-        .strip_prefix('\'')
-        .and_then(|s| s.strip_suffix('\''))
-        .ok_or_else(invalid)?;
-    if name.is_empty() {
-        return Err(invalid());
-    }
-    Ok(name.to_owned())
+    parse_odata_segment(raw, "indexes(", "index", "InvalidIndexName")
 }
 
 /// Parses the OData-style document path segment `docs('key')`.
 fn parse_document_key(raw: &str) -> Result<String, ApiError> {
-    parse_named_segment(raw, "docs(", "document", "InvalidRequest")
+    parse_odata_segment(raw, "docs(", "document", "InvalidRequest")
 }
 
 fn parse_body(body: &axum::body::Bytes) -> Result<Value, ApiError> {
@@ -778,9 +777,10 @@ fn parse_top_param(raw: &str) -> Result<u64, ApiError> {
 
 fn extract_index(path: &str) -> Option<String> {
     let rest = path.strip_prefix("/indexes(")?;
-    let name = rest.split(')').next()?;
-    let name = name.strip_prefix('\'').and_then(|s| s.strip_suffix('\''))?;
-    (!name.is_empty()).then_some(name.to_owned())
+    rest.split(')')
+        .next()
+        .and_then(unquote_name)
+        .map(str::to_owned)
 }
 
 /// The logging operation name for a request: fixed routes and document
@@ -811,17 +811,14 @@ fn operation_for(method: &axum::http::Method, path: &str) -> &'static str {
             "unknown"
         };
     }
-    for kind in ResourceKind::ALL {
-        if path == kind.collection_path() {
-            return if method.as_str() == "POST" {
-                kind.create_operation()
-            } else {
-                kind.list_operation()
-            };
-        }
-        if is_named_segment(path, kind.collection_path()) {
-            return kind.named_operation(method.as_str());
-        }
+    if let Some((kind, named)) = match_azure_route(path) {
+        return if named {
+            kind.named_operation(method.as_str())
+        } else if method.as_str() == "POST" {
+            kind.create_operation()
+        } else {
+            kind.list_operation()
+        };
     }
     match method.as_str() {
         "PUT" => "createIndex",

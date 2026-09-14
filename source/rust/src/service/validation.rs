@@ -43,6 +43,19 @@ const SUPPORTED_FIELD_TYPES: &[&str] = &[
     "Edm.Collection(Edm.Guid)",
 ];
 
+/// Inserts `name` into `seen`; on a duplicate, returns the `InvalidIndex`
+/// error produced by `message`.
+fn ensure_unique<'a>(
+    seen: &mut std::collections::BTreeSet<&'a str>,
+    name: &'a str,
+    message: impl FnOnce() -> String,
+) -> Result<(), ApiError> {
+    if !seen.insert(name) {
+        return Err(ApiError::bad_request("InvalidIndex", message()));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_schema(
     definition: &IndexDefinition,
     max_vector_dimension: usize,
@@ -51,12 +64,9 @@ pub(crate) fn validate_schema(
     let mut seen = std::collections::BTreeSet::new();
     for field in &definition.fields {
         validate_vector_field(field, max_vector_dimension)?;
-        if !seen.insert(field.name.as_str()) {
-            return Err(ApiError::bad_request(
-                "InvalidIndex",
-                format!("Duplicate field name {:?} in index schema.", field.name),
-            ));
-        }
+        ensure_unique(&mut seen, field.name.as_str(), || {
+            format!("Duplicate field name {:?} in index schema.", field.name)
+        })?;
         if field.is_key {
             if field.is_complex_type() {
                 return Err(ApiError::bad_request(
@@ -240,15 +250,12 @@ pub(crate) fn validate_vector_search_config(definition: &IndexDefinition) -> Res
 pub(crate) fn validate_suggesters(definition: &IndexDefinition) -> Result<(), ApiError> {
     let mut seen = std::collections::BTreeSet::new();
     for suggester in &definition.suggesters {
-        if !seen.insert(suggester.name.as_str()) {
-            return Err(ApiError::bad_request(
-                "InvalidIndex",
-                format!(
-                    "Duplicate suggester name {:?} in index schema.",
-                    suggester.name
-                ),
-            ));
-        }
+        ensure_unique(&mut seen, suggester.name.as_str(), || {
+            format!(
+                "Duplicate suggester name {:?} in index schema.",
+                suggester.name
+            )
+        })?;
         if suggester.search_fields.is_empty() {
             return Err(ApiError::bad_request(
                 "InvalidIndex",
@@ -295,15 +302,12 @@ pub(crate) fn validate_subfields(field: &FieldDefinition) -> Result<(), ApiError
     }
     let mut seen = std::collections::BTreeSet::new();
     for subfield in &field.subfields {
-        if !seen.insert(subfield.name.as_str()) {
-            return Err(ApiError::bad_request(
-                "InvalidIndex",
-                format!(
-                    "Duplicate subfield name {:?} in complex type field {:?}.",
-                    subfield.name, field.name
-                ),
-            ));
-        }
+        ensure_unique(&mut seen, subfield.name.as_str(), || {
+            format!(
+                "Duplicate subfield name {:?} in complex type field {:?}.",
+                subfield.name, field.name
+            )
+        })?;
         if subfield.is_key {
             return Err(ApiError::bad_request(
                 "InvalidIndex",
@@ -412,6 +416,29 @@ pub(crate) fn finite_f32(n: f64) -> Option<f32> {
     (n.is_finite() && narrowed.is_finite()).then_some(narrowed)
 }
 
+/// Why an array of JSON values could not be narrowed to finite `f32`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FiniteF32ArrayError {
+    /// A numeric value that is not finite (or overflows `f32`).
+    NonFinite,
+    /// A value that is not a number at all.
+    NonNumeric,
+}
+
+/// Narrows a JSON array of values to finite `f32`s (`Edm.Single`): integers
+/// are widened, and non-finite or overflowing numbers are rejected.
+pub(crate) fn parse_finite_f32_array(items: &[Value]) -> Result<Vec<f32>, FiniteF32ArrayError> {
+    let mut vector = Vec::with_capacity(items.len());
+    for item in items {
+        match item.as_f64().and_then(finite_f32) {
+            Some(narrowed) => vector.push(narrowed),
+            None if item.is_number() => return Err(FiniteF32ArrayError::NonFinite),
+            None => return Err(FiniteF32ArrayError::NonNumeric),
+        }
+    }
+    Ok(vector)
+}
+
 /// Validates a vector field value: a JSON array of exactly the declared
 /// number of finite numbers. Integers are accepted (widened to `f32` at
 /// index time).
@@ -430,27 +457,17 @@ pub(crate) fn check_vector_value(field: &FieldDefinition, value: &Value) -> Resu
             items.len()
         ));
     }
-    for item in items {
-        match item.as_f64() {
-            // The vector index stores `f32` (`Edm.Single`); wider `f64`
-            // values that overflow `f32` would poison distance math, so they
-            // are rejected here.
-            Some(n) if finite_f32(n).is_some() => {}
-            Some(_) => {
-                return Err(format!(
-                    "Field {:?} must contain only finite numeric values.",
-                    field.name
-                ));
+    parse_finite_f32_array(items)
+        .map(|_| ())
+        .map_err(|error| match error {
+            FiniteF32ArrayError::NonFinite => format!(
+                "Field {:?} must contain only finite numeric values.",
+                field.name
+            ),
+            FiniteF32ArrayError::NonNumeric => {
+                format!("Field {:?} must contain only numeric values.", field.name)
             }
-            None => {
-                return Err(format!(
-                    "Field {:?} must contain only numeric values.",
-                    field.name
-                ));
-            }
-        }
-    }
-    Ok(())
+        })
 }
 
 /// Validates a complex-type value: a JSON object whose members are known

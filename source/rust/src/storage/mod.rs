@@ -79,37 +79,18 @@ impl FieldDefinition {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
-        let analyzer = obj
-            .get("analyzer")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
+        let analyzer = get_opt_string(obj, "analyzer");
         Ok(FieldDefinition {
             name: name.to_owned(),
             field_type: normalize_field_type(field_type),
             vector_dimensions,
             vector_search_profile,
-            is_key: obj.get("key").and_then(Value::as_bool).unwrap_or(false),
-            searchable: obj
-                .get("searchable")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            filterable: obj
-                .get("filterable")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            sortable: obj
-                .get("sortable")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            facetable: obj
-                .get("facetable")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            retrievable: obj
-                .get("retrievable")
-                .and_then(Value::as_bool)
-                .unwrap_or(true),
+            is_key: get_bool(obj, "key", false),
+            searchable: get_bool(obj, "searchable", false),
+            filterable: get_bool(obj, "filterable", false),
+            sortable: get_bool(obj, "sortable", false),
+            facetable: get_bool(obj, "facetable", false),
+            retrievable: get_bool(obj, "retrievable", true),
             subfields,
             analyzer,
             raw,
@@ -172,6 +153,21 @@ fn normalize_field_type(field_type: &str) -> String {
     } else {
         field_type.to_owned()
     }
+}
+
+/// Reads an optional boolean property, returning `default` when the key is
+/// absent or its value is not a boolean.
+fn get_bool(obj: &Map<String, Value>, key: &str, default: bool) -> bool {
+    obj.get(key).and_then(Value::as_bool).unwrap_or(default)
+}
+
+/// Reads an optional non-empty string property; `None` when the key is absent,
+/// its value is not a string, or the string is empty.
+fn get_opt_string(obj: &Map<String, Value>, key: &str) -> Option<String> {
+    obj.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
 }
 
 /// A suggester: a named set of searchable fields that the autocomplete and
@@ -309,14 +305,22 @@ impl IndexDefinition {
     /// subfields. A plain name resolves exactly like [`field`](Self::field).
     #[must_use]
     pub fn field_path(&self, path: &str) -> Option<&FieldDefinition> {
-        let mut segments = path.split('/');
-        let first = segments.next()?;
+        let (first, rest) = path_segments(path);
         let mut current = self.fields.iter().find(|f| f.name == first)?;
-        for segment in segments {
+        for segment in rest {
             current = current.subfields.iter().find(|f| f.name == segment)?;
         }
         Some(current)
     }
+}
+
+/// Splits a field path (`Address/City`) into its first segment and the
+/// remaining segments. The first segment is always present (an empty path
+/// yields an empty first segment).
+fn path_segments(path: &str) -> (&str, std::str::Split<'_, char>) {
+    let mut segments = path.split('/');
+    let first = segments.next().unwrap_or("");
+    (first, segments)
 }
 
 /// A document stored in an index, keyed by the index's key field.
@@ -332,12 +336,8 @@ impl Document {
         Value::Object(self.fields.clone())
     }
 
-    /// Resolves a field path (`Address/City`, or a plain field name) against
-    /// this document's field map, walking into complex-type objects. When a
-    /// segment resolves to a JSON array (a collection field or a
-    /// collection-of-complex field), the remaining path is resolved against
-    /// every element, so a collection-of-complex path yields one value per
-    /// element. A plain (non-collection) path yields at most one value.
+    /// Resolves a field path against this document's field map; see
+    /// [`resolve_field_path`] for the resolution semantics.
     #[must_use]
     pub fn resolve_path(&self, path: &str) -> Vec<&Value> {
         resolve_field_path(&self.fields, path)
@@ -352,15 +352,12 @@ impl Document {
 /// (non-collection) path yields at most one value.
 #[must_use]
 pub fn resolve_field_path<'a>(fields: &'a Map<String, Value>, path: &str) -> Vec<&'a Value> {
-    let mut segments = path.split('/');
-    let Some(first) = segments.next() else {
-        return Vec::new();
-    };
+    let (first, rest) = path_segments(path);
     let mut current = match fields.get(first) {
         Some(value) => vec![value],
         None => return Vec::new(),
     };
-    for segment in segments {
+    for segment in rest {
         let mut next = Vec::new();
         for value in current {
             match value {
