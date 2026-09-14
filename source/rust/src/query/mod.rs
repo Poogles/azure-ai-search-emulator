@@ -93,6 +93,11 @@ pub enum QueryError {
     Engine(String),
 }
 
+/// Maps an underlying Tantivy failure onto [`QueryError::Engine`].
+fn engine_err(error: impl std::fmt::Display) -> QueryError {
+    QueryError::Engine(error.to_string())
+}
+
 /// A single Tantivy-backed search index.
 struct EngineIndex {
     /// The underlying index, kept (cheaply cloneable) so Lucene queries can
@@ -134,12 +139,8 @@ impl SearchEngine {
         // Register every supported analyzer so each field's declared
         // tokenizer name resolves at index time.
         register_analyzers(index.tokenizers());
-        let reader = index
-            .reader()
-            .map_err(|e| QueryError::Engine(e.to_string()))?;
-        let writer = index
-            .writer(WRITER_HEAP_BYTES)
-            .map_err(|e| QueryError::Engine(e.to_string()))?;
+        let reader = index.reader().map_err(engine_err)?;
+        let writer = index.writer(WRITER_HEAP_BYTES).map_err(engine_err)?;
         let mut guard = write_unpoisoned(&self.inner);
         if guard.contains_key(name) {
             return Err(QueryError::Engine(format!(
@@ -202,18 +203,12 @@ impl SearchEngine {
             engine
                 .writer
                 .add_document(tantivy_doc)
-                .map_err(|e| QueryError::Engine(e.to_string()))?;
+                .map_err(engine_err)?;
         }
-        engine
-            .writer
-            .commit()
-            .map_err(|e| QueryError::Engine(e.to_string()))?;
+        engine.writer.commit().map_err(engine_err)?;
         // Reload synchronously so newly indexed documents are immediately
         // searchable (the emulator guarantees immediate consistency).
-        engine
-            .reader
-            .reload()
-            .map_err(|e| QueryError::Engine(e.to_string()))?;
+        engine.reader.reload().map_err(engine_err)?;
         Ok(())
     }
 
@@ -237,14 +232,8 @@ impl SearchEngine {
                 .writer
                 .delete_term(Term::from_field_text(engine.key_field, key));
         }
-        engine
-            .writer
-            .commit()
-            .map_err(|e| QueryError::Engine(e.to_string()))?;
-        engine
-            .reader
-            .reload()
-            .map_err(|e| QueryError::Engine(e.to_string()))?;
+        engine.writer.commit().map_err(engine_err)?;
+        engine.reader.reload().map_err(engine_err)?;
         Ok(())
     }
 
@@ -290,7 +279,7 @@ impl SearchEngine {
                 &*tantivy_query,
                 &TopDocs::with_limit(MAX_MATCHES).order_by_score(),
             )
-            .map_err(|e| QueryError::Engine(e.to_string()))?;
+            .map_err(engine_err)?;
         let mut scored = BTreeMap::new();
         for (score, doc_address) in top_docs {
             if let Ok(doc) = searcher.doc::<TantivyDocument>(doc_address) {

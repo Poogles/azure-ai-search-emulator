@@ -44,9 +44,15 @@ pub fn score_from_distance(metric: Metric, distance: f32) -> f32 {
     match metric {
         // `DistCosine` evaluates to `1 - cos_sim`.
         Metric::Cosine => 1.0 - distance,
-        // Unreachable via the graph (dotProduct always scans); kept so the
-        // mapping is total.
-        Metric::DotProduct => -distance,
+        // Unreachable in production: `dotProduct` never builds a graph
+        // (`HnswBackend::build` returns `None`) and always executes as an
+        // exact brute-force scan over the raw inner product (see
+        // `brute_force_score`). Kept so the mapping is total; returns NAN
+        // (never a plausible score) to surface any future graph caller.
+        Metric::DotProduct => {
+            debug_assert!(false, "dotProduct must not use score_from_distance");
+            f32::NAN
+        }
         // `DistL2` evaluates to the raw L2 distance.
         Metric::Euclidean => 1.0 / (1.0 + distance),
     }

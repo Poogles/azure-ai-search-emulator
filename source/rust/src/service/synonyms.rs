@@ -100,9 +100,7 @@ impl SynonymMap {
     /// The JSON representation returned by the synonym-map routes.
     #[must_use]
     pub fn to_value(&self) -> Value {
-        // Serialization of this plain-data struct cannot fail; fall back to
-        // null rather than panicking in request handling.
-        serde_json::to_value(self).unwrap_or(Value::Null)
+        crate::error::to_value_or_null(self)
     }
 }
 

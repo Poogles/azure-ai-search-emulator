@@ -133,19 +133,6 @@ impl ResourceKind {
         }
     }
 
-    /// The label used in create-conflict messages (`A {kind} with name ...
-    /// already exists.`). Only synonym maps name themselves; the other kinds
-    /// share the generic `resource` label.
-    #[must_use]
-    pub const fn conflict_kind(self) -> &'static str {
-        match self {
-            ResourceKind::SynonymMap => "synonym map",
-            ResourceKind::Alias | ResourceKind::KnowledgeSource | ResourceKind::KnowledgeBase => {
-                "resource"
-            }
-        }
-    }
-
     /// The error code for a create conflict, e.g. `AliasAlreadyExists`.
     #[must_use]
     pub const fn conflict_code(self) -> ErrorCode {
@@ -313,10 +300,7 @@ impl<T: Clone> ResourceStore<T> {
         if items.contains_key(name) {
             return Err(ApiError::conflict(
                 kind.conflict_code(),
-                format!(
-                    "A {} with name {name:?} already exists.",
-                    kind.conflict_kind()
-                ),
+                format!("A {} with name {name:?} already exists.", kind.label()),
             ));
         }
         Ok(self.insert(&mut items, name, build))

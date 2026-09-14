@@ -26,9 +26,7 @@ pub struct IndexingResultItem {
 impl IndexingResultItem {
     #[must_use]
     pub fn to_value(&self) -> Value {
-        // Serialization of this plain-data struct cannot fail; fall back to
-        // null rather than panicking in request handling.
-        serde_json::to_value(self).unwrap_or(Value::Null)
+        crate::error::to_value_or_null(self)
     }
 }
 
@@ -51,12 +49,20 @@ impl DocumentAction {
     ///
     /// Returns an [`ApiError`] when the action is not a JSON object, its
     /// `@search.action` is unsupported, or it has no `document` member.
-    pub fn from_value(value: &Value) -> Result<Self, ApiError> {
-        let action_type = value
+    /// Takes the action by value so the document moves (not clones) into the
+    /// result.
+    pub fn from_value(value: Value) -> Result<Self, ApiError> {
+        let Value::Object(mut map) = value else {
+            return Err(ApiError::bad_request(
+                ErrorCode::InvalidDocuments,
+                "Each batch action must be a JSON object.",
+            ));
+        };
+        let kind = match map
             .get("@search.action")
             .and_then(Value::as_str)
-            .unwrap_or("upload");
-        let kind = match action_type {
+            .unwrap_or("upload")
+        {
             "upload" => ActionKind::Upload,
             "merge" => ActionKind::Merge,
             "mergeOrUpload" => ActionKind::MergeOrUpload,
@@ -68,22 +74,11 @@ impl DocumentAction {
                 ))
             }
         };
-        let document = match value.get("document") {
-            Some(document) => document.clone(),
-            None => Value::Object(
-                value
-                    .as_object()
-                    .ok_or_else(|| {
-                        ApiError::bad_request(
-                            ErrorCode::InvalidDocuments,
-                            "Each batch action must be a JSON object.",
-                        )
-                    })?
-                    .iter()
-                    .filter(|(key, _)| key.as_str() != "@search.action")
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect(),
-            ),
+        let document = if let Some(document) = map.remove("document") {
+            document
+        } else {
+            map.remove("@search.action");
+            Value::Object(map)
         };
         Ok(Self { kind, document })
     }

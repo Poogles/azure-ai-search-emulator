@@ -213,10 +213,11 @@ async fn upload_documents(
     let name = parse_index_name(&raw_name)?;
     let batch = parse_body(&body)?;
     // The SDK serializes an `IndexBatch` as `{"value": [...]}`; a bare array is
-    // also accepted for direct HTTP use.
-    let actions = batch_items(&batch)?;
+    // also accepted for direct HTTP use. Actions move out of the batch so
+    // documents are not cloned per action.
+    let actions = batch_items(batch)?;
     let batch = actions
-        .iter()
+        .into_iter()
         .map(DocumentAction::from_value)
         .collect::<Result<Vec<_>, ApiError>>()?;
     let results = state.service.index_documents(&name, batch)?;
@@ -704,16 +705,22 @@ fn parse_body(body: &axum::body::Bytes) -> Result<Value, ApiError> {
 }
 
 /// The document actions of an upload batch: a bare JSON array, or an object
-/// with a `"value"` array (the SDK's `IndexBatch` wire shape).
-fn batch_items(batch: &Value) -> Result<&Vec<Value>, ApiError> {
+/// with a `"value"` array (the SDK's `IndexBatch` wire shape). Takes the batch
+/// by value so actions move (not clone) into the caller.
+fn batch_items(batch: Value) -> Result<Vec<Value>, ApiError> {
     match batch {
         Value::Array(items) => Ok(items),
-        _ => batch.get("value").and_then(Value::as_array).ok_or_else(|| {
-            ApiError::bad_request(
+        Value::Object(mut map) => match map.remove("value") {
+            Some(Value::Array(items)) => Ok(items),
+            _ => Err(ApiError::bad_request(
                 ErrorCode::InvalidDocuments,
                 "Document batch must be a JSON array of actions or an object with a \"value\" array.",
-            )
-        }),
+            )),
+        },
+        _ => Err(ApiError::bad_request(
+            ErrorCode::InvalidDocuments,
+            "Document batch must be a JSON array of actions or an object with a \"value\" array.",
+        )),
     }
 }
 

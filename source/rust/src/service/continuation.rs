@@ -23,18 +23,29 @@ pub struct ContinuationToken {
 impl ContinuationToken {
     #[must_use]
     pub fn encode(&self) -> String {
-        // Serialization of this plain-data struct cannot fail; fall back to an
-        // empty object (which decodes but carries no paging state) rather than
-        // panicking in request handling.
-        let json = serde_json::to_string(self).unwrap_or_default();
+        // Serialization of this plain-data struct cannot fail. On the
+        // impossible failure, fall back to an empty string (which `decode`
+        // rejects) rather than a decodable-but-stateless token that would
+        // silently restart paging. `expect_used` is denied, so the
+        // impossibility is recorded with `debug_assert` instead of `expect`.
+        let json = if let Ok(json) = serde_json::to_string(self) {
+            json
+        } else {
+            debug_assert!(false, "ContinuationToken serialization must not fail");
+            String::new()
+        };
         BASE64_URL_SAFE.encode(json)
     }
 
     /// # Errors
     ///
     /// Returns an error string when the token is not valid base64 JSON with
-    /// the expected shape.
+    /// the expected shape. Empty and stateless tokens are rejected so a
+    /// serialization failure can never silently restart paging.
     pub fn decode(raw: &str) -> Result<Self, String> {
+        if raw.is_empty() {
+            return Err("continuation token is empty".to_owned());
+        }
         let bytes = BASE64_URL_SAFE
             .decode(raw.as_bytes())
             .or_else(|_| BASE64.decode(raw.as_bytes()))

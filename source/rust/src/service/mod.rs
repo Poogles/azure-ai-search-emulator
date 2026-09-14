@@ -217,7 +217,7 @@ impl SearchService {
             }
             if let Err(e) = self.storage.put_documents(&definition.name, preserved) {
                 self.rollback_index(&definition.name);
-                return Err(ApiError::not_found(e.to_string()));
+                return Err(e.into());
             }
         }
         Ok(definition.raw.clone())
@@ -506,11 +506,7 @@ impl SearchService {
     /// Returns an [`ApiError`] if the index or the document does not exist.
     pub fn get_document(&self, index: &str, key: &str) -> Result<Value, ApiError> {
         let definition = self.require_index(index)?;
-        match self
-            .storage
-            .get_document(&definition.name, key)
-            .map_err(|e| ApiError::not_found(e.to_string()))?
-        {
+        match self.storage.get_document(&definition.name, key)? {
             Some(document) => Ok(document.to_value()),
             None => Err(ApiError::not_found(format!(
                 "Document with key {key:?} was not found in index {index:?}."
@@ -525,10 +521,7 @@ impl SearchService {
     /// Returns an [`ApiError`] if the index does not exist.
     pub fn count_documents(&self, index: &str) -> Result<u64, ApiError> {
         let definition = self.require_index(index)?;
-        let docs = self
-            .storage
-            .get_documents(&definition.name)
-            .map_err(|e| ApiError::not_found(e.to_string()))?;
+        let docs = self.storage.get_documents(&definition.name)?;
         Ok(docs.len() as u64)
     }
 
@@ -574,14 +567,10 @@ impl SearchService {
                 )));
             }
             if !upserts.is_empty() {
-                self.storage
-                    .put_documents(&definition.name, upserts)
-                    .map_err(|e| ApiError::not_found(e.to_string()))?;
+                self.storage.put_documents(&definition.name, upserts)?;
             }
             if !deletes.is_empty() {
-                self.storage
-                    .delete_documents(&definition.name, &deletes)
-                    .map_err(|e| ApiError::not_found(e.to_string()))?;
+                self.storage.delete_documents(&definition.name, &deletes)?;
             }
         }
         Ok(batch.results)
@@ -641,11 +630,7 @@ impl SearchService {
                 // A key upserted earlier in the same batch counts as present,
                 // so upload-then-delete resolves to "deleted".
                 let present = batch.upserts.contains_key(&key)
-                    || self
-                        .storage
-                        .get_document(&definition.name, &key)
-                        .map_err(|e| ApiError::not_found(e.to_string()))?
-                        .is_some();
+                    || self.storage.get_document(&definition.name, &key)?.is_some();
                 if present {
                     batch.deletes.insert(key.clone());
                     batch.upserts.remove(&key);
@@ -933,7 +918,7 @@ impl SearchService {
             vector_lists,
         } = self.resolve_plan(&definition, query)?;
         let (scored, total, facets) =
-            Self::execute_plan(&orderby, &documents, full_text_scores, &vector_lists, query);
+            Self::execute_plan(&orderby, documents, full_text_scores, &vector_lists, query);
         let (page, has_more, next_skip) = Self::paginate(scored, skip, query.top, total);
         let page = Self::project_page(page, query, &full_text, &definition);
         Ok(SearchOutcome {
@@ -975,10 +960,7 @@ impl SearchService {
         let vector_active = !query.vector_queries.is_empty();
         let full_text_active = !full_text.is_match_all();
 
-        let documents = self
-            .storage
-            .get_documents(&definition.name)
-            .map_err(|e| ApiError::not_found(e.to_string()))?;
+        let documents = self.storage.get_documents(&definition.name)?;
         let doc_fields: BTreeMap<&str, &Map<String, Value>> = documents
             .iter()
             .map(|doc| (doc.key.as_str(), &doc.fields))
@@ -1017,7 +999,7 @@ impl SearchService {
     /// the match total, and the facets.
     fn execute_plan(
         orderby: &[OrderBy],
-        documents: &[Document],
+        documents: Vec<Document>,
         full_text_scores: BTreeMap<String, f32>,
         vector_lists: &[(f32, BTreeMap<String, f32>)],
         query: &SearchQuery,
@@ -1029,22 +1011,24 @@ impl SearchService {
         // more. When only one side is active (vector-only or full-text-only)
         // keep the native scores via a plain union (best score wins).
         let merged = Self::merge_scores(full_text_scores, vector_lists);
-        let doc_map: BTreeMap<&str, &Document> = documents
-            .iter()
-            .map(|doc| (doc.key.as_str(), doc))
+        // Own the documents by key so hits move (not clone) into `scored`;
+        // only the page is cloned later in `paginate`/`project_page`.
+        let mut doc_map: BTreeMap<String, Document> = documents
+            .into_iter()
+            .map(|doc| (doc.key.clone(), doc))
             .collect();
         let mut scored: Vec<(Document, f32)> = merged
             .into_iter()
-            .filter_map(|(key, score)| doc_map.get(key.as_str()).map(|doc| ((*doc).clone(), score)))
+            .filter_map(|(key, score)| doc_map.remove(&key).map(|doc| (doc, score)))
             .collect();
         order_scored(&mut scored, orderby);
 
         let total = u64::try_from(scored.len()).unwrap_or(u64::MAX);
-        let matched: Vec<Document> = scored.iter().map(|(doc, _)| doc.clone()).collect();
+        // Facets read the full matched set by reference; no second clone.
         let facets = if query.facets.is_empty() {
             None
         } else {
-            Some(compute_facets(&matched, &query.facets))
+            Some(compute_facets(&scored, &query.facets))
         };
         (scored, total, facets)
     }
@@ -1428,10 +1412,7 @@ impl SearchService {
                     format!("Suggester {suggester_name:?} is not defined on index {index:?}."),
                 )
             })?;
-        let documents = self
-            .storage
-            .get_documents(&definition.name)
-            .map_err(|e| ApiError::not_found(e.to_string()))?;
+        let documents = self.storage.get_documents(&definition.name)?;
         Ok((documents, suggester))
     }
 
@@ -1480,6 +1461,11 @@ impl SearchService {
         }
     }
 
+    /// Looks up the index definition, cloning it out of storage. The clone is
+    /// intentional: definitions are small schemas (not documents), and an
+    /// owned value keeps the storage/engine/vector boundaries lifetime-free.
+    /// An `Arc<IndexDefinition>` would avoid the clone but complicate the
+    /// `Storage` trait and all callers for negligible local-emulator benefit.
     fn require_index(&self, name: &str) -> Result<IndexDefinition, ApiError> {
         let resolved = self.resolve_index_name(name);
         self.storage
@@ -1499,14 +1485,9 @@ impl SearchService {
         alias.target_index().unwrap_or_else(|| name.to_owned())
     }
 
-    /// Analyzer names accepted by the analyze-text endpoint; the single
-    /// source of truth is [`crate::query::KNOWN_ANALYZERS`]. Unknown names
-    /// are rejected explicitly rather than silently mapped.
-    const KNOWN_ANALYZERS: &'static [&'static str] = crate::query::KNOWN_ANALYZERS;
-
     /// Validates analyze-text parameters against the index schema: `field`,
     /// when given, must exist in the schema; `analyzer`, when given, must be
-    /// a known analyzer name (see [`SearchService::KNOWN_ANALYZERS`]).
+    /// a known analyzer name (see [`crate::query::KNOWN_ANALYZERS`]).
     ///
     /// # Errors
     ///
@@ -1520,12 +1501,12 @@ impl SearchService {
     ) -> Result<(), ApiError> {
         let definition = self.require_index(index)?;
         if let Some(name) = analyzer {
-            if !Self::KNOWN_ANALYZERS.contains(&name) {
+            if !crate::query::KNOWN_ANALYZERS.contains(&name) {
                 return Err(ApiError::bad_request(
                     ErrorCode::InvalidRequest,
                     format!(
                         "Unknown analyzer {name:?}; supported analyzers: {}.",
-                        Self::KNOWN_ANALYZERS.join(", ")
+                        crate::query::KNOWN_ANALYZERS.join(", ")
                     ),
                 ));
             }
@@ -1651,12 +1632,16 @@ fn prepare_full_text(
     full_text.mode = query.search_mode;
     // Synonym expansions for single-term clauses (fuzzy terms and phrases do
     // not expand). Each pair is `(raw term, raw expansions)`; the engine
-    // analyzes both sides per field.
+    // analyzes both sides per field. Expansions are cached per unique term so
+    // a repeated term (e.g. `wa wa`) does not rebuild the map scan per clause.
+    let mut expansion_cache: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for clause in &full_text.required {
         if let Clause::Term(term) = clause {
-            let expansions = service.synonym_expansions(term);
+            let expansions = expansion_cache
+                .entry(term.clone())
+                .or_insert_with(|| service.synonym_expansions(term));
             if !expansions.is_empty() {
-                full_text.synonyms.push((term.clone(), expansions));
+                full_text.synonyms.push((term.clone(), expansions.clone()));
             }
         }
     }

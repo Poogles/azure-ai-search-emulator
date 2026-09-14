@@ -180,7 +180,7 @@ suite (`make test`) green.
 
 ## 4. Error-handling / clone hygiene
 
-- [ ] **4.1 Storage/error conversions.** 6x
+- [x] **4.1 Storage/error conversions.** 6x
   `.map_err(|e| ApiError::not_found(e.to_string()))?` in `service/mod.rs`
   (`199,479,496,546,551,1387`) -> `storage_not_found()` or
   `impl From<StorageError> for ApiError`. 5x
@@ -188,15 +188,24 @@ suite (`make test`) green.
   (`146-155,218-226,249-257`) -> `engine_err()`. ~40x inline
   `ApiError::bad_request("InvalidQuery", format!(...))` in `parsing.rs`
   (+ `invalid_index!` in `validation.rs`) -> `invalid_query!()` macro or fns.
-- [ ] **4.2 `to_value_or_null`.** `service/types.rs:25-32`,
+  (Done via `From<StorageError> for ApiError`, `engine_err()` in `query`,
+  and `ApiError::invalid_query` / `invalid_index` constructors used
+  throughout `parsing.rs` + `validation.rs`.)
+- [x] **4.2 `to_value_or_null`.** `service/types.rs:25-32`,
   `synonyms.rs:99-107`, `continuation.rs:24-31`, `resources.rs:25-30` all do
   `to_value(self).unwrap_or(Value::Null)`. One
   `to_value_or_null<T: Serialize>()` in `error.rs` or `sync_util.rs`.
-- [ ] **4.3 `string_items` extension.** `service/parsing.rs:21-53`
+  (Done via `error::to_value_or_null`, used by `IndexingResultItem` and
+  `SynonymMap`; `NamedResource::to_value` is infallible by construction,
+  and the continuation string case is handled in 4.5.)
+- [x] **4.3 `string_items` extension.** `service/parsing.rs:21-53`
   `string_items` exists but each caller (`parse_orderby`, `parse_select`,
   `parse_facets`, `parse_search_fields`) re-does trim/filter loops. Add
   `string_items_or(value, name, per_item)` mapping helper.
-- [ ] **4.4 Owned-clone paths.** `service/mod.rs:1401-1406` `require_index()`
+  (Done via `string_items_or`; used in `parse_search_fields` + `highlight`,
+  redundant trim/empty removed from `parse_orderby`; `select`/`facets` keep
+  special handling — `*` early-return and option re-attachment.)
+- [x] **4.4 Owned-clone paths.** `service/mod.rs:1401-1406` `require_index()`
   clones the whole definition per request; `service/mod.rs:953-960` clones
   every hit twice; `service/mod.rs:1555-1590` rebuilds synonym expansions per
   clause; `service/mod.rs:1607-1610` + `parsing.rs:440` clone-then-parse;
@@ -205,24 +214,35 @@ suite (`make test`) green.
   refs through facet/paginate (clone only the page), precompute
   `lowered -> expansions` once per search, consume `Value` in
   `DocumentAction::from_value(Value)`. Document as intentional if kept.
-- [ ] **4.5 Continuation-token failure mode.** `service/continuation.rs:29`
+  (Synonym expansions cached per unique term; `execute_plan` moves hits out
+  of an owned map and `compute_facets` borrows scored pairs — no second
+  clone; `DocumentAction::from_value(Value)` + owned `batch_items` move
+  documents; `require_index` clone and storage lock clones documented as
+  intentional — small schemas, lock-free readers.)
+- [x] **4.5 Continuation-token failure mode.** `service/continuation.rs:29`
   `unwrap_or_default()` on serialize yields a decodable-but-stateless token
   that silently restarts paging. Make `decode` reject it (or
   `debug_assert` + empty string that `decode` rejects; `expect_used` is
   denied so no `expect`).
-- [ ] **4.6 Lossy/dead arms.** `vector/distance.rs:58-68` unreachable
+  (Encode uses `debug_assert` + empty-string fallback; `decode` rejects
+  empty tokens explicitly.)
+- [x] **4.6 Lossy/dead arms.** `vector/distance.rs:58-68` unreachable
   `DotProduct` score kept "total" -> `#[cfg(test)]` or explicit `NAN` +
   comment. `service/resources.rs:140-147` `conflict_kind()` collapses kinds to
   `"resource"` -> reuse `label()`; delete method. `service/mod.rs:1423`
   `KNOWN_ANALYZERS` alias -> inline canonical path. `filter/date.rs:205-235`
   two `#[allow(cast_precision_loss)]` -> `u64` parts + `i64` diffs at the
   boundary, cast once in `evaluate()`.
+  (DotProduct arm returns `NAN` with `debug_assert`; `conflict_kind`
+  deleted for `label()`; `KNOWN_ANALYZERS` alias inlined; date helpers
+  return `u64`/`i64` with a single `date_integer_to_number` cast.)
 
 ## Verification
 
-- [ ] **V.1** After each section: `make rust` (fmt, clippy `-D warnings`,
-  `cargo test --all-targets`).
-- [ ] **V.2** After sections 1, 2, 4 (API-visible paths): `make test` (Python
-  e2e) and `make test-csharp` (C# suite incl. fixture replay).
+- [x] **V.1** After each section: `make rust` (fmt, clippy `-D warnings`,
+  `cargo test --all-targets`). (Section 4: green — 196 Rust tests.)
+- [x] **V.2** After sections 1, 2, 4 (API-visible paths): `make test` (Python
+  e2e) and `make test-csharp` (C# suite incl. fixture replay). (Section 4:
+  Python 20/20, C# 92/92.)
 - [ ] **V.3** Final: `make all` (rust + docker + e2e) and confirm the image
   size is still under 20 MB.

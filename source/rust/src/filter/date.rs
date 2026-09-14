@@ -158,21 +158,34 @@ impl DateRef {
     }
 }
 
-/// Extracts a `datepart` calendar component as a number. All components fit
-/// exactly in an `f64` (year, month, day, ...), so the conversion is lossless.
-fn datepart_value(part: DatePart, dt: &DateTime<Utc>) -> f64 {
+/// Extracts a `datepart` calendar component as an integer. Parts are
+/// non-negative (year, month, day, ...), so `u64` is exact; the `f64`
+/// conversion happens once in `evaluate` at the `FilterValue` boundary.
+fn datepart_value(part: DatePart, dt: &DateTime<Utc>) -> u64 {
     match part {
-        DatePart::Year => f64::from(dt.year()),
-        DatePart::Quarter => f64::from(dt.month0() / 3 + 1),
-        DatePart::Month => f64::from(dt.month()),
-        DatePart::Week => f64::from(dt.iso_week().week()),
-        DatePart::Day => f64::from(dt.day()),
-        DatePart::Hour => f64::from(dt.hour()),
-        DatePart::Minute => f64::from(dt.minute()),
-        DatePart::Second => f64::from(dt.second()),
-        DatePart::DayOfWeek => f64::from(dt.weekday().num_days_from_sunday()),
-        DatePart::DayOfYear => f64::from(dt.ordinal()),
+        // Years in practice are positive; clamp the (unrepresentable in
+        // `u64`) negative range to 0 rather than failing the comparison.
+        DatePart::Year => u64::try_from(dt.year()).unwrap_or(0),
+        DatePart::Quarter => u64::from(dt.month0() / 3 + 1),
+        DatePart::Month => u64::from(dt.month()),
+        DatePart::Week => u64::from(dt.iso_week().week()),
+        DatePart::Day => u64::from(dt.day()),
+        DatePart::Hour => u64::from(dt.hour()),
+        DatePart::Minute => u64::from(dt.minute()),
+        DatePart::Second => u64::from(dt.second()),
+        DatePart::DayOfWeek => u64::from(dt.weekday().num_days_from_sunday()),
+        DatePart::DayOfYear => u64::from(dt.ordinal()),
     }
+}
+
+/// Converts an exact integer date component to `f64` for filter comparison.
+/// Calendar parts (<= ~262k for years, <= 366 otherwise) and `datediff`
+/// results (at most ~8e12 seconds for chrono's date range) fit exactly in
+/// `f64`'s 2^52 integer precision; the cast lives here alone so the helpers
+/// above stay exact integers.
+#[allow(clippy::cast_precision_loss)]
+fn date_integer_to_number(value: i64) -> f64 {
+    value as f64
 }
 
 /// Shifts a date by `interval` `unit`s, returning the normalized ISO-8601
@@ -203,33 +216,30 @@ fn dateadd_value(unit: DateUnit, interval: i64, dt: &DateTime<Utc>) -> Option<St
 }
 
 /// Computes the whole `unit`s between `start` and `end` (truncated toward
-/// zero, matching Azure's `datediff`). Calendar units count month/year
-/// boundaries; clock units divide the exact duration. Results always fit
-/// exactly in an `f64` (chrono's date range spans ~262k years, at most ~8e12
-/// seconds, far below the 2^52 exact-integer limit).
-fn datediff_value(unit: DateUnit, start: &DateTime<Utc>, end: &DateTime<Utc>) -> f64 {
-    #[allow(clippy::cast_precision_loss)]
-    let as_number = |value: i64| value as f64;
+/// zero, matching Azure's `datediff`) as an exact integer. Calendar units
+/// count month/year boundaries; clock units divide the exact duration. The
+/// `f64` conversion happens once in `evaluate` at the `FilterValue` boundary.
+fn datediff_value(unit: DateUnit, start: &DateTime<Utc>, end: &DateTime<Utc>) -> i64 {
     match unit {
         DateUnit::Year | DateUnit::Quarter | DateUnit::Month => {
             let months = (i64::from(end.year()) - i64::from(start.year())) * 12
                 + i64::from(end.month())
                 - i64::from(start.month());
-            as_number(match unit {
+            match unit {
                 DateUnit::Year => months.div_euclid(12),
                 DateUnit::Quarter => months.div_euclid(3),
                 _ => months,
-            })
+            }
         }
         _ => {
             let duration = *end - *start;
-            as_number(match unit {
+            match unit {
                 DateUnit::Week => duration.num_weeks(),
                 DateUnit::Day => duration.num_days(),
                 DateUnit::Hour => duration.num_hours(),
                 DateUnit::Minute => duration.num_minutes(),
                 _ => duration.num_seconds(),
-            })
+            }
         }
     }
 }
@@ -243,7 +253,11 @@ impl DateExpr {
         match self {
             DateExpr::DatePart { part, field } => {
                 let dt = resolve_datetime(fields, field)?;
-                Some(FilterValue::Number(datepart_value(*part, &dt)))
+                let value = datepart_value(*part, &dt);
+                // Parts are tiny (years excepted, still << 2^52); the
+                // `u64 -> i64` narrowing cannot fail in practice.
+                let as_i64 = i64::try_from(value).unwrap_or(i64::MAX);
+                Some(FilterValue::Number(date_integer_to_number(as_i64)))
             }
             DateExpr::DateAdd {
                 unit,
@@ -256,9 +270,9 @@ impl DateExpr {
             DateExpr::DateDiff { unit, start, end } => {
                 let start_dt = start.resolve(fields)?;
                 let end_dt = end.resolve(fields)?;
-                Some(FilterValue::Number(datediff_value(
+                Some(FilterValue::Number(date_integer_to_number(datediff_value(
                     *unit, &start_dt, &end_dt,
-                )))
+                ))))
             }
             DateExpr::UtcDateTime(iso) => Some(FilterValue::String(iso.clone())),
         }

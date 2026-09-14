@@ -6,23 +6,25 @@ use crate::storage::Document;
 
 use super::types::Facet;
 
-/// Computes facet counts over the full (filtered, ordered) result set: one
+/// Computes facet counts over the full (filtered, ordered) scored set: one
 /// entry per distinct value, ordered by count descending then value ascending,
 /// truncated to the facet's limit when one is given. The special `$count`
-/// facet reports the total number of documents in the result set.
-pub(crate) fn compute_facets(documents: &[Document], facets: &[Facet]) -> Value {
+/// facet reports the total number of documents in the result set. Takes the
+/// scored `(document, score)` pairs by reference so callers avoid cloning the
+/// matched set a second time; scores are ignored.
+pub(crate) fn compute_facets(scored: &[(Document, f32)], facets: &[Facet]) -> Value {
     let mut map = Map::new();
     for facet in facets {
         if facet.field == "$count" {
             map.insert(
                 facet.field.clone(),
-                Value::from(u64::try_from(documents.len()).unwrap_or(u64::MAX)),
+                Value::from(u64::try_from(scored.len()).unwrap_or(u64::MAX)),
             );
             continue;
         }
         let mut counts: std::collections::BTreeMap<String, (FacetValue, u64)> =
             std::collections::BTreeMap::new();
-        for document in documents {
+        for (document, _) in scored {
             let Some(value) = document.fields.get(&facet.field) else {
                 continue;
             };

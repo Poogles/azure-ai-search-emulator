@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use crate::error::{ApiError, ErrorCode};
+use crate::error::ApiError;
 use crate::storage::{Document, FieldDefinition, FieldType, IndexDefinition};
 use crate::vector::parse_vector_search;
 
@@ -51,7 +51,7 @@ fn ensure_unique<'a>(
     message: impl FnOnce() -> String,
 ) -> Result<(), ApiError> {
     if !seen.insert(name) {
-        return Err(ApiError::bad_request(ErrorCode::InvalidIndex, message()));
+        return Err(ApiError::invalid_index(message()));
     }
     Ok(())
 }
@@ -69,20 +69,16 @@ pub(crate) fn validate_schema(
         })?;
         if field.is_key {
             if field.is_complex_type() {
-                return Err(ApiError::bad_request(
-                    ErrorCode::InvalidIndex,
-                    format!(
-                        "Field {:?} cannot be the key: complex type fields cannot be keys.",
-                        field.name
-                    ),
-                ));
+                return Err(ApiError::invalid_index(format!(
+                    "Field {:?} cannot be the key: complex type fields cannot be keys.",
+                    field.name
+                )));
             }
             key_count += 1;
         }
         if field.is_complex_type() {
             if field.searchable || field.sortable || field.facetable {
-                return Err(ApiError::bad_request(
-                    ErrorCode::InvalidIndex,
+                return Err(ApiError::invalid_index(
                     format!(
                         "Field {:?} is a complex type and cannot be searchable, sortable, or facetable; \
                          set those attributes on its subfields instead.",
@@ -92,26 +88,22 @@ pub(crate) fn validate_schema(
             }
             validate_subfields(field)?;
         } else if !SUPPORTED_FIELD_TYPES.contains(&field.field_type) {
-            return Err(ApiError::bad_request(
-                ErrorCode::InvalidIndex,
-                format!(
-                    "Unsupported field type {:?} for field {:?}. Supported types: {}, Edm.ComplexType.",
-                    field.field_type.as_str(),
-                    field.name,
-                    SUPPORTED_FIELD_TYPES
-                        .iter()
-                        .map(FieldType::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            ));
+            return Err(ApiError::invalid_index(format!(
+                "Unsupported field type {:?} for field {:?}. Supported types: {}, Edm.ComplexType.",
+                field.field_type.as_str(),
+                field.name,
+                SUPPORTED_FIELD_TYPES
+                    .iter()
+                    .map(FieldType::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         }
     }
     if key_count != 1 {
-        return Err(ApiError::bad_request(
-            ErrorCode::InvalidIndex,
-            format!("Index schema must define exactly one key field; found {key_count}."),
-        ));
+        return Err(ApiError::invalid_index(format!(
+            "Index schema must define exactly one key field; found {key_count}."
+        )));
     }
     validate_suggesters(definition)?;
     validate_vector_search_config(definition)?;
@@ -127,8 +119,7 @@ pub(crate) fn validate_vector_field(
         return Ok(());
     }
     if !field.field_type.is_vector_field_type() {
-        return Err(ApiError::bad_request(
-            ErrorCode::InvalidIndex,
+        return Err(ApiError::invalid_index(
             format!(
                 "Unsupported vector field type {:?} for field {:?}; only 'Collection(Edm.Single)' and 'Collection(Edm.Half)' are supported.",
                 field.field_type.as_str(), field.name
@@ -143,13 +134,10 @@ pub(crate) fn validate_vector_field(
                 .get("dimensions")
                 .or_else(|| field.raw.get("vector_search_dimensions"))
                 .map_or("missing".to_owned(), Value::to_string);
-            return Err(ApiError::bad_request(
-                ErrorCode::InvalidIndex,
-                format!(
-                    "Vector field {:?} has invalid dimensions {raw}; must be 1-{max_dimension}.",
-                    field.name
-                ),
-            ));
+            return Err(ApiError::invalid_index(format!(
+                "Vector field {:?} has invalid dimensions {raw}; must be 1-{max_dimension}.",
+                field.name
+            )));
         }
     }
     if field
@@ -157,28 +145,22 @@ pub(crate) fn validate_vector_field(
         .as_deref()
         .is_none_or(str::is_empty)
     {
-        return Err(ApiError::bad_request(
-            ErrorCode::InvalidIndex,
-            format!(
-                "Vector field {:?} is missing required \"vectorSearchProfile\".",
-                field.name
-            ),
-        ));
+        return Err(ApiError::invalid_index(format!(
+            "Vector field {:?} is missing required \"vectorSearchProfile\".",
+            field.name
+        )));
     }
     if !field.searchable {
-        return Err(ApiError::bad_request(
-            ErrorCode::InvalidIndex,
-            format!(
-                "Vector field {:?} must be searchable; set \"searchable\": true.",
-                field.name
-            ),
-        ));
+        return Err(ApiError::invalid_index(format!(
+            "Vector field {:?} must be searchable; set \"searchable\": true.",
+            field.name
+        )));
     }
     if field.is_key {
-        return Err(ApiError::bad_request(
-            ErrorCode::InvalidIndex,
-            format!("Vector field {:?} cannot be the key.", field.name),
-        ));
+        return Err(ApiError::invalid_index(format!(
+            "Vector field {:?} cannot be the key.",
+            field.name
+        )));
     }
     for (attribute, set) in [
         ("filterable", field.filterable),
@@ -186,10 +168,10 @@ pub(crate) fn validate_vector_field(
         ("facetable", field.facetable),
     ] {
         if set {
-            return Err(ApiError::bad_request(
-                ErrorCode::InvalidIndex,
-                format!("Vector field {:?} cannot be {attribute}.", field.name),
-            ));
+            return Err(ApiError::invalid_index(format!(
+                "Vector field {:?} cannot be {attribute}.",
+                field.name
+            )));
         }
     }
     Ok(())
@@ -202,15 +184,12 @@ pub(crate) fn validate_vector_search_config(definition: &IndexDefinition) -> Res
         .filter(|f| f.is_vector_field())
         .collect();
     if vector_fields.len() > crate::vector::MAX_VECTOR_FIELDS {
-        return Err(ApiError::bad_request(
-            ErrorCode::InvalidIndex,
-            format!(
-                "Index {:?} has {} vector fields; at most {} are supported.",
-                definition.name,
-                vector_fields.len(),
-                crate::vector::MAX_VECTOR_FIELDS
-            ),
-        ));
+        return Err(ApiError::invalid_index(format!(
+            "Index {:?} has {} vector fields; at most {} are supported.",
+            definition.name,
+            vector_fields.len(),
+            crate::vector::MAX_VECTOR_FIELDS
+        )));
     }
     if vector_fields.is_empty() {
         return Ok(());
@@ -223,26 +202,20 @@ pub(crate) fn validate_vector_search_config(definition: &IndexDefinition) -> Res
         .and_then(Value::as_array)
         .is_some_and(|profiles| !profiles.is_empty());
     if !has_profiles {
-        return Err(ApiError::bad_request(
-            ErrorCode::InvalidIndex,
-            format!(
-                "Index {:?} has vector fields but no vectorSearch configuration.",
-                definition.name
-            ),
-        ));
+        return Err(ApiError::invalid_index(format!(
+            "Index {:?} has vector fields but no vectorSearch configuration.",
+            definition.name
+        )));
     }
-    let config = parse_vector_search(definition.vector_search.as_ref())
-        .map_err(|message| ApiError::bad_request(ErrorCode::InvalidIndex, message))?;
+    let config =
+        parse_vector_search(definition.vector_search.as_ref()).map_err(ApiError::invalid_index)?;
     for field in vector_fields {
         let profile = field.vector_search_profile.clone().unwrap_or_default();
         if !config.profiles.contains_key(&profile) {
-            return Err(ApiError::bad_request(
-                ErrorCode::InvalidIndex,
-                format!(
-                    "Vector field {:?} references unknown vector search profile {profile:?}.",
-                    field.name
-                ),
-            ));
+            return Err(ApiError::invalid_index(format!(
+                "Vector field {:?} references unknown vector search profile {profile:?}.",
+                field.name
+            )));
         }
     }
     Ok(())
@@ -258,33 +231,24 @@ pub(crate) fn validate_suggesters(definition: &IndexDefinition) -> Result<(), Ap
             )
         })?;
         if suggester.search_fields.is_empty() {
-            return Err(ApiError::bad_request(
-                ErrorCode::InvalidIndex,
-                format!(
-                    "Suggester {:?} must define a non-empty \"searchFields\" array.",
-                    suggester.name
-                ),
-            ));
+            return Err(ApiError::invalid_index(format!(
+                "Suggester {:?} must define a non-empty \"searchFields\" array.",
+                suggester.name
+            )));
         }
         for field_name in &suggester.search_fields {
             let field_def = definition.field_path(field_name).ok_or_else(|| {
-                ApiError::bad_request(
-                    ErrorCode::InvalidIndex,
-                    format!(
-                        "Suggester {:?} references unknown field {:?}.",
-                        suggester.name, field_name
-                    ),
-                )
+                ApiError::invalid_index(format!(
+                    "Suggester {:?} references unknown field {:?}.",
+                    suggester.name, field_name
+                ))
             })?;
             if !field_def.searchable {
-                return Err(ApiError::bad_request(
-                    ErrorCode::InvalidIndex,
-                    format!(
-                        "Suggester {:?} references field {:?}, which is not searchable; \
+                return Err(ApiError::invalid_index(format!(
+                    "Suggester {:?} references field {:?}, which is not searchable; \
                          mark it \"searchable\": true in the index schema.",
-                        suggester.name, field_name
-                    ),
-                ));
+                    suggester.name, field_name
+                )));
             }
         }
     }
@@ -293,13 +257,10 @@ pub(crate) fn validate_suggesters(definition: &IndexDefinition) -> Result<(), Ap
 
 pub(crate) fn validate_subfields(field: &FieldDefinition) -> Result<(), ApiError> {
     if field.subfields.is_empty() {
-        return Err(ApiError::bad_request(
-            ErrorCode::InvalidIndex,
-            format!(
-                "Complex type field {:?} must define a non-empty \"fields\" array of subfields.",
-                field.name
-            ),
-        ));
+        return Err(ApiError::invalid_index(format!(
+            "Complex type field {:?} must define a non-empty \"fields\" array of subfields.",
+            field.name
+        )));
     }
     let mut seen = std::collections::BTreeSet::new();
     for subfield in &field.subfields {
@@ -310,34 +271,25 @@ pub(crate) fn validate_subfields(field: &FieldDefinition) -> Result<(), ApiError
             )
         })?;
         if subfield.is_key {
-            return Err(ApiError::bad_request(
-                ErrorCode::InvalidIndex,
-                format!(
-                    "Subfield {:?} of complex type field {:?} cannot be a key.",
-                    subfield.name, field.name
-                ),
-            ));
+            return Err(ApiError::invalid_index(format!(
+                "Subfield {:?} of complex type field {:?} cannot be a key.",
+                subfield.name, field.name
+            )));
         }
         if subfield.has_dimensions_property() || subfield.vector_search_profile.is_some() {
-            return Err(ApiError::bad_request(
-                ErrorCode::InvalidIndex,
-                format!(
-                    "Subfield {:?} of complex type field {:?} cannot be a vector field.",
-                    subfield.name, field.name
-                ),
-            ));
+            return Err(ApiError::invalid_index(format!(
+                "Subfield {:?} of complex type field {:?} cannot be a vector field.",
+                subfield.name, field.name
+            )));
         }
         if !SUPPORTED_FIELD_TYPES.contains(&subfield.field_type) {
-            return Err(ApiError::bad_request(
-                ErrorCode::InvalidIndex,
-                format!(
-                    "Unsupported subfield type {:?} for subfield {:?} of complex type field {:?}. \
+            return Err(ApiError::invalid_index(format!(
+                "Unsupported subfield type {:?} for subfield {:?} of complex type field {:?}. \
                      Subfields must be scalar or collection-of-scalar types.",
-                    subfield.field_type.as_str(),
-                    subfield.name,
-                    field.name
-                ),
-            ));
+                subfield.field_type.as_str(),
+                subfield.name,
+                field.name
+            )));
         }
     }
     Ok(())

@@ -11,8 +11,7 @@ use super::types::{Facet, OrderBy, SearchField, VectorFilterMode, VectorQuery};
 use super::validation::{finite_f32, parse_finite_f32_array, FiniteF32ArrayError};
 
 pub(crate) fn parse_filter_option(raw: &str) -> Result<FilterExpr, ApiError> {
-    filter::parse_filter(raw)
-        .map_err(|e| ApiError::bad_request(ErrorCode::InvalidQuery, format!("Invalid filter: {e}")))
+    filter::parse_filter(raw).map_err(|e| ApiError::invalid_query(format!("Invalid filter: {e}")))
 }
 
 /// Extracts a list of comma-separated items from a search option value. The
@@ -36,20 +35,33 @@ pub(crate) fn string_items(value: &Value, name: &str) -> Result<Vec<String>, Api
                         }
                     }
                     None => {
-                        return Err(ApiError::bad_request(
-                            ErrorCode::InvalidQuery,
-                            format!("{name} must be a string or an array of strings."),
-                        ))
+                        return Err(ApiError::invalid_query(format!(
+                            "{name} must be a string or an array of strings."
+                        )))
                     }
                 }
             }
             Ok(out)
         }
-        _ => Err(ApiError::bad_request(
-            ErrorCode::InvalidQuery,
-            format!("{name} must be a string or an array of strings."),
-        )),
+        _ => Err(ApiError::invalid_query(format!(
+            "{name} must be a string or an array of strings."
+        ))),
     }
+}
+
+/// Maps each comma-separated item from a search option value through
+/// `per_item`, collecting the results. `string_items` already trims and drops
+/// empties, so `per_item` sees only non-empty items and callers must not
+/// re-trim or re-filter.
+pub(crate) fn string_items_or<T>(
+    value: &Value,
+    name: &str,
+    per_item: impl FnMut(String) -> Result<T, ApiError>,
+) -> Result<Vec<T>, ApiError> {
+    string_items(value, name)?
+        .into_iter()
+        .map(per_item)
+        .collect()
 }
 
 /// Parses an `orderby` value: comma-separated `field [asc|desc]` clauses (or
@@ -61,43 +73,34 @@ pub(crate) fn parse_orderby(
     value: &Value,
     definition: &IndexDefinition,
 ) -> Result<(Vec<OrderBy>, String), ApiError> {
+    // `string_items` already trims and drops empties; `part` needs no
+    // re-trim or empty check here.
     let parts = string_items(value, "orderby")?;
     let mut clauses = Vec::new();
     for part in &parts {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
         let tokens: Vec<&str> = part.split_whitespace().collect();
         let (field, direction) = match tokens.as_slice() {
             [field] => (*field, "asc"),
             [field, direction] => (*field, *direction),
             _ => {
-                return Err(ApiError::bad_request(
-                    ErrorCode::InvalidQuery,
-                    format!(
-                        "Invalid orderby clause {part:?}: expected 'field' or 'field asc|desc'."
-                    ),
-                ))
+                return Err(ApiError::invalid_query(format!(
+                    "Invalid orderby clause {part:?}: expected 'field' or 'field asc|desc'."
+                )))
             }
         };
         if field.is_empty() {
-            return Err(ApiError::bad_request(
-                ErrorCode::InvalidQuery,
-                format!("Invalid orderby clause {part:?}: missing field name."),
-            ));
+            return Err(ApiError::invalid_query(format!(
+                "Invalid orderby clause {part:?}: missing field name."
+            )));
         }
         let descending = match direction.to_ascii_lowercase().as_str() {
             "asc" => false,
             "desc" => true,
             other => {
-                return Err(ApiError::bad_request(
-                    ErrorCode::InvalidQuery,
-                    format!(
-                        "Invalid orderby clause {part:?}: expected direction 'asc' or 'desc', \
+                return Err(ApiError::invalid_query(format!(
+                    "Invalid orderby clause {part:?}: expected direction 'asc' or 'desc', \
                          found {other:?}."
-                    ),
-                ))
+                )))
             }
         };
         // `@search.score` is not a schema field: it orders by relevance score
@@ -110,18 +113,12 @@ pub(crate) fn parse_orderby(
             continue;
         }
         let field_def = definition.field(field).ok_or_else(|| {
-            ApiError::bad_request(
-                ErrorCode::InvalidQuery,
-                format!("orderby references unknown field {field:?}."),
-            )
+            ApiError::invalid_query(format!("orderby references unknown field {field:?}."))
         })?;
         if !field_def.sortable {
-            return Err(ApiError::bad_request(
-                ErrorCode::InvalidQuery,
-                format!(
-                    "Field {field:?} is not sortable; mark it \"sortable\": true in the index schema."
-                ),
-            ));
+            return Err(ApiError::invalid_query(format!(
+                "Field {field:?} is not sortable; mark it \"sortable\": true in the index schema."
+            )));
         }
         clauses.push(OrderBy {
             field: field.to_owned(),
@@ -129,10 +126,7 @@ pub(crate) fn parse_orderby(
         });
     }
     if clauses.is_empty() {
-        return Err(ApiError::bad_request(
-            ErrorCode::InvalidQuery,
-            "orderby is empty.",
-        ));
+        return Err(ApiError::invalid_query("orderby is empty."));
     }
     Ok((clauses, parts.join(", ")))
 }
@@ -151,18 +145,14 @@ pub(crate) fn parse_select(
     let mut fields = Vec::new();
     for part in items {
         if definition.field(&part).is_none() {
-            return Err(ApiError::bad_request(
-                ErrorCode::InvalidQuery,
-                format!("select references unknown field {part:?}."),
-            ));
+            return Err(ApiError::invalid_query(format!(
+                "select references unknown field {part:?}."
+            )));
         }
         fields.push(part);
     }
     if fields.is_empty() {
-        return Err(ApiError::bad_request(
-            ErrorCode::InvalidQuery,
-            "select is empty.",
-        ));
+        return Err(ApiError::invalid_query("select is empty."));
     }
     Ok(fields)
 }
@@ -187,10 +177,7 @@ pub(crate) fn parse_facets(
         parse_facet_entry(&part, definition, &mut facets)?;
     }
     if facets.is_empty() {
-        return Err(ApiError::bad_request(
-            ErrorCode::InvalidQuery,
-            "facets is empty.",
-        ));
+        return Err(ApiError::invalid_query("facets is empty."));
     }
     Ok(facets)
 }
@@ -233,16 +220,12 @@ pub(crate) fn parse_facet_entry(
     for option in pieces {
         let option = option.trim();
         let Some((key, arg)) = option.split_once(':') else {
-            return Err(ApiError::bad_request(
-                ErrorCode::InvalidQuery,
-                format!(
-                    "Invalid facet option {option:?} in {part:?}; expected 'count:N' or 'top:N'."
-                ),
-            ));
+            return Err(ApiError::invalid_query(format!(
+                "Invalid facet option {option:?} in {part:?}; expected 'count:N' or 'top:N'."
+            )));
         };
         let count: u64 = arg.trim().parse().map_err(|_| {
-            ApiError::bad_request(
-                ErrorCode::InvalidQuery,
+            ApiError::invalid_query(
                 format!(
                     "Invalid facet option {option:?} in {part:?}; the count must be a non-negative integer."
                 ),
@@ -252,8 +235,7 @@ pub(crate) fn parse_facet_entry(
         match key {
             "count" | "top" => limit = Some(n),
             other => {
-                return Err(ApiError::bad_request(
-                    ErrorCode::InvalidQuery,
+                return Err(ApiError::invalid_query(
                     format!(
                         "Unsupported facet option {other:?} in {part:?}; supported options: count:N, top:N."
                     ),
@@ -272,10 +254,9 @@ pub(crate) fn parse_facet_entry(
         }
     } else if name == "$count" {
         if limit.is_some() {
-            return Err(ApiError::bad_request(
-                ErrorCode::InvalidQuery,
-                format!("The $count facet does not take options (got {part:?})."),
-            ));
+            return Err(ApiError::invalid_query(format!(
+                "The $count facet does not take options (got {part:?})."
+            )));
         }
         facets.push(Facet {
             field: "$count".to_owned(),
@@ -283,18 +264,12 @@ pub(crate) fn parse_facet_entry(
         });
     } else {
         let field_def = definition.field(name).ok_or_else(|| {
-            ApiError::bad_request(
-                ErrorCode::InvalidQuery,
-                format!("facets references unknown field {name:?}."),
-            )
+            ApiError::invalid_query(format!("facets references unknown field {name:?}."))
         })?;
         if !field_def.facetable {
-            return Err(ApiError::bad_request(
-                ErrorCode::InvalidQuery,
-                format!(
-                    "Field {name:?} is not facetable; mark it \"facetable\": true in the index schema."
-                ),
-            ));
+            return Err(ApiError::invalid_query(format!(
+                "Field {name:?} is not facetable; mark it \"facetable\": true in the index schema."
+            )));
         }
         facets.push(Facet {
             field: name.to_owned(),
@@ -314,11 +289,8 @@ pub(crate) fn parse_facet_entry(
 pub(crate) fn parse_search_mode(obj: &Map<String, Value>) -> Result<SearchMode, ApiError> {
     match obj.get("searchMode").or_else(|| obj.get("search_mode")) {
         None | Some(Value::Null) => Ok(SearchMode::default()),
-        Some(Value::String(mode)) => {
-            SearchMode::parse(mode).map_err(|e| ApiError::bad_request(ErrorCode::InvalidQuery, e))
-        }
-        Some(_) => Err(ApiError::bad_request(
-            ErrorCode::InvalidQuery,
+        Some(Value::String(mode)) => SearchMode::parse(mode).map_err(ApiError::invalid_query),
+        Some(_) => Err(ApiError::invalid_query(
             "searchMode must be 'all' or 'any'.",
         )),
     }
@@ -335,23 +307,18 @@ pub(crate) fn parse_paging_options(
     obj: &Map<String, Value>,
 ) -> Result<(bool, Option<u64>, u64), ApiError> {
     let count = obj.get("count").and_then(Value::as_bool).unwrap_or(false);
-    let top = match obj.get("top") {
-        None => None,
-        Some(value) => Some(value.as_u64().ok_or_else(|| {
-            ApiError::bad_request(
-                ErrorCode::InvalidQuery,
-                "\"top\" must be a non-negative integer.",
-            )
-        })?),
-    };
+    let top =
+        match obj.get("top") {
+            None => None,
+            Some(value) => Some(value.as_u64().ok_or_else(|| {
+                ApiError::invalid_query("\"top\" must be a non-negative integer.")
+            })?),
+        };
     let skip = match obj.get("skip") {
         None => 0,
-        Some(value) => value.as_u64().ok_or_else(|| {
-            ApiError::bad_request(
-                ErrorCode::InvalidQuery,
-                "\"skip\" must be a non-negative integer.",
-            )
-        })?,
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| ApiError::invalid_query("\"skip\" must be a non-negative integer."))?,
     };
     Ok((count, top, skip))
 }
@@ -400,15 +367,11 @@ pub(crate) fn parse_vector_filter_mode(
     match value {
         None | Some(Value::Null) => Ok(VectorFilterMode::PostFilter),
         Some(Value::String(mode)) => VectorFilterMode::parse(mode).ok_or_else(|| {
-            ApiError::bad_request(
-                ErrorCode::InvalidQuery,
-                format!(
-                    "Invalid vectorFilterMode {mode:?}; supported values: 'preFilter', 'postFilter'."
-                ),
-            )
+            ApiError::invalid_query(format!(
+                "Invalid vectorFilterMode {mode:?}; supported values: 'preFilter', 'postFilter'."
+            ))
         }),
-        Some(_) => Err(ApiError::bad_request(
-            ErrorCode::InvalidQuery,
+        Some(_) => Err(ApiError::invalid_query(
             "vectorFilterMode must be 'preFilter' or 'postFilter'.",
         )),
     }
@@ -434,17 +397,16 @@ pub(crate) fn parse_vector_queries(
     if raw.is_null() {
         return Ok((Vec::new(), None));
     }
-    let entries = raw.as_array().ok_or_else(|| {
-        ApiError::bad_request(ErrorCode::InvalidQuery, "vectorQueries must be an array.")
-    })?;
+    let entries = raw
+        .as_array()
+        .ok_or_else(|| ApiError::invalid_query("vectorQueries must be an array."))?;
     if entries.is_empty() {
         return Ok((Vec::new(), None));
     }
     if entries.len() > MAX_VECTOR_QUERIES {
-        return Err(ApiError::bad_request(
-            ErrorCode::InvalidQuery,
-            format!("At most {MAX_VECTOR_QUERIES} vector queries are supported."),
-        ));
+        return Err(ApiError::invalid_query(format!(
+            "At most {MAX_VECTOR_QUERIES} vector queries are supported."
+        )));
     }
     let mut queries = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -462,10 +424,7 @@ pub(crate) fn parse_vector_query(
     definition: &IndexDefinition,
 ) -> Result<VectorQuery, ApiError> {
     let obj = entry.as_object().ok_or_else(|| {
-        ApiError::bad_request(
-            ErrorCode::InvalidQuery,
-            "Each vectorQueries entry must be a JSON object.",
-        )
+        ApiError::invalid_query("Each vectorQueries entry must be a JSON object.")
     })?;
     match obj.get("kind").and_then(Value::as_str) {
         None | Some("vector") => {}
@@ -476,10 +435,9 @@ pub(crate) fn parse_vector_query(
             ));
         }
         Some(other) => {
-            return Err(ApiError::bad_request(
-                ErrorCode::InvalidQuery,
-                format!("Invalid vector query kind {other:?}; supported kinds: 'vector'."),
-            ));
+            return Err(ApiError::invalid_query(format!(
+                "Invalid vector query kind {other:?}; supported kinds: 'vector'."
+            )));
         }
     }
     let fields = VectorFieldSet::parse(obj, definition)?;
@@ -516,10 +474,7 @@ fn parse_vector_k(obj: &Map<String, Value>) -> Result<usize, ApiError> {
             .and_then(|n| usize::try_from(n).ok())
             .filter(|n| *n >= 1 && *n <= MAX_VECTOR_K)
             .ok_or_else(|| {
-                ApiError::bad_request(
-                    ErrorCode::InvalidQuery,
-                    "Vector query 'k' must be a positive integer (max 1000).",
-                )
+                ApiError::invalid_query("Vector query 'k' must be a positive integer (max 1000).")
             }),
     }
 }
@@ -527,12 +482,8 @@ fn parse_vector_k(obj: &Map<String, Value>) -> Result<usize, ApiError> {
 /// Parses a vector query's `weight`: a finite positive number (default
 /// `1.0` when absent).
 fn parse_vector_weight(obj: &Map<String, Value>) -> Result<f32, ApiError> {
-    let invalid = || {
-        ApiError::bad_request(
-            ErrorCode::InvalidQuery,
-            "Vector query 'weight' must be a finite positive number.",
-        )
-    };
+    let invalid =
+        || ApiError::invalid_query("Vector query 'weight' must be a finite positive number.");
     match obj.get("weight") {
         None | Some(Value::Null) => Ok(1.0),
         Some(value) => {
@@ -563,18 +514,12 @@ impl VectorFieldSet {
     /// Parses a vector query's `fields`: every entry must be a vector field
     /// in the schema.
     fn parse(obj: &Map<String, Value>, definition: &IndexDefinition) -> Result<Self, ApiError> {
-        let fields_value = obj.get("fields").ok_or_else(|| {
-            ApiError::bad_request(
-                ErrorCode::InvalidQuery,
-                "Each vector query must define \"fields\".",
-            )
-        })?;
+        let fields_value = obj
+            .get("fields")
+            .ok_or_else(|| ApiError::invalid_query("Each vector query must define \"fields\"."))?;
         let names = string_items(fields_value, "vector query fields")?;
         if names.is_empty() {
-            return Err(ApiError::bad_request(
-                ErrorCode::InvalidQuery,
-                "Vector query \"fields\" is empty.",
-            ));
+            return Err(ApiError::invalid_query("Vector query \"fields\" is empty."));
         }
         let mut dim: Option<usize> = None;
         for name in &names {
@@ -582,21 +527,17 @@ impl VectorFieldSet {
                 .field(name)
                 .filter(|f| f.is_vector_field())
                 .ok_or_else(|| {
-                    ApiError::bad_request(
-                        ErrorCode::InvalidQuery,
-                        format!(
-                            "Vector query field {name:?} is not a vector field in index {:?}.",
-                            definition.name
-                        ),
-                    )
+                    ApiError::invalid_query(format!(
+                        "Vector query field {name:?} is not a vector field in index {:?}.",
+                        definition.name
+                    ))
                 })?;
             let dimensions = field_def.vector_dimensions.unwrap_or(0);
             match dim {
                 None => dim = Some(dimensions),
                 Some(d) if d == dimensions => {}
                 Some(d) => {
-                    return Err(ApiError::bad_request(
-                        ErrorCode::InvalidQuery,
+                    return Err(ApiError::invalid_query(
                         format!(
                             "Vector query targets fields with different dimensions ({d} vs {dimensions})."
                         ),
@@ -613,17 +554,11 @@ impl VectorFieldSet {
     /// Parses the query's `vector` against this field set: an array of
     /// finite numbers whose length matches the shared dimension.
     fn parse_vector(&self, obj: &Map<String, Value>) -> Result<Vec<f32>, ApiError> {
-        let raw_vector = obj.get("vector").ok_or_else(|| {
-            ApiError::bad_request(
-                ErrorCode::InvalidQuery,
-                "Each vector query must define \"vector\".",
-            )
-        })?;
+        let raw_vector = obj
+            .get("vector")
+            .ok_or_else(|| ApiError::invalid_query("Each vector query must define \"vector\"."))?;
         let items = raw_vector.as_array().ok_or_else(|| {
-            ApiError::bad_request(
-                ErrorCode::InvalidQuery,
-                "Vector query \"vector\" must be an array of numbers.",
-            )
+            ApiError::invalid_query("Vector query \"vector\" must be an array of numbers.")
         })?;
         self.check_vector_len(items.len())?;
         parse_finite_f32_array(items).map_err(|error| {
@@ -637,22 +572,19 @@ impl VectorFieldSet {
                     self.first_field()
                 ),
             };
-            ApiError::bad_request(ErrorCode::InvalidQuery, message)
+            ApiError::invalid_query(message)
         })
     }
 
     /// Checks a vector's length against the shared dimension.
     fn check_vector_len(&self, len: usize) -> Result<(), ApiError> {
         if len != self.dim {
-            return Err(ApiError::bad_request(
-                ErrorCode::InvalidQuery,
-                format!(
-                    "Vector query for {:?} has dimension {}, expected {}.",
-                    self.first_field(),
-                    len,
-                    self.dim
-                ),
-            ));
+            return Err(ApiError::invalid_query(format!(
+                "Vector query for {:?} has dimension {}, expected {}.",
+                self.first_field(),
+                len,
+                self.dim
+            )));
         }
         Ok(())
     }
@@ -671,63 +603,48 @@ pub(crate) fn parse_search_fields(
     value: &Value,
     definition: &IndexDefinition,
 ) -> Result<Vec<SearchField>, ApiError> {
-    let mut fields = Vec::new();
-    for part in string_items(value, "searchFields")? {
+    let fields = string_items_or(value, "searchFields", |part| {
         let (name_part, weight) = match part.split_once('^') {
             None => (part.as_str(), 1.0),
             Some((name, raw_weight)) => {
                 let weight: f32 = raw_weight.trim().parse().map_err(|_| {
-                    ApiError::bad_request(
-                        ErrorCode::InvalidQuery,
-                        format!(
-                            "Invalid searchFields weight in {part:?}; \
+                    ApiError::invalid_query(format!(
+                        "Invalid searchFields weight in {part:?}; \
                              expected a positive number (e.g. 'field^2')."
-                        ),
-                    )
+                    ))
                 })?;
                 if !is_finite_positive(weight) {
-                    return Err(ApiError::bad_request(
-                        ErrorCode::InvalidQuery,
-                        format!(
-                            "Invalid searchFields weight in {part:?}; \
+                    return Err(ApiError::invalid_query(format!(
+                        "Invalid searchFields weight in {part:?}; \
                              expected a finite positive number."
-                        ),
-                    ));
+                    )));
                 }
                 (name, weight)
             }
         };
         let name = name_part.trim();
         let field_def = definition.field_path(name).ok_or_else(|| {
-            ApiError::bad_request(
-                ErrorCode::InvalidQuery,
-                format!("searchFields references unknown field {name:?}."),
-            )
+            ApiError::invalid_query(format!("searchFields references unknown field {name:?}."))
         })?;
         if !field_def.searchable {
-            return Err(ApiError::bad_request(
-                ErrorCode::InvalidQuery,
+            return Err(ApiError::invalid_query(
                 format!(
                     "Field {name:?} is not searchable; mark it \"searchable\": true in the index schema."
                 ),
             ));
         }
         if field_def.is_vector_field() {
-            return Err(ApiError::bad_request(
-                ErrorCode::InvalidQuery,
-                format!("Field {name:?} is a vector field and cannot be used in searchFields."),
-            ));
+            return Err(ApiError::invalid_query(format!(
+                "Field {name:?} is a vector field and cannot be used in searchFields."
+            )));
         }
-        fields.push(SearchField {
+        Ok(SearchField {
             name: name.to_owned(),
             boost: weight,
-        });
-    }
+        })
+    })?;
     if fields.is_empty() {
-        return Err(ApiError::bad_request(
-            ErrorCode::InvalidQuery,
-            "searchFields is empty.",
-        ));
+        return Err(ApiError::invalid_query("searchFields is empty."));
     }
     Ok(fields)
 }
@@ -743,29 +660,21 @@ pub(crate) fn parse_highlight_options(
     let fields = match highlight_value {
         None | Some(Value::Null) => Vec::new(),
         Some(value) => {
-            let mut fields = Vec::new();
-            for part in string_items(value, "highlight")? {
+            let fields = string_items_or(value, "highlight", |part| {
                 let field_def = definition.field_path(&part).ok_or_else(|| {
-                    ApiError::bad_request(
-                        ErrorCode::InvalidQuery,
-                        format!("highlight references unknown field {part:?}."),
-                    )
+                    ApiError::invalid_query(format!("highlight references unknown field {part:?}."))
                 })?;
                 if !field_def.searchable {
-                    return Err(ApiError::bad_request(
-                        ErrorCode::InvalidQuery,
+                    return Err(ApiError::invalid_query(
                         format!(
                             "Field {part:?} is not searchable; only searchable fields can be highlighted."
                         ),
                     ));
                 }
-                fields.push(part);
-            }
+                Ok(part)
+            })?;
             if fields.is_empty() {
-                return Err(ApiError::bad_request(
-                    ErrorCode::InvalidQuery,
-                    "highlight is empty.",
-                ));
+                return Err(ApiError::invalid_query("highlight is empty."));
             }
             fields
         }
@@ -774,10 +683,7 @@ pub(crate) fn parse_highlight_options(
         match obj.get(key) {
             None | Some(Value::Null) => Ok(default.to_owned()),
             Some(Value::String(tag)) => Ok(tag.clone()),
-            Some(_) => Err(ApiError::bad_request(
-                ErrorCode::InvalidQuery,
-                format!("{key} must be a string."),
-            )),
+            Some(_) => Err(ApiError::invalid_query(format!("{key} must be a string."))),
         }
     };
     let pre_tag = tag("highlightPreTag", "<em>")?;

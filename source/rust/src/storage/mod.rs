@@ -692,6 +692,10 @@ impl Storage for InMemoryStorage {
     }
 
     fn get_documents(&self, index: &str) -> Result<Vec<Document>, StorageError> {
+        // Clones under the read lock are intentional: handing out owned
+        // documents keeps readers lock-free for the (longer) search that
+        // follows, at the cost of one clone per document. The emulator is
+        // in-memory with small test-sized indexes, so this is cheap.
         let indexes = read_unpoisoned(&self.inner);
         let entry = indexes
             .get(index)
