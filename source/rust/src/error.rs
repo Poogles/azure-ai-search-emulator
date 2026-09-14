@@ -8,10 +8,62 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
+/// The Azure error `code` for a client-facing error. The wire spelling is the
+/// variant name; [`ErrorCode::as_str`] is the single source of truth so the
+/// response body and any echo can never drift from the variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorCode {
+    AuthenticationFailed,
+    ResourceNotFound,
+    InternalError,
+    InvalidQuery,
+    InvalidIndex,
+    InvalidIndexName,
+    InvalidRequest,
+    InvalidDocuments,
+    InvalidAlias,
+    InvalidSynonymMap,
+    InvalidKnowledgeSource,
+    InvalidKnowledgeBase,
+    IndexAlreadyExists,
+    SynonymMapAlreadyExists,
+    AliasAlreadyExists,
+    KnowledgeSourceAlreadyExists,
+    KnowledgeBaseAlreadyExists,
+    UnsupportedQuery,
+    UnsupportedAction,
+    ApiVersionMissing,
+    ApiVersionUnsupported,
+}
+
+crate::string_enum!(ErrorCode as_str {
+    AuthenticationFailed => "AuthenticationFailed",
+    ResourceNotFound => "ResourceNotFound",
+    InternalError => "InternalError",
+    InvalidQuery => "InvalidQuery",
+    InvalidIndex => "InvalidIndex",
+    InvalidIndexName => "InvalidIndexName",
+    InvalidRequest => "InvalidRequest",
+    InvalidDocuments => "InvalidDocuments",
+    InvalidAlias => "InvalidAlias",
+    InvalidSynonymMap => "InvalidSynonymMap",
+    InvalidKnowledgeSource => "InvalidKnowledgeSource",
+    InvalidKnowledgeBase => "InvalidKnowledgeBase",
+    IndexAlreadyExists => "IndexAlreadyExists",
+    SynonymMapAlreadyExists => "SynonymMapAlreadyExists",
+    AliasAlreadyExists => "AliasAlreadyExists",
+    KnowledgeSourceAlreadyExists => "KnowledgeSourceAlreadyExists",
+    KnowledgeBaseAlreadyExists => "KnowledgeBaseAlreadyExists",
+    UnsupportedQuery => "UnsupportedQuery",
+    UnsupportedAction => "UnsupportedAction",
+    ApiVersionMissing => "ApiVersionMissing",
+    ApiVersionUnsupported => "ApiVersionUnsupported",
+});
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiError {
     pub status: StatusCode,
-    pub code: String,
+    pub code: ErrorCode,
     pub message: String,
 }
 
@@ -19,15 +71,15 @@ impl ApiError {
     pub fn authentication_failed(message: impl Into<String>) -> Self {
         ApiError {
             status: StatusCode::UNAUTHORIZED,
-            code: "AuthenticationFailed".to_owned(),
+            code: ErrorCode::AuthenticationFailed,
             message: message.into(),
         }
     }
 
-    pub fn bad_request(code: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn bad_request(code: ErrorCode, message: impl Into<String>) -> Self {
         ApiError {
             status: StatusCode::BAD_REQUEST,
-            code: code.into(),
+            code,
             message: message.into(),
         }
     }
@@ -35,23 +87,23 @@ impl ApiError {
     pub fn not_found(message: impl Into<String>) -> Self {
         ApiError {
             status: StatusCode::NOT_FOUND,
-            code: "ResourceNotFound".to_owned(),
+            code: ErrorCode::ResourceNotFound,
             message: message.into(),
         }
     }
 
-    pub fn conflict(code: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn conflict(code: ErrorCode, message: impl Into<String>) -> Self {
         ApiError {
             status: StatusCode::CONFLICT,
-            code: code.into(),
+            code,
             message: message.into(),
         }
     }
 
-    pub fn unsupported(code: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn unsupported(code: ErrorCode, message: impl Into<String>) -> Self {
         ApiError {
             status: StatusCode::BAD_REQUEST,
-            code: code.into(),
+            code,
             message: message.into(),
         }
     }
@@ -59,7 +111,7 @@ impl ApiError {
     pub fn internal(message: impl Into<String>) -> Self {
         ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: "InternalError".to_owned(),
+            code: ErrorCode::InternalError,
             message: message.into(),
         }
     }
@@ -69,7 +121,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = Json(json!({
             "error": {
-                "code": self.code,
+                "code": self.code.as_str(),
                 "message": self.message,
             }
         }));
@@ -79,7 +131,13 @@ impl IntoResponse for ApiError {
 
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ({}): {}", self.status, self.code, self.message)
+        write!(
+            f,
+            "{} ({}): {}",
+            self.status,
+            self.code.as_str(),
+            self.message
+        )
     }
 }
 

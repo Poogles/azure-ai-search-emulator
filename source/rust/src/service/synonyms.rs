@@ -3,7 +3,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ErrorCode};
 
 /// One parsed Solr synonym rule: `inputs` (matched query terms) rewrite to
 /// `outputs` (additional indexed/query terms). For `a,b,c` every term is both
@@ -116,24 +116,24 @@ pub(crate) fn validate_synonym_map(
 ) -> Result<(), ApiError> {
     if name.is_empty() {
         return Err(ApiError::bad_request(
-            "InvalidSynonymMap",
+            ErrorCode::InvalidSynonymMap,
             "The synonym map name is required.",
         ));
     }
     if format != "solr" {
         return Err(ApiError::bad_request(
-            "InvalidSynonymMap",
+            ErrorCode::InvalidSynonymMap,
             format!("Synonym map format {format:?} is not supported; only \"solr\" is supported."),
         ));
     }
     match parse_synonym_rules(synonyms) {
         Ok(rules) if !rules.is_empty() => Ok(()),
         Ok(_) => Err(ApiError::bad_request(
-            "InvalidSynonymMap",
+            ErrorCode::InvalidSynonymMap,
             "The synonym map must contain at least one synonym rule.",
         )),
         Err(e) => Err(ApiError::bad_request(
-            "InvalidSynonymMap",
+            ErrorCode::InvalidSynonymMap,
             format!("Invalid synonym rules: {e}"),
         )),
     }

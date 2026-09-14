@@ -1,6 +1,6 @@
 //! Filter validation against the index schema.
 
-use crate::storage::{FieldDefinition, IndexDefinition};
+use crate::storage::{FieldDefinition, FieldType, IndexDefinition};
 
 use super::{FilterExpr, FilterValue, StringFunc};
 
@@ -43,9 +43,10 @@ pub fn validate(expr: &FilterExpr, definition: &IndexDefinition) -> Result<(), S
         }
         FilterExpr::StringFunc { func, field, .. } => {
             let field_def = require_filterable(field, definition)?;
-            if field_def.field_type != "Edm.String"
-                && field_def.field_type != "Edm.Collection(Edm.String)"
-            {
+            if !matches!(
+                field_def.field_type,
+                FieldType::String | FieldType::CollectionString
+            ) {
                 let name = match func {
                     StringFunc::StartsWith => "startswith",
                     StringFunc::EndsWith => "endswith",
@@ -54,7 +55,7 @@ pub fn validate(expr: &FilterExpr, definition: &IndexDefinition) -> Result<(), S
                 return Err(format!(
                     "Filter function {name} on field {field:?} requires a string field; \
                      field type is {:?}.",
-                    field_def.field_type
+                    field_def.field_type.as_str()
                 ));
             }
             Ok(())
@@ -85,11 +86,11 @@ pub fn validate(expr: &FilterExpr, definition: &IndexDefinition) -> Result<(), S
         FilterExpr::DateCompare { left, .. } => {
             for field in left.referenced_fields() {
                 let field_def = require_filterable(&field, definition)?;
-                if field_def.field_type != "Edm.DateTimeOffset" {
+                if !matches!(field_def.field_type, FieldType::DateTimeOffset) {
                     return Err(format!(
                         "Date filter on field {field:?} requires an Edm.DateTimeOffset field; \
                          field type is {:?}.",
-                        field_def.field_type
+                        field_def.field_type.as_str()
                     ));
                 }
             }
@@ -97,13 +98,14 @@ pub fn validate(expr: &FilterExpr, definition: &IndexDefinition) -> Result<(), S
         }
         FilterExpr::IsMatch { field, .. } => {
             let field_def = require_filterable(field, definition)?;
-            if field_def.field_type != "Edm.String"
-                && field_def.field_type != "Edm.Collection(Edm.String)"
-            {
+            if !matches!(
+                field_def.field_type,
+                FieldType::String | FieldType::CollectionString
+            ) {
                 return Err(format!(
                     "Filter function search.ismatch on field {field:?} requires a string field; \
                      field type is {:?}.",
-                    field_def.field_type
+                    field_def.field_type.as_str()
                 ));
             }
             Ok(())

@@ -136,6 +136,32 @@ fn split_lambda_field(name: &str) -> Option<(String, String)> {
     None
 }
 
+/// The shape of a comparison expression, classified from its leading field
+/// name and the next token. [`Parser::classify_comparison`] is the dispatch
+/// table: its branch order is the parse order and must be preserved (the
+/// `OData` lambda form shadows the `any`/`all` keywords; the date-function
+/// names shadow the generic function-call form).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComparisonKind {
+    /// `OData` lambda: `field/any(var: body)` / `field/all(var: body)`.
+    Lambda,
+    /// Collection filter: `field any var op value` / `field all var op value`.
+    Collection,
+    /// Date function: `datepart(...)` / `dateadd(...)` / `datediff(...)` /
+    /// `utcdatetime(...)`.
+    DateFn,
+    /// Search function: `search.ismatch(...)` / `search.ismatchscoring(...)` /
+    /// `search.isempty(...)` / `search.isnull(...)`.
+    SearchFn,
+    /// String function call: `startswith(...)` / `endswith(...)` /
+    /// `contains(...)`.
+    FunctionCall,
+    /// Membership test: `field in (value, ...)`.
+    InList,
+    /// Plain comparison: `field op value`.
+    Plain,
+}
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -223,114 +249,147 @@ impl Parser {
     }
 
     fn parse_comparison(&mut self) -> Result<FilterExpr, String> {
-        // Collection filtering: `field any var op value` / `field all var op value`.
         let first = self.expect_ident("field name")?;
-        // OData lambda syntax: `field/any(var: body)` / `field/all(var: body)`.
-        // The tokenizer folds `field/any` into a single identifier (because `/`
-        // continues an identifier), so detect the lambda operator as a suffix.
-        if let Some((field, kind)) = split_lambda_field(&first) {
-            if matches!(self.peek(), Some(Token::LParen)) {
-                self.next();
-                let _variable = self.expect_ident("lambda variable")?;
-                match self.next() {
-                    Some(Token::Colon) => {}
-                    other => {
-                        return Err(format!(
-                            "Expected ':' after lambda variable, found {}.",
-                            describe_token(other.as_ref())
-                        ))
-                    }
-                }
-                let inner = self.parse_comparison()?;
-                match self.next() {
-                    Some(Token::RParen) => {}
-                    other => {
-                        return Err(format!(
-                            "Expected ')' after lambda body, found {}.",
-                            describe_token(other.as_ref())
-                        ))
-                    }
-                }
-                return match kind.as_str() {
-                    "any" => Ok(FilterExpr::Any {
-                        field,
-                        inner: Box::new(inner),
-                    }),
-                    _ => Ok(FilterExpr::All {
-                        field,
-                        inner: Box::new(inner),
-                    }),
-                };
+        match self.classify_comparison(&first) {
+            ComparisonKind::Lambda => self.parse_lambda(&first),
+            ComparisonKind::Collection => self.parse_collection_filter(&first),
+            ComparisonKind::DateFn => self.parse_date_compare(&first),
+            ComparisonKind::SearchFn => self.parse_search_dispatch(&first),
+            ComparisonKind::FunctionCall => self.parse_function_call(&first),
+            ComparisonKind::InList => {
+                self.next(); // Consume `in`.
+                self.parse_in_list(&first)
             }
+            ComparisonKind::Plain => self.parse_plain_comparison(&first),
+        }
+    }
+
+    /// The dispatch table for [`Parser::parse_comparison`]: classifies a
+    /// comparison from its leading field name and the next token. The branch
+    /// order is the parse order and must be preserved: the `OData` lambda form
+    /// shadows the `any`/`all` keywords, and the date-function names shadow
+    /// the generic function-call form.
+    fn classify_comparison(&self, first: &str) -> ComparisonKind {
+        use ComparisonKind as K;
+        if split_lambda_field(first).is_some() && matches!(self.peek(), Some(Token::LParen)) {
+            return K::Lambda;
         }
         if self.peek_ident_is("any") || self.peek_ident_is("all") {
-            let Some(Token::Ident(kind)) = self.next() else {
-                return Err("Expected 'any' or 'all' keyword.".to_owned());
-            };
-            let variable = self.expect_ident("lambda variable")?;
-            let op = self.parse_op()?;
-            let value = self.parse_value()?;
-            let inner = FilterExpr::Compare {
-                field: variable,
-                op,
-                value,
-            };
-            return match kind.as_str() {
-                "any" => Ok(FilterExpr::Any {
-                    field: first,
-                    inner: Box::new(inner),
-                }),
-                _ => Ok(FilterExpr::All {
-                    field: first,
-                    inner: Box::new(inner),
-                }),
-            };
+            return K::Collection;
         }
-        // Date functions: `datepart(...)`, `dateadd(...)`, `datediff(...)`,
-        // or a leading `utcdatetime('...')`.
-        if matches!(
-            first.as_str(),
-            "datepart" | "dateadd" | "datediff" | "utcdatetime"
-        ) && matches!(self.peek(), Some(Token::LParen))
+        if matches!(first, "datepart" | "dateadd" | "datediff" | "utcdatetime")
+            && matches!(self.peek(), Some(Token::LParen))
         {
-            return self.parse_date_compare(&first);
+            return K::DateFn;
         }
-        // Search functions: `search.ismatch(...)`, `search.ismatchscoring(...)`,
-        // `search.isempty(...)`, `search.isnull(...)`. The tokenizer splits
-        // `search.ismatch` into an identifier, a dot, and an identifier.
         if first == "search" && matches!(self.peek(), Some(Token::Dot)) {
-            self.next(); // Consume '.'.
-            let func = self.expect_ident("search function name")?;
-            if matches!(self.peek(), Some(Token::LParen)) {
-                return self.parse_search_function(&func);
-            }
-            return Err(format!(
-                "Expected '(' after 'search.{func}'; supported search functions: \
-                 ismatch, ismatchscoring, isempty, isnull."
-            ));
+            return K::SearchFn;
         }
-        // Function calls: `startswith(field, 'prefix')`, `endswith(field,
-        // 'suffix')`, `contains(field, 'substring')`.
         if matches!(self.peek(), Some(Token::LParen)) {
-            return self.parse_function_call(&first);
+            return K::FunctionCall;
         }
-        // Membership test: `field in (value, ...)`.
         if self.peek_ident_is("in") {
-            self.next();
-            return self.parse_in_list(&first);
+            return K::InList;
         }
+        K::Plain
+    }
+
+    /// `OData` lambda: `field/any(var: body)` / `field/all(var: body)`. The
+    /// tokenizer folds `field/any` into a single identifier (because `/`
+    /// continues an identifier), so the lambda operator is detected as a
+    /// suffix.
+    fn parse_lambda(&mut self, first: &str) -> Result<FilterExpr, String> {
+        let Some((field, kind)) = split_lambda_field(first) else {
+            return Err(format!("Expected a lambda field, found {first:?}."));
+        };
+        self.next(); // Consume '('.
+        let _variable = self.expect_ident("lambda variable")?;
+        match self.next() {
+            Some(Token::Colon) => {}
+            other => {
+                return Err(format!(
+                    "Expected ':' after lambda variable, found {}.",
+                    describe_token(other.as_ref())
+                ))
+            }
+        }
+        let inner = self.parse_comparison()?;
+        match self.next() {
+            Some(Token::RParen) => {}
+            other => {
+                return Err(format!(
+                    "Expected ')' after lambda body, found {}.",
+                    describe_token(other.as_ref())
+                ))
+            }
+        }
+        match kind.as_str() {
+            "any" => Ok(FilterExpr::Any {
+                field,
+                inner: Box::new(inner),
+            }),
+            _ => Ok(FilterExpr::All {
+                field,
+                inner: Box::new(inner),
+            }),
+        }
+    }
+
+    /// Collection filter: `field any var op value` / `field all var op value`.
+    fn parse_collection_filter(&mut self, first: &str) -> Result<FilterExpr, String> {
+        let Some(Token::Ident(kind)) = self.next() else {
+            return Err("Expected 'any' or 'all' keyword.".to_owned());
+        };
+        let variable = self.expect_ident("lambda variable")?;
+        let op = self.parse_op()?;
+        let value = self.parse_value()?;
+        let inner = FilterExpr::Compare {
+            field: variable,
+            op,
+            value,
+        };
+        match kind.as_str() {
+            "any" => Ok(FilterExpr::Any {
+                field: first.to_owned(),
+                inner: Box::new(inner),
+            }),
+            _ => Ok(FilterExpr::All {
+                field: first.to_owned(),
+                inner: Box::new(inner),
+            }),
+        }
+    }
+
+    /// Search function: `search.ismatch(...)`, `search.ismatchscoring(...)`,
+    /// `search.isempty(...)`, `search.isnull(...)`. The tokenizer splits
+    /// `search.ismatch` into an identifier, a dot, and an identifier.
+    fn parse_search_dispatch(&mut self, _first: &str) -> Result<FilterExpr, String> {
+        self.next(); // Consume '.'.
+        let func = self.expect_ident("search function name")?;
+        if matches!(self.peek(), Some(Token::LParen)) {
+            return self.parse_search_function(&func);
+        }
+        Err(format!(
+            "Expected '(' after 'search.{func}'; supported search functions: \
+             ismatch, ismatchscoring, isempty, isnull."
+        ))
+    }
+
+    /// Plain comparison: `field op value`, with an optional trailing
+    /// `utcdatetime('...')` on the value side.
+    fn parse_plain_comparison(&mut self, first: &str) -> Result<FilterExpr, String> {
         let op = self.parse_op()?;
         // A trailing `utcdatetime('...')`: `field op utcdatetime('...')`.
         if let Some(iso) = self.try_parse_utcdatetime()? {
             return Ok(FilterExpr::DateCompare {
-                left: DateOperand::Field(first.clone()),
+                left: DateOperand::Field(first.to_owned()),
                 op,
                 value: FilterValue::String(iso),
             });
         }
         let value = self.parse_value()?;
         Ok(FilterExpr::Compare {
-            field: first,
+            field: first.to_owned(),
             op,
             value,
         })

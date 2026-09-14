@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ErrorCode};
 use crate::filter::FilterExpr;
 use crate::query::{QueryType, SearchMode};
 use crate::storage::Document;
@@ -63,7 +63,7 @@ impl DocumentAction {
             "delete" => ActionKind::Delete,
             other => {
                 return Err(ApiError::unsupported(
-                    "UnsupportedAction",
+                    ErrorCode::UnsupportedAction,
                     format!("Document action {other:?} is not supported by the emulator."),
                 ))
             }
@@ -75,7 +75,7 @@ impl DocumentAction {
                     .as_object()
                     .ok_or_else(|| {
                         ApiError::bad_request(
-                            "InvalidDocuments",
+                            ErrorCode::InvalidDocuments,
                             "Each batch action must be a JSON object.",
                         )
                     })?
@@ -170,15 +170,10 @@ pub enum VectorFilterMode {
     PreFilter,
 }
 
-impl VectorFilterMode {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            VectorFilterMode::PostFilter => "postFilter",
-            VectorFilterMode::PreFilter => "preFilter",
-        }
-    }
-}
+crate::string_enum!(VectorFilterMode both {
+    PostFilter => "postFilter",
+    PreFilter => "preFilter",
+});
 
 /// A document-key predicate for `preFilter` vector search: whether the
 /// document with the given key matches the top-level filter.

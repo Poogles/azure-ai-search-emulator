@@ -80,27 +80,18 @@ const WRITER_HEAP_BYTES: usize = 50_000_000;
 const MAX_MATCHES: usize = 1_000_000;
 
 /// Errors produced by the query engine.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum QueryError {
     /// The requested search index does not exist.
+    #[error("index {0:?} not found")]
     IndexNotFound(String),
     /// The search text is malformed (e.g. an unparseable Lucene query).
+    #[error("invalid query: {0}")]
     InvalidQuery(String),
     /// An underlying Tantivy operation failed.
+    #[error("search engine error: {0}")]
     Engine(String),
 }
-
-impl std::fmt::Display for QueryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            QueryError::IndexNotFound(name) => write!(f, "index {name:?} not found"),
-            QueryError::InvalidQuery(message) => write!(f, "invalid query: {message}"),
-            QueryError::Engine(message) => write!(f, "search engine error: {message}"),
-        }
-    }
-}
-
-impl std::error::Error for QueryError {}
 
 /// A single Tantivy-backed search index.
 struct EngineIndex {
@@ -527,6 +518,7 @@ mod tests {
         ANALYZER_KEYWORD, ANALYZER_LATIN, ANALYZER_NGRAM, ANALYZER_WHITESPACE,
     };
     use super::*;
+    use crate::storage::FieldType;
     use serde_json::{Map, Value};
     use std::collections::BTreeSet;
 
@@ -534,7 +526,7 @@ mod tests {
         vec![
             FieldDefinition {
                 name: "id".to_owned(),
-                field_type: "Edm.String".to_owned(),
+                field_type: FieldType::String,
                 is_key: true,
                 searchable: false,
                 filterable: false,
@@ -549,7 +541,7 @@ mod tests {
             },
             FieldDefinition {
                 name: "title".to_owned(),
-                field_type: "Edm.String".to_owned(),
+                field_type: FieldType::String,
                 is_key: false,
                 searchable: true,
                 filterable: false,
@@ -564,7 +556,7 @@ mod tests {
             },
             FieldDefinition {
                 name: "body".to_owned(),
-                field_type: "Edm.String".to_owned(),
+                field_type: FieldType::String,
                 is_key: false,
                 searchable: true,
                 filterable: false,
@@ -579,7 +571,7 @@ mod tests {
             },
             FieldDefinition {
                 name: "count".to_owned(),
-                field_type: "Edm.Int32".to_owned(),
+                field_type: FieldType::Int32,
                 is_key: false,
                 searchable: false,
                 filterable: true,
@@ -594,7 +586,7 @@ mod tests {
             },
             FieldDefinition {
                 name: "price".to_owned(),
-                field_type: "Edm.Double".to_owned(),
+                field_type: FieldType::Double,
                 is_key: false,
                 searchable: true,
                 filterable: true,
@@ -1043,7 +1035,7 @@ mod tests {
     ) -> FieldDefinition {
         FieldDefinition {
             name: name.to_owned(),
-            field_type: field_type.to_owned(),
+            field_type: FieldType::from_normalized(field_type),
             is_key: false,
             searchable,
             filterable: false,
@@ -1061,7 +1053,7 @@ mod tests {
     fn key_field() -> FieldDefinition {
         FieldDefinition {
             name: "id".to_owned(),
-            field_type: "Edm.String".to_owned(),
+            field_type: FieldType::String,
             is_key: true,
             searchable: false,
             filterable: false,

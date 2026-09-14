@@ -1,17 +1,176 @@
 //! Storage abstraction for index definitions and documents.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
 use crate::sync_util::{read_unpoisoned, write_unpoisoned};
 
+/// A normalized `Edm.*` field type. Recognized types are named variants;
+/// anything else is preserved verbatim in [`FieldType::Unknown`] so error
+/// messages can echo the original spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldType {
+    String,
+    Int32,
+    Int64,
+    Single,
+    Double,
+    Boolean,
+    DateTimeOffset,
+    Guid,
+    GeographyPoint,
+    ComplexType,
+    Half,
+    CollectionString,
+    CollectionInt32,
+    CollectionInt64,
+    CollectionSingle,
+    CollectionDouble,
+    CollectionHalf,
+    CollectionBoolean,
+    CollectionDateTimeOffset,
+    CollectionGuid,
+    CollectionComplexType,
+    /// An unrecognized type, kept verbatim for echo in error messages.
+    Unknown(String),
+}
+
+impl FieldType {
+    /// The canonical `Edm.*` spelling (the stored string for `Unknown`), for
+    /// echo in error messages.
+    #[must_use]
+    pub fn as_str(&self) -> Cow<'_, str> {
+        use FieldType as T;
+        match self {
+            T::Unknown(raw) => Cow::Borrowed(raw),
+            T::String => Cow::Borrowed("Edm.String"),
+            T::Int32 => Cow::Borrowed("Edm.Int32"),
+            T::Int64 => Cow::Borrowed("Edm.Int64"),
+            T::Single => Cow::Borrowed("Edm.Single"),
+            T::Double => Cow::Borrowed("Edm.Double"),
+            T::Boolean => Cow::Borrowed("Edm.Boolean"),
+            T::DateTimeOffset => Cow::Borrowed("Edm.DateTimeOffset"),
+            T::Guid => Cow::Borrowed("Edm.Guid"),
+            T::GeographyPoint => Cow::Borrowed("Edm.GeographyPoint"),
+            T::ComplexType => Cow::Borrowed("Edm.ComplexType"),
+            T::Half => Cow::Borrowed("Edm.Half"),
+            T::CollectionString => Cow::Borrowed("Edm.Collection(Edm.String)"),
+            T::CollectionInt32 => Cow::Borrowed("Edm.Collection(Edm.Int32)"),
+            T::CollectionInt64 => Cow::Borrowed("Edm.Collection(Edm.Int64)"),
+            T::CollectionSingle => Cow::Borrowed("Edm.Collection(Edm.Single)"),
+            T::CollectionDouble => Cow::Borrowed("Edm.Collection(Edm.Double)"),
+            T::CollectionHalf => Cow::Borrowed("Edm.Collection(Edm.Half)"),
+            T::CollectionBoolean => Cow::Borrowed("Edm.Collection(Edm.Boolean)"),
+            T::CollectionDateTimeOffset => Cow::Borrowed("Edm.Collection(Edm.DateTimeOffset)"),
+            T::CollectionGuid => Cow::Borrowed("Edm.Collection(Edm.Guid)"),
+            T::CollectionComplexType => Cow::Borrowed("Edm.Collection(Edm.ComplexType)"),
+        }
+    }
+
+    /// Parses a normalized `Edm.*` spelling into a variant; unrecognized
+    /// spellings are preserved in [`FieldType::Unknown`].
+    #[must_use]
+    pub fn from_normalized(raw: &str) -> Self {
+        use FieldType as T;
+        match raw {
+            "Edm.String" => T::String,
+            "Edm.Int32" => T::Int32,
+            "Edm.Int64" => T::Int64,
+            "Edm.Single" => T::Single,
+            "Edm.Double" => T::Double,
+            "Edm.Boolean" => T::Boolean,
+            "Edm.DateTimeOffset" => T::DateTimeOffset,
+            "Edm.Guid" => T::Guid,
+            "Edm.GeographyPoint" => T::GeographyPoint,
+            "Edm.ComplexType" => T::ComplexType,
+            "Edm.Half" => T::Half,
+            "Edm.Collection(Edm.String)" => T::CollectionString,
+            "Edm.Collection(Edm.Int32)" => T::CollectionInt32,
+            "Edm.Collection(Edm.Int64)" => T::CollectionInt64,
+            "Edm.Collection(Edm.Single)" => T::CollectionSingle,
+            "Edm.Collection(Edm.Double)" => T::CollectionDouble,
+            "Edm.Collection(Edm.Half)" => T::CollectionHalf,
+            "Edm.Collection(Edm.Boolean)" => T::CollectionBoolean,
+            "Edm.Collection(Edm.DateTimeOffset)" => T::CollectionDateTimeOffset,
+            "Edm.Collection(Edm.Guid)" => T::CollectionGuid,
+            "Edm.Collection(Edm.ComplexType)" => T::CollectionComplexType,
+            other => T::Unknown(other.to_owned()),
+        }
+    }
+
+    /// The element type for a collection field, `None` for scalar types.
+    #[must_use]
+    pub fn inner_type(&self) -> Option<Self> {
+        use FieldType as T;
+        match self {
+            T::CollectionString => Some(T::String),
+            T::CollectionInt32 => Some(T::Int32),
+            T::CollectionInt64 => Some(T::Int64),
+            T::CollectionSingle => Some(T::Single),
+            T::CollectionDouble => Some(T::Double),
+            T::CollectionHalf => Some(T::Half),
+            T::CollectionBoolean => Some(T::Boolean),
+            T::CollectionDateTimeOffset => Some(T::DateTimeOffset),
+            T::CollectionGuid => Some(T::Guid),
+            T::CollectionComplexType => Some(T::ComplexType),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a collection (`Edm.Collection(...)`) type.
+    #[must_use]
+    pub fn is_collection(&self) -> bool {
+        use FieldType as T;
+        matches!(
+            self,
+            T::CollectionString
+                | T::CollectionInt32
+                | T::CollectionInt64
+                | T::CollectionSingle
+                | T::CollectionDouble
+                | T::CollectionHalf
+                | T::CollectionBoolean
+                | T::CollectionDateTimeOffset
+                | T::CollectionGuid
+                | T::CollectionComplexType
+        )
+    }
+
+    /// Whether this is a complex type (scalar or collection of complex).
+    #[must_use]
+    pub fn is_complex_type(&self) -> bool {
+        matches!(
+            self,
+            FieldType::ComplexType | FieldType::CollectionComplexType
+        )
+    }
+
+    /// Whether this type can back a vector field.
+    #[must_use]
+    pub fn is_vector_field_type(&self) -> bool {
+        matches!(
+            self,
+            FieldType::CollectionSingle | FieldType::CollectionHalf
+        )
+    }
+}
+
+impl std::str::FromStr for FieldType {
+    type Err = std::convert::Infallible;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Ok(Self::from_normalized(raw))
+    }
+}
+
 /// A single field definition from an index schema.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct FieldDefinition {
     pub name: String,
-    pub field_type: String,
+    pub field_type: FieldType,
     pub is_key: bool,
     pub searchable: bool,
     pub filterable: bool,
@@ -82,7 +241,7 @@ impl FieldDefinition {
         let analyzer = get_opt_string(obj, "analyzer");
         Ok(FieldDefinition {
             name: name.to_owned(),
-            field_type: normalize_field_type(field_type),
+            field_type: FieldType::from_normalized(&normalize_field_type(field_type)),
             vector_dimensions,
             vector_search_profile,
             is_key: get_bool(obj, "key", false),
@@ -104,10 +263,7 @@ impl FieldDefinition {
     /// schema validation.
     #[must_use]
     pub fn is_vector_field(&self) -> bool {
-        matches!(
-            self.field_type.as_str(),
-            "Edm.Collection(Edm.Single)" | "Edm.Collection(Edm.Half)"
-        ) && self.vector_dimensions.is_some()
+        self.field_type.is_vector_field_type() && self.vector_dimensions.is_some()
     }
 
     /// Whether the raw definition carries a `dimensions` property (under
@@ -126,16 +282,13 @@ impl FieldDefinition {
     /// Both carry subfields and share the same validation and indexing rules.
     #[must_use]
     pub fn is_complex_type(&self) -> bool {
-        matches!(
-            self.field_type.as_str(),
-            "Edm.ComplexType" | "Edm.Collection(Edm.ComplexType)"
-        )
+        self.field_type.is_complex_type()
     }
 
     /// Whether this field is a collection type (`Edm.Collection(...)`).
     #[must_use]
     pub fn is_collection(&self) -> bool {
-        self.field_type.starts_with("Edm.Collection(")
+        self.field_type.is_collection()
     }
 }
 
@@ -381,22 +534,13 @@ pub fn resolve_field_path<'a>(fields: &'a Map<String, Value>, path: &str) -> Vec
 }
 
 /// Errors produced by the storage layer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StorageError {
+    #[error("index {0:?} already exists")]
     IndexAlreadyExists(String),
+    #[error("index {0:?} not found")]
     IndexNotFound(String),
 }
-
-impl std::fmt::Display for StorageError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StorageError::IndexAlreadyExists(name) => write!(f, "index {name:?} already exists"),
-            StorageError::IndexNotFound(name) => write!(f, "index {name:?} not found"),
-        }
-    }
-}
-
-impl std::error::Error for StorageError {}
 
 /// The storage abstraction from the initial design.
 ///

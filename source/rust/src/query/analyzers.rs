@@ -83,41 +83,58 @@ pub const KNOWN_ANALYZERS: &[&str] = &[
     "tr.microsoft",
 ];
 
+/// The analyzers with an explicit (non-English) tokenizer. Every other name —
+/// the index default (`None`), the standard aliases, and anything
+/// unrecognized — falls back to the English analyzer (see
+/// `docs/known_differences.md`). Adding a new analyzer is a data change here.
+const ANALYZER_MAP: &[(&str, &str)] = &[
+    ("keyword", ANALYZER_KEYWORD),
+    ("whitespace", ANALYZER_WHITESPACE),
+    ("alphanum", ANALYZER_ALPHANUM),
+    ("latin", ANALYZER_LATIN),
+    ("ngram", ANALYZER_NGRAM),
+    ("ngram.microsoft", ANALYZER_NGRAM),
+    ("ngram.lucene", ANALYZER_NGRAM),
+    ("edgeNgram", ANALYZER_EDGE_NGRAM),
+    ("edgeNgram.microsoft", ANALYZER_EDGE_NGRAM),
+    ("edgeNgram.lucene", ANALYZER_EDGE_NGRAM),
+    ("chinese", ANALYZER_CJK),
+    ("japanese", ANALYZER_CJK),
+    ("korean", ANALYZER_CJK),
+    ("thai", ANALYZER_THAI),
+    ("vietnamese", ANALYZER_VIETNAMESE),
+    ("ar.microsoft", ANALYZER_ARABIC),
+    ("da.microsoft", ANALYZER_DANISH),
+    ("de.microsoft", ANALYZER_GERMAN),
+    ("el.microsoft", ANALYZER_GREEK),
+    ("es.microsoft", ANALYZER_SPANISH),
+    ("fi.microsoft", ANALYZER_FINNISH),
+    ("fr.microsoft", ANALYZER_FRENCH),
+    ("hu.microsoft", ANALYZER_HUNGARIAN),
+    ("it.microsoft", ANALYZER_ITALIAN),
+    ("nl.microsoft", ANALYZER_DUTCH),
+    ("no.microsoft", ANALYZER_NORWEGIAN),
+    ("pt.microsoft", ANALYZER_PORTUGUESE),
+    ("ro.microsoft", ANALYZER_ROMANIAN),
+    ("ru.microsoft", ANALYZER_RUSSIAN),
+    ("sv.microsoft", ANALYZER_SWEDISH),
+    ("tr.microsoft", ANALYZER_TURKISH),
+];
+
 /// Maps an Azure analyzer name (or `None` for the index default) to the
 /// registered tokenizer name used for both indexing and querying. Unknown
 /// names fall back to the English analyzer (see
 /// `docs/known_differences.md`).
 #[must_use]
 pub fn analyzer_tokenizer_name(analyzer: Option<&str>) -> &'static str {
-    match analyzer {
-        Some("keyword") => ANALYZER_KEYWORD,
-        Some("whitespace") => ANALYZER_WHITESPACE,
-        Some("alphanum") => ANALYZER_ALPHANUM,
-        Some("latin") => ANALYZER_LATIN,
-        Some("ngram" | "ngram.microsoft" | "ngram.lucene") => ANALYZER_NGRAM,
-        Some("edgeNgram" | "edgeNgram.microsoft" | "edgeNgram.lucene") => ANALYZER_EDGE_NGRAM,
-        Some("chinese" | "japanese" | "korean") => ANALYZER_CJK,
-        Some("thai") => ANALYZER_THAI,
-        Some("vietnamese") => ANALYZER_VIETNAMESE,
-        Some("ar.microsoft") => ANALYZER_ARABIC,
-        Some("da.microsoft") => ANALYZER_DANISH,
-        Some("de.microsoft") => ANALYZER_GERMAN,
-        Some("el.microsoft") => ANALYZER_GREEK,
-        Some("es.microsoft") => ANALYZER_SPANISH,
-        Some("fi.microsoft") => ANALYZER_FINNISH,
-        Some("fr.microsoft") => ANALYZER_FRENCH,
-        Some("hu.microsoft") => ANALYZER_HUNGARIAN,
-        Some("it.microsoft") => ANALYZER_ITALIAN,
-        Some("nl.microsoft") => ANALYZER_DUTCH,
-        Some("no.microsoft") => ANALYZER_NORWEGIAN,
-        Some("pt.microsoft") => ANALYZER_PORTUGUESE,
-        Some("ro.microsoft") => ANALYZER_ROMANIAN,
-        Some("ru.microsoft") => ANALYZER_RUSSIAN,
-        Some("sv.microsoft") => ANALYZER_SWEDISH,
-        Some("tr.microsoft") => ANALYZER_TURKISH,
-        // The default, the standard aliases, and anything unrecognized.
-        None | Some(_) => ANALYZER_ENGLISH,
-    }
+    analyzer
+        .and_then(|name| {
+            ANALYZER_MAP
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, tok)| *tok)
+        })
+        .unwrap_or(ANALYZER_ENGLISH)
 }
 
 /// Builds a language analyzer: simple tokenization with lowercasing,

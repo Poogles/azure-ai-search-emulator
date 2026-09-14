@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ErrorCode};
 use crate::sync_util::{read_unpoisoned, write_unpoisoned};
 
 /// A stored named resource (an index alias, knowledge source, or knowledge
@@ -148,24 +148,24 @@ impl ResourceKind {
 
     /// The error code for a create conflict, e.g. `AliasAlreadyExists`.
     #[must_use]
-    pub const fn conflict_code(self) -> &'static str {
+    pub const fn conflict_code(self) -> ErrorCode {
         match self {
-            ResourceKind::SynonymMap => "SynonymMapAlreadyExists",
-            ResourceKind::Alias => "AliasAlreadyExists",
-            ResourceKind::KnowledgeSource => "KnowledgeSourceAlreadyExists",
-            ResourceKind::KnowledgeBase => "KnowledgeBaseAlreadyExists",
+            ResourceKind::SynonymMap => ErrorCode::SynonymMapAlreadyExists,
+            ResourceKind::Alias => ErrorCode::AliasAlreadyExists,
+            ResourceKind::KnowledgeSource => ErrorCode::KnowledgeSourceAlreadyExists,
+            ResourceKind::KnowledgeBase => ErrorCode::KnowledgeBaseAlreadyExists,
         }
     }
 
     /// The error code for invalid request segments and bodies, e.g.
     /// `InvalidAlias`.
     #[must_use]
-    pub const fn invalid_code(self) -> &'static str {
+    pub const fn invalid_code(self) -> ErrorCode {
         match self {
-            ResourceKind::SynonymMap => "InvalidSynonymMap",
-            ResourceKind::Alias => "InvalidAlias",
-            ResourceKind::KnowledgeSource => "InvalidKnowledgeSource",
-            ResourceKind::KnowledgeBase => "InvalidKnowledgeBase",
+            ResourceKind::SynonymMap => ErrorCode::InvalidSynonymMap,
+            ResourceKind::Alias => ErrorCode::InvalidAlias,
+            ResourceKind::KnowledgeSource => ErrorCode::InvalidKnowledgeSource,
+            ResourceKind::KnowledgeBase => ErrorCode::InvalidKnowledgeBase,
         }
     }
 

@@ -11,7 +11,7 @@ use axum::Json;
 use serde_json::Value;
 
 use super::AppState;
-use crate::error::ApiError;
+use crate::error::{ApiError, ErrorCode};
 use crate::service::ResourceKind;
 
 /// `POST /synonymmaps` — Create Synonym Map. The name comes from the body.
@@ -188,7 +188,7 @@ pub(crate) fn parse_odata_segment(
     raw: &str,
     prefix: &str,
     kind_label: &str,
-    code: &str,
+    code: ErrorCode,
 ) -> Result<String, ApiError> {
     split_odata_segment(raw, prefix)
         .map(str::to_owned)
@@ -219,7 +219,7 @@ pub(crate) fn parse_named_resource_segment(
 }
 
 /// Extracts a non-empty `name` from a resource body.
-fn body_name(definition: &Value, kind: &str, code: &str) -> Result<String, ApiError> {
+fn body_name(definition: &Value, kind: &str, code: ErrorCode) -> Result<String, ApiError> {
     definition
         .get("name")
         .and_then(Value::as_str)
@@ -233,7 +233,7 @@ fn validate_named_body(
     path_name: &str,
     definition: &Value,
     kind: &str,
-    code: &str,
+    code: ErrorCode,
 ) -> Result<(), ApiError> {
     let body_name = definition.get("name").and_then(Value::as_str).unwrap_or("");
     if body_name.is_empty() || body_name != path_name {
@@ -253,14 +253,14 @@ fn validate_alias(definition: &Value) -> Result<(), ApiError> {
         .filter(|items| !items.is_empty())
         .ok_or_else(|| {
             ApiError::bad_request(
-                "InvalidAlias",
+                ErrorCode::InvalidAlias,
                 "An alias must define a non-empty \"indexes\" array.",
             )
         })?;
     for index in indexes {
         if !index.is_string() || index.as_str().is_some_and(str::is_empty) {
             return Err(ApiError::bad_request(
-                "InvalidAlias",
+                ErrorCode::InvalidAlias,
                 "Alias \"indexes\" entries must be non-empty index name strings.",
             ));
         }
@@ -276,7 +276,7 @@ fn validate_knowledge_source(definition: &Value) -> Result<(), ApiError> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             ApiError::bad_request(
-                "InvalidKnowledgeSource",
+                ErrorCode::InvalidKnowledgeSource,
                 "A knowledge source must define a non-empty \"kind\".",
             )
         })?;
@@ -290,7 +290,7 @@ fn validate_knowledge_source(definition: &Value) -> Result<(), ApiError> {
             .filter(|s| !s.is_empty());
         if index_name.is_none() {
             return Err(ApiError::bad_request(
-                "InvalidKnowledgeSource",
+                ErrorCode::InvalidKnowledgeSource,
                 "A searchIndex knowledge source must define \
                  \"searchIndexParameters.searchIndexName\".",
             ));
@@ -307,7 +307,7 @@ fn validate_knowledge_base(definition: &Value) -> Result<(), ApiError> {
         .filter(|items| !items.is_empty())
         .ok_or_else(|| {
             ApiError::bad_request(
-                "InvalidKnowledgeBase",
+                ErrorCode::InvalidKnowledgeBase,
                 "A knowledge base must define a non-empty \"knowledgeSources\" array.",
             )
         })?;
@@ -318,7 +318,7 @@ fn validate_knowledge_base(definition: &Value) -> Result<(), ApiError> {
             .is_none_or(str::is_empty)
         {
             return Err(ApiError::bad_request(
-                "InvalidKnowledgeBase",
+                ErrorCode::InvalidKnowledgeBase,
                 "Each \"knowledgeSources\" entry must have a non-empty \"name\".",
             ));
         }

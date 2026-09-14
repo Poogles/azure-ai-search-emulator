@@ -12,7 +12,7 @@
 //! version is accepted, so newer SDK defaults keep working without
 //! reconfiguration. Versions below the floor are rejected explicitly.
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ErrorCode};
 
 /// Validates `api-version` query parameters against the supported set.
 #[derive(Debug, Clone)]
@@ -75,11 +75,11 @@ impl VersionAdapter {
     pub fn check(&self, version: Option<&str>) -> Result<(), ApiError> {
         match version {
             None => Err(ApiError::bad_request(
-                "ApiVersionMissing",
+                ErrorCode::ApiVersionMissing,
                 "The 'api-version' query parameter is required.",
             )),
             Some(v) if !self.is_supported(v) => Err(ApiError::bad_request(
-                "ApiVersionUnsupported",
+                ErrorCode::ApiVersionUnsupported,
                 format!(
                     "API version {v} is not supported. Supported versions: {}.",
                     self.supported.join(", ")
@@ -135,7 +135,7 @@ mod tests {
             Ok(()) => panic!("expected ApiVersionMissing error"),
             Err(err) => err,
         };
-        assert_eq!(err.code, "ApiVersionMissing");
+        assert_eq!(err.code.as_str(), "ApiVersionMissing");
         assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
     }
 
@@ -146,7 +146,7 @@ mod tests {
             Ok(()) => panic!("expected ApiVersionUnsupported error"),
             Err(err) => err,
         };
-        assert_eq!(err.code, "ApiVersionUnsupported");
+        assert_eq!(err.code.as_str(), "ApiVersionUnsupported");
         assert!(err.message.contains("2024-07-01"));
         assert!(err.message.contains("2025-03-01"));
     }

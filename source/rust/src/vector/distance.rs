@@ -18,30 +18,15 @@ pub enum Metric {
     Euclidean,
 }
 
-impl Metric {
-    /// Parses the Azure `metric` spelling. Only the documented spellings are
-    /// accepted; anything else is rejected with `400 InvalidIndex` by the
-    /// caller. Named `parse` (rather than `from_str`) to avoid confusion
-    /// with [`std::str::FromStr::from_str`].
-    #[must_use]
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "cosine" => Some(Metric::Cosine),
-            "dotProduct" => Some(Metric::DotProduct),
-            "euclidean" => Some(Metric::Euclidean),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Metric::Cosine => "cosine",
-            Metric::DotProduct => "dotProduct",
-            Metric::Euclidean => "euclidean",
-        }
-    }
-}
+// Parses the Azure `metric` spelling. Only the documented spellings are
+// accepted; anything else is rejected with `400 InvalidIndex` by the caller.
+// Named `parse` (rather than `from_str`) to avoid confusion with
+// `std::str::FromStr::from_str`.
+crate::string_enum!(Metric both {
+    Cosine => "cosine",
+    DotProduct => "dotProduct",
+    Euclidean => "euclidean",
+});
 
 /// Converts an HNSW `distance` (as returned in [`hnsw_rs::prelude::Neighbour`])
 /// into the emulator's `@search.score` for the given metric.

@@ -84,72 +84,87 @@ fn compare_scored(
     a.0.key.cmp(&b.0.key)
 }
 
+/// Compares two documents on `field` by a comparable sort key. A missing
+/// value sorts first in ascending order and last in descending order (the
+/// `Option` key orders `None` below `Some`, and `descending` reverses it),
+/// matching Azure's null ordering.
 fn compare_field(a: &Document, b: &Document, field: &str, descending: bool) -> std::cmp::Ordering {
-    let (av, bv) = (a.fields.get(field), b.fields.get(field));
-    match (av, bv) {
-        (None, None) => std::cmp::Ordering::Equal,
-        // Azure sorts nulls first in ascending order (last in descending).
-        (None, Some(_)) => {
-            if descending {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Less
-            }
-        }
-        (Some(_), None) => {
-            if descending {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Greater
-            }
-        }
-        (Some(av), Some(bv)) => {
-            let ordering = compare_values(av, bv);
-            if descending {
-                ordering.reverse()
-            } else {
-                ordering
-            }
-        }
+    let ordering = sort_key(a.fields.get(field)).cmp(&sort_key(b.fields.get(field)));
+    if descending {
+        ordering.reverse()
+    } else {
+        ordering
     }
 }
 
-fn compare_values(av: &Value, bv: &Value) -> std::cmp::Ordering {
-    match (av, bv) {
-        (Value::Number(a), Value::Number(b)) => compare_numbers(a, b),
-        (Value::String(a), Value::String(b)) => a.cmp(b),
-        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
-        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
-        // Mixed types: order by type tag so the result is deterministic.
-        _ => type_tag(av).cmp(&type_tag(bv)),
+/// A comparable key for a document field value. The `Option` wrapper puts
+/// missing values first (ascending); the inner [`SortKey`] orders present
+/// values by type tag, then by value within a type.
+fn sort_key(value: Option<&Value>) -> Option<SortKey> {
+    value.map(|value| match value {
+        Value::Null => SortKey::Null,
+        Value::Bool(b) => SortKey::Bool(*b),
+        Value::Number(n) => SortKey::Number(number_key(n)),
+        Value::String(s) => SortKey::String(s.clone()),
+        Value::Array(_) => SortKey::Array,
+        Value::Object(_) => SortKey::Object,
+    })
+}
+
+/// The comparable form of a JSON value. Variant order is the type-tag order
+/// used for mixed-type comparisons (`Null < Bool < Number < String < Array <
+/// Object`); within a type the payload orders by value.
+#[derive(PartialOrd, Ord, PartialEq, Eq)]
+enum SortKey {
+    Null,
+    Bool(bool),
+    Number(NumberKey),
+    String(String),
+    Array,
+    Object,
+}
+
+/// A comparable key for a JSON number. Ordered by the `f64` value, with the
+/// exact integer (as `i128`) as a tie-breaker so large magnitudes that round
+/// to the same `f64` still order exactly. `f64` conversion is monotonic, so
+/// this matches comparing integers in their native `i64`/`u64` form and
+/// falling back to `f64` for floats and mixed pairs.
+#[derive(Clone, Copy)]
+struct NumberKey {
+    f64: f64,
+    int: Option<i128>,
+}
+
+impl PartialEq for NumberKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
     }
 }
 
-/// Compares two JSON numbers: integer values are compared in their native
-/// `i64`/`u64` form so large magnitudes order exactly (an `f64` comparison
-/// would round them together), falling back to `f64` for floats and mixed
-/// integer/float pairs.
-fn compare_numbers(a: &serde_json::Number, b: &serde_json::Number) -> std::cmp::Ordering {
-    match (a.as_i64(), b.as_i64()) {
-        (Some(x), Some(y)) => x.cmp(&y),
-        _ => match (a.as_u64(), b.as_u64()) {
-            (Some(x), Some(y)) => x.cmp(&y),
-            _ => a
-                .as_f64()
-                .partial_cmp(&b.as_f64())
-                .unwrap_or(std::cmp::Ordering::Equal),
-        },
+impl Eq for NumberKey {}
+
+impl PartialOrd for NumberKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
-fn type_tag(value: &Value) -> u8 {
-    match value {
-        Value::Null => 0,
-        Value::Bool(_) => 1,
-        Value::Number(_) => 2,
-        Value::String(_) => 3,
-        Value::Array(_) => 4,
-        Value::Object(_) => 5,
+impl Ord for NumberKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.f64
+            .total_cmp(&other.f64)
+            .then_with(|| self.int.cmp(&other.int))
+    }
+}
+
+fn number_key(n: &serde_json::Number) -> NumberKey {
+    let int = n
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| n.as_u64().map(i128::from));
+    NumberKey {
+        f64: n.as_f64().unwrap_or(f64::NAN),
+        int,
     }
 }
 

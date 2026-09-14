@@ -36,37 +36,19 @@ pub struct Config {
     pub max_vector_dimension: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
+    #[error("invalid EMULATOR_PORT value: {0:?}")]
     InvalidPort(String),
+    #[error("invalid EMULATOR_STORAGE__MODE value: {0:?} (expected \"memory\" or \"file\")")]
     InvalidStorageMode(String),
+    #[error("invalid EMULATOR_API_VERSIONS value: {0:?}")]
     InvalidApiVersions(String),
+    #[error("invalid boolean value: {0}")]
     InvalidBool(String),
+    #[error("invalid EMULATOR_VECTOR__MAX_DIMENSION value: {0:?}")]
     InvalidMaxVectorDimension(String),
 }
-
-impl fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ConfigError::InvalidPort(v) => write!(f, "invalid EMULATOR_PORT value: {v:?}"),
-            ConfigError::InvalidStorageMode(v) => {
-                write!(
-                    f,
-                    "invalid EMULATOR_STORAGE__MODE value: {v:?} (expected \"memory\" or \"file\")"
-                )
-            }
-            ConfigError::InvalidApiVersions(v) => {
-                write!(f, "invalid EMULATOR_API_VERSIONS value: {v:?}")
-            }
-            ConfigError::InvalidBool(v) => write!(f, "invalid boolean value: {v}"),
-            ConfigError::InvalidMaxVectorDimension(v) => {
-                write!(f, "invalid EMULATOR_VECTOR__MAX_DIMENSION value: {v:?}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ConfigError {}
 
 /// Parses a non-empty value with `parse`, returning `default` when the value
 /// is unset and `err(raw)` when it is present but fails to parse.

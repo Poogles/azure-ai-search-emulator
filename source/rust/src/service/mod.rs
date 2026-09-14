@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ErrorCode};
 use crate::filter::{self, FilterExpr};
 use crate::query::{parse_search_text, Clause, FullTextQuery, QueryError, QueryType, SearchEngine};
 use crate::storage::{
@@ -142,12 +142,12 @@ impl SearchService {
                 }
                 if let Err(message) = self.create_vector_indexes(&definition) {
                     self.rollback_index(&definition.name);
-                    return Err(ApiError::bad_request("InvalidIndex", message));
+                    return Err(ApiError::bad_request(ErrorCode::InvalidIndex, message));
                 }
                 Ok(definition.raw.clone())
             }
             Err(StorageError::IndexAlreadyExists(name)) => Err(ApiError::conflict(
-                "IndexAlreadyExists",
+                ErrorCode::IndexAlreadyExists,
                 format!("An index with name {name:?} already exists."),
             )),
             Err(StorageError::IndexNotFound(name)) => Err(ApiError::not_found(format!(
@@ -198,7 +198,7 @@ impl SearchService {
         self.vectors.delete_index(&definition.name);
         if let Err(message) = self.create_vector_indexes(&definition) {
             self.rollback_index(&definition.name);
-            return Err(ApiError::bad_request("InvalidIndex", message));
+            return Err(ApiError::bad_request(ErrorCode::InvalidIndex, message));
         }
         // Re-materialize preserved documents: engine, vectors, then storage
         // (the same order as a fresh upload). A failure rolls the index back
@@ -287,7 +287,7 @@ impl SearchService {
     fn check_alias_collision(&self, name: &str) -> Result<(), ApiError> {
         if self.named_store(ResourceKind::Alias).contains(name) {
             return Err(ApiError::conflict(
-                "IndexAlreadyExists",
+                ErrorCode::IndexAlreadyExists,
                 format!("An alias with name {name:?} already exists."),
             ));
         }
@@ -365,7 +365,10 @@ impl SearchService {
     ) -> Result<Vec<SynonymRule>, ApiError> {
         validate_synonym_map(name, format, synonyms)?;
         parse_synonym_rules(synonyms).map_err(|e| {
-            ApiError::bad_request("InvalidSynonymMap", format!("Invalid synonym rules: {e}"))
+            ApiError::bad_request(
+                ErrorCode::InvalidSynonymMap,
+                format!("Invalid synonym rules: {e}"),
+            )
         })
     }
 
@@ -811,7 +814,7 @@ impl SearchService {
             Value::Null => &Map::new(),
             _ => {
                 return Err(ApiError::bad_request(
-                    "InvalidQuery",
+                    ErrorCode::InvalidQuery,
                     "Search request body must be a JSON object.",
                 ))
             }
@@ -820,7 +823,7 @@ impl SearchService {
         for key in UNSUPPORTED_SEARCH_OPTIONS {
             if obj.contains_key(*key) {
                 return Err(ApiError::unsupported(
-                    "UnsupportedQuery",
+                    ErrorCode::UnsupportedQuery,
                     format!("The {key:?} search option is not supported by the emulator."),
                 ));
             }
@@ -829,7 +832,7 @@ impl SearchService {
         // parsed by the engine's query parser).
         let query_type = match obj.get("queryType").and_then(Value::as_str) {
             Some(value) => QueryType::parse(value).map_err(|e| {
-                ApiError::bad_request("InvalidQuery", format!("Invalid queryType: {e}"))
+                ApiError::bad_request(ErrorCode::InvalidQuery, format!("Invalid queryType: {e}"))
             })?,
             None => QueryType::Simple,
         };
@@ -848,7 +851,7 @@ impl SearchService {
         };
         if let Some(expr) = &filter {
             filter::validate(expr, &definition).map_err(|e| {
-                ApiError::bad_request("InvalidQuery", format!("Invalid filter: {e}"))
+                ApiError::bad_request(ErrorCode::InvalidQuery, format!("Invalid filter: {e}"))
             })?;
         }
 
@@ -1153,13 +1156,16 @@ impl SearchService {
             return Ok((query.skip, query.filter.clone(), query.orderby.clone()));
         };
         let token = ContinuationToken::decode(raw).map_err(|e| {
-            ApiError::bad_request("InvalidQuery", format!("Invalid continuation token: {e}"))
+            ApiError::bad_request(
+                ErrorCode::InvalidQuery,
+                format!("Invalid continuation token: {e}"),
+            )
         })?;
         if (current_vector_hash.is_some() || token.vector_query_hash.is_some())
             && current_vector_hash != token.vector_query_hash
         {
             return Err(ApiError::bad_request(
-                "InvalidQuery",
+                ErrorCode::InvalidQuery,
                 "Vector query changed during paging; restart the search.",
             ));
         }
@@ -1330,7 +1336,7 @@ impl SearchService {
         let needle = search.to_lowercase();
         if needle.is_empty() {
             return Err(ApiError::bad_request(
-                "InvalidQuery",
+                ErrorCode::InvalidQuery,
                 "The autocomplete search text must be a non-empty string.",
             ));
         }
@@ -1377,7 +1383,7 @@ impl SearchService {
         let needle = search_text.trim().to_lowercase();
         if needle.is_empty() {
             return Err(ApiError::bad_request(
-                "InvalidQuery",
+                ErrorCode::InvalidQuery,
                 "The suggest search text must be a non-empty string.",
             ));
         }
@@ -1418,7 +1424,7 @@ impl SearchService {
             .cloned()
             .ok_or_else(|| {
                 ApiError::bad_request(
-                    "InvalidQuery",
+                    ErrorCode::InvalidQuery,
                     format!("Suggester {suggester_name:?} is not defined on index {index:?}."),
                 )
             })?;
@@ -1516,7 +1522,7 @@ impl SearchService {
         if let Some(name) = analyzer {
             if !Self::KNOWN_ANALYZERS.contains(&name) {
                 return Err(ApiError::bad_request(
-                    "InvalidRequest",
+                    ErrorCode::InvalidRequest,
                     format!(
                         "Unknown analyzer {name:?}; supported analyzers: {}.",
                         Self::KNOWN_ANALYZERS.join(", ")
@@ -1527,7 +1533,7 @@ impl SearchService {
         if let Some(name) = field {
             if definition.field_path(name).is_none() {
                 return Err(ApiError::bad_request(
-                    "InvalidRequest",
+                    ErrorCode::InvalidRequest,
                     format!("Analyze field {name:?} does not exist in index {index:?}."),
                 ));
             }
@@ -1638,7 +1644,7 @@ fn prepare_full_text(
             ..FullTextQuery::default()
         },
         (Some(text), QueryType::Simple) => parse_search_text(text).map_err(|e| {
-            ApiError::bad_request("InvalidQuery", format!("Invalid search text: {e}"))
+            ApiError::bad_request(ErrorCode::InvalidQuery, format!("Invalid search text: {e}"))
         })?,
         (None, _) => FullTextQuery::default(),
     };
@@ -1671,9 +1677,10 @@ fn engine_error(index: &str, error: QueryError) -> ApiError {
         QueryError::IndexNotFound(name) => {
             ApiError::not_found(format!("Index {name:?} was not found."))
         }
-        QueryError::InvalidQuery(message) => {
-            ApiError::bad_request("InvalidQuery", format!("Invalid search text: {message}"))
-        }
+        QueryError::InvalidQuery(message) => ApiError::bad_request(
+            ErrorCode::InvalidQuery,
+            format!("Invalid search text: {message}"),
+        ),
         QueryError::Engine(message) => {
             ApiError::internal(format!("Search failed for index {index:?}: {message}"))
         }
@@ -1682,7 +1689,7 @@ fn engine_error(index: &str, error: QueryError) -> ApiError {
 
 fn parse_index_definition(raw: &Value) -> Result<IndexDefinition, ApiError> {
     IndexDefinition::from_json(raw.clone())
-        .map_err(|message| ApiError::bad_request("InvalidIndex", message))
+        .map_err(|message| ApiError::bad_request(ErrorCode::InvalidIndex, message))
 }
 
 #[cfg(test)]
@@ -2294,9 +2301,9 @@ mod tests {
 
         // Unknown facet options are rejected explicitly.
         let api_error = err(service.parse_search("items", &json!({"facets": ["tags,minimum:1"]})));
-        assert_eq!(api_error.code, "InvalidQuery");
+        assert_eq!(api_error.code.as_str(), "InvalidQuery");
         let api_error = err(service.parse_search("items", &json!({"facets": ["tags,count:many"]})));
-        assert_eq!(api_error.code, "InvalidQuery");
+        assert_eq!(api_error.code.as_str(), "InvalidQuery");
     }
 
     #[test]
@@ -2305,35 +2312,35 @@ mod tests {
         ok(service.create_index(&index_body()));
         // Unknown filter field.
         let api_error = err(service.parse_search("items", &json!({"filter": "missing eq 1"})));
-        assert_eq!(api_error.code, "InvalidQuery");
+        assert_eq!(api_error.code.as_str(), "InvalidQuery");
         // Non-sortable field in orderby.
         let api_error = err(service.parse_search("items", &json!({"orderby": "title"})));
-        assert_eq!(api_error.code, "InvalidQuery");
+        assert_eq!(api_error.code.as_str(), "InvalidQuery");
         // Unknown field in select.
         let api_error = err(service.parse_search("items", &json!({"select": "nope"})));
-        assert_eq!(api_error.code, "InvalidQuery");
+        assert_eq!(api_error.code.as_str(), "InvalidQuery");
         // Non-facetable field in facets.
         let api_error = err(service.parse_search("items", &json!({"facets": "price"})));
-        assert_eq!(api_error.code, "InvalidQuery");
+        assert_eq!(api_error.code.as_str(), "InvalidQuery");
         // Non-searchable field in searchFields.
         let api_error = err(service.parse_search("items", &json!({"searchFields": "price"})));
-        assert_eq!(api_error.code, "InvalidQuery");
+        assert_eq!(api_error.code.as_str(), "InvalidQuery");
         // Bad searchFields weight.
         let api_error = err(service.parse_search("items", &json!({"searchFields": "title^many"})));
-        assert_eq!(api_error.code, "InvalidQuery");
+        assert_eq!(api_error.code.as_str(), "InvalidQuery");
         let api_error = err(service.parse_search("items", &json!({"searchFields": "title^0"})));
-        assert_eq!(api_error.code, "InvalidQuery");
+        assert_eq!(api_error.code.as_str(), "InvalidQuery");
         // Highlight on an unknown or non-searchable field is rejected.
         let api_error = err(service.parse_search("items", &json!({"highlight": "missing"})));
-        assert_eq!(api_error.code, "InvalidQuery");
+        assert_eq!(api_error.code.as_str(), "InvalidQuery");
         let api_error = err(service.parse_search("items", &json!({"highlight": "price"})));
-        assert_eq!(api_error.code, "InvalidQuery");
+        assert_eq!(api_error.code.as_str(), "InvalidQuery");
         // Invalid searchMode.
         let api_error = err(service.parse_search("items", &json!({"searchMode": "both"})));
-        assert_eq!(api_error.code, "InvalidQuery");
+        assert_eq!(api_error.code.as_str(), "InvalidQuery");
         // Bad filter syntax.
         let api_error = err(service.parse_search("items", &json!({"filter": "price eq"})));
-        assert_eq!(api_error.code, "InvalidQuery");
+        assert_eq!(api_error.code.as_str(), "InvalidQuery");
     }
 
     #[test]
@@ -2567,7 +2574,7 @@ mod tests {
         assert_eq!(texts, vec!["boston"]);
         // An invalid filter is rejected.
         let api_error = err(service.suggest("items", "sg", "bos", 5, Some("tags/any(t:")));
-        assert_eq!(api_error.code, "InvalidQuery");
+        assert_eq!(api_error.code.as_str(), "InvalidQuery");
     }
 
     #[test]
@@ -2579,14 +2586,14 @@ mod tests {
         assert_eq!(api_error.status, axum::http::StatusCode::NOT_FOUND);
         // Unknown suggester.
         let api_error = err(service.autocomplete("items", "nope", "bos", 5, None));
-        assert_eq!(api_error.code, "InvalidQuery");
+        assert_eq!(api_error.code.as_str(), "InvalidQuery");
         let api_error = err(service.suggest("items", "nope", "bos", 5, None));
-        assert_eq!(api_error.code, "InvalidQuery");
+        assert_eq!(api_error.code.as_str(), "InvalidQuery");
         // Empty search text.
         let api_error = err(service.autocomplete("items", "sg", "   ", 5, None));
-        assert_eq!(api_error.code, "InvalidQuery");
+        assert_eq!(api_error.code.as_str(), "InvalidQuery");
         let api_error = err(service.suggest("items", "sg", "", 5, None));
-        assert_eq!(api_error.code, "InvalidQuery");
+        assert_eq!(api_error.code.as_str(), "InvalidQuery");
     }
 
     #[test]

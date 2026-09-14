@@ -14,7 +14,7 @@ use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 
 use crate::config::Config;
-use crate::error::ApiError;
+use crate::error::{ApiError, ErrorCode};
 use crate::query::SearchEngine;
 use crate::service::{DocumentAction, ResourceKind, SearchOutcome, SearchService};
 use crate::vector::VectorEngine;
@@ -152,7 +152,7 @@ async fn create_or_update_index(
     let body_name = definition.get("name").and_then(Value::as_str).unwrap_or("");
     if name != body_name {
         return Err(ApiError::bad_request(
-            "InvalidIndex",
+            ErrorCode::InvalidIndex,
             format!("Index name in path ({name:?}) does not match index name in body."),
         ));
     }
@@ -427,7 +427,7 @@ async fn analyze_text(
     let name = parse_index_name(&raw_name)?;
     let raw = parse_body(&body)?;
     let text = raw.get("text").and_then(Value::as_str).ok_or_else(|| {
-        ApiError::bad_request("InvalidRequest", "The \"text\" field is required.")
+        ApiError::bad_request(ErrorCode::InvalidRequest, "The \"text\" field is required.")
     })?;
     let analyzer = raw
         .get("analyzer")
@@ -683,23 +683,24 @@ async fn request_logging(request: Request, next: middleware::Next) -> Response {
 
 /// Parses the OData-style index path segment `indexes('name')`.
 fn parse_index_name(raw: &str) -> Result<String, ApiError> {
-    parse_odata_segment(raw, "indexes(", "index", "InvalidIndexName")
+    parse_odata_segment(raw, "indexes(", "index", ErrorCode::InvalidIndexName)
 }
 
 /// Parses the OData-style document path segment `docs('key')`.
 fn parse_document_key(raw: &str) -> Result<String, ApiError> {
-    parse_odata_segment(raw, "docs(", "document", "InvalidRequest")
+    parse_odata_segment(raw, "docs(", "document", ErrorCode::InvalidRequest)
 }
 
 fn parse_body(body: &axum::body::Bytes) -> Result<Value, ApiError> {
     if body.is_empty() {
         return Err(ApiError::bad_request(
-            "InvalidRequest",
+            ErrorCode::InvalidRequest,
             "Request body is required.",
         ));
     }
-    serde_json::from_slice(body)
-        .map_err(|e| ApiError::bad_request("InvalidRequest", format!("Invalid JSON body: {e}")))
+    serde_json::from_slice(body).map_err(|e| {
+        ApiError::bad_request(ErrorCode::InvalidRequest, format!("Invalid JSON body: {e}"))
+    })
 }
 
 /// The document actions of an upload batch: a bare JSON array, or an object
@@ -709,7 +710,7 @@ fn batch_items(batch: &Value) -> Result<&Vec<Value>, ApiError> {
         Value::Array(items) => Ok(items),
         _ => batch.get("value").and_then(Value::as_array).ok_or_else(|| {
             ApiError::bad_request(
-                "InvalidDocuments",
+                ErrorCode::InvalidDocuments,
                 "Document batch must be a JSON array of actions or an object with a \"value\" array.",
             )
         }),
@@ -743,10 +744,13 @@ fn suggest_request_params(
         })
     };
     let search_text = param(&["search", "searchText"]).ok_or_else(|| {
-        ApiError::bad_request("InvalidQuery", "The \"search\" field is required.")
+        ApiError::bad_request(ErrorCode::InvalidQuery, "The \"search\" field is required.")
     })?;
     let suggester_name = param(&["suggesterName"]).ok_or_else(|| {
-        ApiError::bad_request("InvalidQuery", "The \"suggesterName\" field is required.")
+        ApiError::bad_request(
+            ErrorCode::InvalidQuery,
+            "The \"suggesterName\" field is required.",
+        )
     })?;
     let top = match raw.get("top") {
         // An explicit `top` must be a positive integer; an absent (or null)
@@ -758,7 +762,10 @@ fn suggest_request_params(
             }
         }
         Some(value) => value.as_u64().filter(|top| *top > 0).ok_or_else(|| {
-            ApiError::bad_request("InvalidQuery", "\"top\" must be a positive integer.")
+            ApiError::bad_request(
+                ErrorCode::InvalidQuery,
+                "\"top\" must be a positive integer.",
+            )
         })?,
     };
     // An optional `filter` narrows the candidate documents (like the search
@@ -772,7 +779,12 @@ fn parse_top_param(raw: &str) -> Result<u64, ApiError> {
     raw.parse::<u64>()
         .ok()
         .filter(|top| *top > 0)
-        .ok_or_else(|| ApiError::bad_request("InvalidQuery", "\"top\" must be a positive integer."))
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                ErrorCode::InvalidQuery,
+                "\"top\" must be a positive integer.",
+            )
+        })
 }
 
 fn extract_index(path: &str) -> Option<String> {

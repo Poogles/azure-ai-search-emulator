@@ -146,34 +146,34 @@ suite (`make test`) green.
 
 ## 3. Stringly-typed surfaces (compiler-checked replacements)
 
-- [ ] **3.1 `FieldType` enum.** `storage/mod.rs:12-36`
+- [x] **3.1 `FieldType` enum.** `storage/mod.rs:12-36`
   `field_type: String` compared as raw strings in >=8 places
   (`validation.rs:115-118`, `parsing.rs:668`, `query/mod.rs:356`,
   `is_vector_field:125-130`, `is_complex_type:147-152`,
   `is_collection:156-158`, `SUPPORTED_FIELD_TYPES:25-44`, `type_ok:530-538`).
   Add `enum FieldType` with `FromStr`; keep raw string only for echo.
-- [ ] **3.2 `ErrorCode` enum.** `error.rs:11-16` `code: String` + ~100
+- [x] **3.2 `ErrorCode` enum.** `error.rs:11-16` `code: String` + ~100
   `bad_request("InvalidQuery"/...)` call sites. Add
   `enum ErrorCode { InvalidQuery, InvalidIndex, ... }` with `as_str()`;
   `bad_request(code: ErrorCode, ...)`.
-- [ ] **3.3 String-enum uniformity.** `service/types.rs:114-131`
+- [x] **3.3 String-enum uniformity.** `service/types.rs:114-131`
   `VectorFilterMode::as_str` + `vector/distance.rs:36-44` `Metric::as_str` +
   `filter/mod.rs:37-53` `FilterOp`/`StringFunc::parse` hand-rolled pairs
   (`Metric::parse` vs `as_str` already disagree on `cosineSimilarity`).
   `strum(EnumString, Display)` or local `string_enum!` macro.
-- [ ] **3.4 `ConfigError`/`StorageError`/`QueryError` display.** `config.rs:39-69`
+- [x] **3.4 `ConfigError`/`StorageError`/`QueryError` display.** `config.rs:39-69`
   (+ `storage/mod.rs:387-402`, `query/mod.rs:93-103`) manual `Display`.
   `thiserror` derive; uniform messages (fixes `InvalidBool:61` dropping the
   var name).
-- [ ] **3.5 Filter dispatcher table.** `filter/parser.rs:225-337`
+- [x] **3.5 Filter dispatcher table.** `filter/parser.rs:225-337`
   `parse_comparison` is an order-dependent 110-line `peek` chain
   (lambda -> any/all -> date-fn -> `search.*` -> plain-fn -> `in` -> op).
   Table of prefix -> parse-fn.
-- [ ] **3.6 Ordering sort keys.** `service/ordering.rs:87-143`
+- [x] **3.6 Ordering sort keys.** `service/ordering.rs:87-143`
   `compare_field` + `compare_values`/`compare_numbers` nested `Option` x
   type-tag x `i64`/`u64`/`f64` ladder. Comparable `sort_key(Option<&Value>)`
   tuple + `sort_by_key`.
-- [ ] **3.7 Analyzer registry.** `query/analyzers.rs:91-121`
+- [x] **3.7 Analyzer registry.** `query/analyzers.rs:91-121`
   `analyzer_tokenizer_name` 20-arm match + `None | Some(_)` catch-all mapping
   unknown -> English. `phf::Map` or generated table + explicit `Unknown`
   variant so new analyzers are a data change.

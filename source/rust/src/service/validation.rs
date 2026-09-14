@@ -2,8 +2,8 @@
 
 use serde_json::Value;
 
-use crate::error::ApiError;
-use crate::storage::{Document, FieldDefinition, IndexDefinition};
+use crate::error::{ApiError, ErrorCode};
+use crate::storage::{Document, FieldDefinition, FieldType, IndexDefinition};
 use crate::vector::parse_vector_search;
 
 pub(crate) fn key_field_name(definition: &IndexDefinition) -> String {
@@ -22,25 +22,25 @@ pub(crate) fn key_display(value: &Value) -> Option<String> {
 }
 
 /// Field types accepted by the schema validator.
-const SUPPORTED_FIELD_TYPES: &[&str] = &[
-    "Edm.String",
-    "Edm.Int32",
-    "Edm.Int64",
-    "Edm.Single",
-    "Edm.Double",
-    "Edm.Boolean",
-    "Edm.DateTimeOffset",
-    "Edm.Guid",
-    "Edm.GeographyPoint",
-    "Edm.Collection(Edm.String)",
-    "Edm.Collection(Edm.Int32)",
-    "Edm.Collection(Edm.Int64)",
-    "Edm.Collection(Edm.Single)",
-    "Edm.Collection(Edm.Double)",
-    "Edm.Collection(Edm.Half)",
-    "Edm.Collection(Edm.Boolean)",
-    "Edm.Collection(Edm.DateTimeOffset)",
-    "Edm.Collection(Edm.Guid)",
+const SUPPORTED_FIELD_TYPES: &[FieldType] = &[
+    FieldType::String,
+    FieldType::Int32,
+    FieldType::Int64,
+    FieldType::Single,
+    FieldType::Double,
+    FieldType::Boolean,
+    FieldType::DateTimeOffset,
+    FieldType::Guid,
+    FieldType::GeographyPoint,
+    FieldType::CollectionString,
+    FieldType::CollectionInt32,
+    FieldType::CollectionInt64,
+    FieldType::CollectionSingle,
+    FieldType::CollectionDouble,
+    FieldType::CollectionHalf,
+    FieldType::CollectionBoolean,
+    FieldType::CollectionDateTimeOffset,
+    FieldType::CollectionGuid,
 ];
 
 /// Inserts `name` into `seen`; on a duplicate, returns the `InvalidIndex`
@@ -51,7 +51,7 @@ fn ensure_unique<'a>(
     message: impl FnOnce() -> String,
 ) -> Result<(), ApiError> {
     if !seen.insert(name) {
-        return Err(ApiError::bad_request("InvalidIndex", message()));
+        return Err(ApiError::bad_request(ErrorCode::InvalidIndex, message()));
     }
     Ok(())
 }
@@ -70,7 +70,7 @@ pub(crate) fn validate_schema(
         if field.is_key {
             if field.is_complex_type() {
                 return Err(ApiError::bad_request(
-                    "InvalidIndex",
+                    ErrorCode::InvalidIndex,
                     format!(
                         "Field {:?} cannot be the key: complex type fields cannot be keys.",
                         field.name
@@ -82,7 +82,7 @@ pub(crate) fn validate_schema(
         if field.is_complex_type() {
             if field.searchable || field.sortable || field.facetable {
                 return Err(ApiError::bad_request(
-                    "InvalidIndex",
+                    ErrorCode::InvalidIndex,
                     format!(
                         "Field {:?} is a complex type and cannot be searchable, sortable, or facetable; \
                          set those attributes on its subfields instead.",
@@ -91,21 +91,25 @@ pub(crate) fn validate_schema(
                 ));
             }
             validate_subfields(field)?;
-        } else if !SUPPORTED_FIELD_TYPES.contains(&field.field_type.as_str()) {
+        } else if !SUPPORTED_FIELD_TYPES.contains(&field.field_type) {
             return Err(ApiError::bad_request(
-                "InvalidIndex",
+                ErrorCode::InvalidIndex,
                 format!(
                     "Unsupported field type {:?} for field {:?}. Supported types: {}, Edm.ComplexType.",
-                    field.field_type,
+                    field.field_type.as_str(),
                     field.name,
-                    SUPPORTED_FIELD_TYPES.join(", ")
+                    SUPPORTED_FIELD_TYPES
+                        .iter()
+                        .map(FieldType::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
             ));
         }
     }
     if key_count != 1 {
         return Err(ApiError::bad_request(
-            "InvalidIndex",
+            ErrorCode::InvalidIndex,
             format!("Index schema must define exactly one key field; found {key_count}."),
         ));
     }
@@ -122,15 +126,12 @@ pub(crate) fn validate_vector_field(
     if !attempts_vector {
         return Ok(());
     }
-    if !matches!(
-        field.field_type.as_str(),
-        "Edm.Collection(Edm.Single)" | "Edm.Collection(Edm.Half)"
-    ) {
+    if !field.field_type.is_vector_field_type() {
         return Err(ApiError::bad_request(
-            "InvalidIndex",
+            ErrorCode::InvalidIndex,
             format!(
                 "Unsupported vector field type {:?} for field {:?}; only 'Collection(Edm.Single)' and 'Collection(Edm.Half)' are supported.",
-                field.field_type, field.name
+                field.field_type.as_str(), field.name
             ),
         ));
     }
@@ -143,7 +144,7 @@ pub(crate) fn validate_vector_field(
                 .or_else(|| field.raw.get("vector_search_dimensions"))
                 .map_or("missing".to_owned(), Value::to_string);
             return Err(ApiError::bad_request(
-                "InvalidIndex",
+                ErrorCode::InvalidIndex,
                 format!(
                     "Vector field {:?} has invalid dimensions {raw}; must be 1-{max_dimension}.",
                     field.name
@@ -157,7 +158,7 @@ pub(crate) fn validate_vector_field(
         .is_none_or(str::is_empty)
     {
         return Err(ApiError::bad_request(
-            "InvalidIndex",
+            ErrorCode::InvalidIndex,
             format!(
                 "Vector field {:?} is missing required \"vectorSearchProfile\".",
                 field.name
@@ -166,7 +167,7 @@ pub(crate) fn validate_vector_field(
     }
     if !field.searchable {
         return Err(ApiError::bad_request(
-            "InvalidIndex",
+            ErrorCode::InvalidIndex,
             format!(
                 "Vector field {:?} must be searchable; set \"searchable\": true.",
                 field.name
@@ -175,7 +176,7 @@ pub(crate) fn validate_vector_field(
     }
     if field.is_key {
         return Err(ApiError::bad_request(
-            "InvalidIndex",
+            ErrorCode::InvalidIndex,
             format!("Vector field {:?} cannot be the key.", field.name),
         ));
     }
@@ -186,7 +187,7 @@ pub(crate) fn validate_vector_field(
     ] {
         if set {
             return Err(ApiError::bad_request(
-                "InvalidIndex",
+                ErrorCode::InvalidIndex,
                 format!("Vector field {:?} cannot be {attribute}.", field.name),
             ));
         }
@@ -202,7 +203,7 @@ pub(crate) fn validate_vector_search_config(definition: &IndexDefinition) -> Res
         .collect();
     if vector_fields.len() > crate::vector::MAX_VECTOR_FIELDS {
         return Err(ApiError::bad_request(
-            "InvalidIndex",
+            ErrorCode::InvalidIndex,
             format!(
                 "Index {:?} has {} vector fields; at most {} are supported.",
                 definition.name,
@@ -223,7 +224,7 @@ pub(crate) fn validate_vector_search_config(definition: &IndexDefinition) -> Res
         .is_some_and(|profiles| !profiles.is_empty());
     if !has_profiles {
         return Err(ApiError::bad_request(
-            "InvalidIndex",
+            ErrorCode::InvalidIndex,
             format!(
                 "Index {:?} has vector fields but no vectorSearch configuration.",
                 definition.name
@@ -231,12 +232,12 @@ pub(crate) fn validate_vector_search_config(definition: &IndexDefinition) -> Res
         ));
     }
     let config = parse_vector_search(definition.vector_search.as_ref())
-        .map_err(|message| ApiError::bad_request("InvalidIndex", message))?;
+        .map_err(|message| ApiError::bad_request(ErrorCode::InvalidIndex, message))?;
     for field in vector_fields {
         let profile = field.vector_search_profile.clone().unwrap_or_default();
         if !config.profiles.contains_key(&profile) {
             return Err(ApiError::bad_request(
-                "InvalidIndex",
+                ErrorCode::InvalidIndex,
                 format!(
                     "Vector field {:?} references unknown vector search profile {profile:?}.",
                     field.name
@@ -258,7 +259,7 @@ pub(crate) fn validate_suggesters(definition: &IndexDefinition) -> Result<(), Ap
         })?;
         if suggester.search_fields.is_empty() {
             return Err(ApiError::bad_request(
-                "InvalidIndex",
+                ErrorCode::InvalidIndex,
                 format!(
                     "Suggester {:?} must define a non-empty \"searchFields\" array.",
                     suggester.name
@@ -268,7 +269,7 @@ pub(crate) fn validate_suggesters(definition: &IndexDefinition) -> Result<(), Ap
         for field_name in &suggester.search_fields {
             let field_def = definition.field_path(field_name).ok_or_else(|| {
                 ApiError::bad_request(
-                    "InvalidIndex",
+                    ErrorCode::InvalidIndex,
                     format!(
                         "Suggester {:?} references unknown field {:?}.",
                         suggester.name, field_name
@@ -277,7 +278,7 @@ pub(crate) fn validate_suggesters(definition: &IndexDefinition) -> Result<(), Ap
             })?;
             if !field_def.searchable {
                 return Err(ApiError::bad_request(
-                    "InvalidIndex",
+                    ErrorCode::InvalidIndex,
                     format!(
                         "Suggester {:?} references field {:?}, which is not searchable; \
                          mark it \"searchable\": true in the index schema.",
@@ -293,7 +294,7 @@ pub(crate) fn validate_suggesters(definition: &IndexDefinition) -> Result<(), Ap
 pub(crate) fn validate_subfields(field: &FieldDefinition) -> Result<(), ApiError> {
     if field.subfields.is_empty() {
         return Err(ApiError::bad_request(
-            "InvalidIndex",
+            ErrorCode::InvalidIndex,
             format!(
                 "Complex type field {:?} must define a non-empty \"fields\" array of subfields.",
                 field.name
@@ -310,7 +311,7 @@ pub(crate) fn validate_subfields(field: &FieldDefinition) -> Result<(), ApiError
         })?;
         if subfield.is_key {
             return Err(ApiError::bad_request(
-                "InvalidIndex",
+                ErrorCode::InvalidIndex,
                 format!(
                     "Subfield {:?} of complex type field {:?} cannot be a key.",
                     subfield.name, field.name
@@ -319,20 +320,22 @@ pub(crate) fn validate_subfields(field: &FieldDefinition) -> Result<(), ApiError
         }
         if subfield.has_dimensions_property() || subfield.vector_search_profile.is_some() {
             return Err(ApiError::bad_request(
-                "InvalidIndex",
+                ErrorCode::InvalidIndex,
                 format!(
                     "Subfield {:?} of complex type field {:?} cannot be a vector field.",
                     subfield.name, field.name
                 ),
             ));
         }
-        if !SUPPORTED_FIELD_TYPES.contains(&subfield.field_type.as_str()) {
+        if !SUPPORTED_FIELD_TYPES.contains(&subfield.field_type) {
             return Err(ApiError::bad_request(
-                "InvalidIndex",
+                ErrorCode::InvalidIndex,
                 format!(
                     "Unsupported subfield type {:?} for subfield {:?} of complex type field {:?}. \
                      Subfields must be scalar or collection-of-scalar types.",
-                    subfield.field_type, subfield.name, field.name
+                    subfield.field_type.as_str(),
+                    subfield.name,
+                    field.name
                 ),
             ));
         }
@@ -382,27 +385,25 @@ pub(crate) fn check_field_type(field: &FieldDefinition, value: &Value) -> Result
     }
     let name = &field.name;
     let field_type = &field.field_type;
-    let ok = if let Some(inner) = field_type
-        .strip_prefix("Edm.Collection(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
+    let ok = if let Some(inner) = field_type.inner_type() {
         value
             .as_array()
-            .is_some_and(|items| items.iter().all(|item| type_ok(inner, item)))
+            .is_some_and(|items| items.iter().all(|item| type_ok(&inner, item)))
     } else {
         type_ok(field_type, value)
     };
     if ok {
         Ok(())
     } else {
-        let hint = if field_type == "Edm.GeographyPoint" {
+        let hint = if matches!(field_type, FieldType::GeographyPoint) {
             " Expected a GeoJSON point object \
              {\"type\": \"Point\", \"coordinates\": [lon, lat]} or a string."
         } else {
             ""
         };
         Err(format!(
-            "Value for field {name:?} is not compatible with type {field_type:?}.{hint}"
+            "Value for field {name:?} is not compatible with type {:?}.{hint}",
+            field_type.as_str()
         ))
     }
 }
@@ -544,13 +545,13 @@ pub(crate) fn is_geography_point(value: &Value) -> bool {
 /// scalar type check: used directly for scalar fields and per-element for
 /// `Edm.Collection(...)` fields. Unknown types pass (schema validation has
 /// already rejected unsupported types).
-pub(crate) fn type_ok(inner: &str, value: &Value) -> bool {
+pub(crate) fn type_ok(inner: &FieldType, value: &Value) -> bool {
     match inner {
-        "Edm.String" | "Edm.DateTimeOffset" | "Edm.Guid" => value.is_string(),
-        "Edm.GeographyPoint" => is_geography_point(value),
-        "Edm.Int32" | "Edm.Int64" => value.is_i64() || value.is_u64(),
-        "Edm.Single" | "Edm.Double" => value.is_number(),
-        "Edm.Boolean" => value.is_boolean(),
+        FieldType::String | FieldType::DateTimeOffset | FieldType::Guid => value.is_string(),
+        FieldType::GeographyPoint => is_geography_point(value),
+        FieldType::Int32 | FieldType::Int64 => value.is_i64() || value.is_u64(),
+        FieldType::Single | FieldType::Double => value.is_number(),
+        FieldType::Boolean => value.is_boolean(),
         _ => true,
     }
 }

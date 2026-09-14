@@ -34,19 +34,16 @@ pub enum FilterOp {
     Le,
 }
 
-impl FilterOp {
-    pub(crate) fn parse(token: &str) -> Option<Self> {
-        match token {
-            "eq" => Some(Self::Eq),
-            "ne" => Some(Self::Ne),
-            "gt" => Some(Self::Gt),
-            "ge" => Some(Self::Ge),
-            "lt" => Some(Self::Lt),
-            "le" => Some(Self::Le),
-            _ => None,
-        }
-    }
+crate::string_enum!(pub(crate) FilterOp parse {
+    Eq => "eq",
+    Ne => "ne",
+    Gt => "gt",
+    Ge => "ge",
+    Lt => "lt",
+    Le => "le",
+});
 
+impl FilterOp {
     pub(crate) fn is_ordering(self) -> bool {
         matches!(self, Self::Gt | Self::Ge | Self::Lt | Self::Le)
     }
@@ -82,16 +79,11 @@ pub enum StringFunc {
     Contains,
 }
 
-impl StringFunc {
-    pub(crate) fn parse(name: &str) -> Option<Self> {
-        match name {
-            "startswith" => Some(Self::StartsWith),
-            "endswith" => Some(Self::EndsWith),
-            "contains" => Some(Self::Contains),
-            _ => None,
-        }
-    }
-}
+crate::string_enum!(pub(crate) StringFunc parse {
+    StartsWith => "startswith",
+    EndsWith => "endswith",
+    Contains => "contains",
+});
 
 /// The internal filter expression tree.
 #[derive(Debug, Clone, PartialEq)]
