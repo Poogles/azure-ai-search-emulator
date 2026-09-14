@@ -21,6 +21,7 @@ dependencies = [
  "chrono",
  "hnsw_rs",
  "http",
+ "regex",
  "serde",
  "serde_json",
  "tantivy",

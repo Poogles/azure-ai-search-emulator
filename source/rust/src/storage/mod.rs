@@ -389,6 +389,10 @@ pub struct IndexDefinition {
     /// `vector` module); preserved here so the vector engine can build its
     /// per-field indexes from the stored definition.
     pub vector_search: Option<Value>,
+    /// The names of the synonym maps associated with the index (the
+    /// `synonymMaps` array). Only these maps are applied to full-text search
+    /// on this index; maps not referenced here are inert for it.
+    pub synonym_maps: Vec<String>,
     /// The raw JSON index definition, preserved for echo in responses.
     pub raw: Value,
 }
@@ -430,11 +434,24 @@ impl IndexDefinition {
             .get("vectorSearch")
             .or_else(|| obj.get("vector_search"))
             .cloned();
+        let synonym_maps = obj
+            .get("synonymMaps")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(IndexDefinition {
             name: name.to_owned(),
             fields,
             suggesters,
             vector_search,
+            synonym_maps,
             raw,
         })
     }

@@ -306,7 +306,23 @@ async fn numeric_values_are_full_text_searchable() {
 #[tokio::test]
 async fn synonym_map_expands_search_terms() {
     let app = app();
-    let (status, _) = create_index(&app, "items").await;
+    // Create the synonym map first, then an index that references it.
+    let uri = format!("/synonymmaps?api-version={API_VERSION}");
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            &uri,
+            Some(API_KEY),
+            Some(json!({"name": "m", "format": "solr", "synonyms": "WA, Washington"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let mut definition = index_definition("items");
+    definition["synonymMaps"] = json!(["m"]);
+    let (status, _) = create_custom_index(&app, definition).await;
     assert_eq!(status, StatusCode::CREATED);
     let (status, _) = call(
         app.clone(),
@@ -321,6 +337,15 @@ async fn synonym_map_expands_search_terms() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
+    // "wa" has no literal match but expands to "washington".
+    let (status, body) = call(app, search_request("items", json!({"search": "wa"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&body), vec!["1"]);
+}
+
+#[tokio::test]
+async fn index_without_synonym_map_reference_does_not_expand() {
+    let app = app();
     let uri = format!("/synonymmaps?api-version={API_VERSION}");
     let (status, _) = call(
         app.clone(),
@@ -334,10 +359,34 @@ async fn synonym_map_expands_search_terms() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    // "wa" has no literal match but expands to "washington".
+    // The index does not reference the map, so "wa" does not expand.
+    let (status, _) = create_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        upload_request(
+            "items",
+            json!([
+                {"@search.action": "upload", "document": {"id": "1", "title": "hotels in Washington"}}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
     let (status, body) = call(app, search_request("items", json!({"search": "wa"}))).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(ids(&body), vec!["1"]);
+    assert!(ids(&body).is_empty());
+}
+
+#[tokio::test]
+async fn index_referencing_missing_synonym_map_returns_400() {
+    let app = app();
+    let mut definition = index_definition("items");
+    definition["synonymMaps"] = json!(["missing"]);
+    let (status, body) = create_custom_index(&app, definition).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "InvalidIndex");
 }
 
 // ---------------------------------------------------------------------------

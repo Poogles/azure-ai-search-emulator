@@ -129,6 +129,7 @@ impl SearchService {
         let definition = parse_index_definition(raw)?;
         validate_schema(&definition, self.max_vector_dimension)?;
         self.check_alias_collision(&definition.name)?;
+        self.validate_synonym_maps(&definition)?;
         match self.storage.create_index(&definition) {
             Ok(()) => {
                 if let Err(e) = self
@@ -172,6 +173,7 @@ impl SearchService {
         let definition = parse_index_definition(raw)?;
         validate_schema(&definition, self.max_vector_dimension)?;
         self.check_alias_collision(&definition.name)?;
+        self.validate_synonym_maps(&definition)?;
         // In-place update: capture the stored documents when the index exists
         // and the schema change is compatible with them; otherwise the index
         // is replaced and its documents are discarded.
@@ -282,6 +284,24 @@ impl SearchService {
             .create_index(&definition.name, definition.vector_search.as_ref(), &fields)
     }
 
+    /// Validates that every synonym map referenced by the index's
+    /// `synonymMaps` array exists. A missing map is `400 InvalidIndex`
+    /// (matching Azure).
+    fn validate_synonym_maps(&self, definition: &IndexDefinition) -> Result<(), ApiError> {
+        for name in &definition.synonym_maps {
+            if !self.synonym_maps.contains(name) {
+                return Err(ApiError::bad_request(
+                    ErrorCode::InvalidIndex,
+                    format!(
+                        "Synonym map {name:?} referenced by index {:?} does not exist.",
+                        definition.name
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Index and alias names share the data-plane namespace (aliases resolve
     /// where index names are accepted), so an index may not shadow an alias.
     fn check_alias_collision(&self, name: &str) -> Result<(), ApiError> {
@@ -382,13 +402,17 @@ impl SearchService {
     }
 
     /// Returns the raw synonym outputs for a query word: the union of outputs
-    /// from all rules (across all service-level maps) with a matching input
-    /// (case-insensitive), excluding the word itself. All maps apply to every
-    /// search (the emulator does not track per-field map associations).
-    fn synonym_expansions(&self, word: &str) -> Vec<String> {
+    /// from all rules (across the index's associated maps) with a matching
+    /// input (case-insensitive), excluding the word itself. Only the maps
+    /// named in `map_names` (the index's `synonymMaps`) are applied; maps not
+    /// referenced by the index are inert for it.
+    fn synonym_expansions(&self, word: &str, map_names: &[String]) -> Vec<String> {
         let lowered = word.to_lowercase();
         let mut outputs = BTreeSet::new();
-        for map in self.synonym_maps.list() {
+        for name in map_names {
+            let Ok(map) = self.synonym_maps.get(ResourceKind::SynonymMap, name) else {
+                continue;
+            };
             for rule in &map.rules {
                 if rule.inputs.iter().any(|input| input == &lowered) {
                     outputs.extend(rule.outputs.iter().cloned());
@@ -956,7 +980,7 @@ impl SearchService {
 
         let (skip, filter, orderby) = Self::resolve_paging(query, definition, current_vector_hash)?;
 
-        let full_text = prepare_full_text(self, query)?;
+        let full_text = prepare_full_text(self, definition, query)?;
         let vector_active = !query.vector_queries.is_empty();
         let full_text_active = !full_text.is_match_all();
 
@@ -1617,6 +1641,7 @@ fn schema_compatible(old: &IndexDefinition, new: &IndexDefinition) -> bool {
 /// malformed.
 fn prepare_full_text(
     service: &SearchService,
+    definition: &IndexDefinition,
     query: &SearchQuery,
 ) -> Result<FullTextQuery, ApiError> {
     let mut full_text = match (&query.search, query.query_type) {
@@ -1639,7 +1664,7 @@ fn prepare_full_text(
         if let Clause::Term(term) = clause {
             let expansions = expansion_cache
                 .entry(term.clone())
-                .or_insert_with(|| service.synonym_expansions(term));
+                .or_insert_with(|| service.synonym_expansions(term, &definition.synonym_maps));
             if !expansions.is_empty() {
                 full_text.synonyms.push((term.clone(), expansions.clone()));
             }
@@ -1733,6 +1758,7 @@ mod tests {
             fields,
             suggesters: Vec::new(),
             vector_search: None,
+            synonym_maps: Vec::new(),
             raw: json!({}),
         }
     }
@@ -2895,19 +2921,35 @@ mod tests {
     fn synonym_expansions_match_case_insensitively() {
         let service = service();
         ok(service.create_synonym_map("m", "solr", "USA, United States\nWA => Washington"));
-        assert_eq!(service.synonym_expansions("usa"), vec!["states", "united"]);
-        assert_eq!(service.synonym_expansions("USA"), vec!["states", "united"]);
-        assert_eq!(service.synonym_expansions("states"), vec!["united", "usa"]);
+        let maps = vec!["m".to_owned()];
+        assert_eq!(
+            service.synonym_expansions("usa", &maps),
+            vec!["states", "united"]
+        );
+        assert_eq!(
+            service.synonym_expansions("USA", &maps),
+            vec!["states", "united"]
+        );
+        assert_eq!(
+            service.synonym_expansions("states", &maps),
+            vec!["united", "usa"]
+        );
         // Explicit mappings only expand from the left side.
-        assert_eq!(service.synonym_expansions("wa"), vec!["washington"]);
-        assert!(service.synonym_expansions("washington").is_empty());
-        assert!(service.synonym_expansions("unknown").is_empty());
+        assert_eq!(service.synonym_expansions("wa", &maps), vec!["washington"]);
+        assert!(service.synonym_expansions("washington", &maps).is_empty());
+        assert!(service.synonym_expansions("unknown", &maps).is_empty());
+        // A map not referenced by the index is inert for it.
+        assert!(service.synonym_expansions("usa", &[]).is_empty());
     }
 
     #[test]
     fn synonym_search_expands_query_terms() {
         let service = service();
-        ok(service.create_index(&index_body()));
+        ok(service.create_synonym_map("m", "solr", "WA, Washington"));
+        // An index that references the map expands "wa" to "washington".
+        let mut body = index_body();
+        body["synonymMaps"] = json!(["m"]);
+        ok(service.create_index(&body));
         upload(
             &service,
             vec![
@@ -2915,18 +2957,24 @@ mod tests {
                 json!({"id": "2", "title": "flights to Boston"}),
             ],
         );
-        ok(service.create_synonym_map("m", "solr", "WA, Washington"));
         // "wa" matches document 1 via the "washington" expansion.
         let query = ok(service.parse_search("items", &json!({"search": "wa"})));
         let outcome = ok(service.search("items", &query));
         let keys: Vec<&str> = outcome.documents.iter().map(|d| d.key.as_str()).collect();
         assert_eq!(keys, vec!["1"]);
-        // Without the map, "wa" matches nothing.
-        service
-            .delete_synonym_map("m")
-            .unwrap_or_else(|e| panic!("delete failed: {e}"));
-        let query = ok(service.parse_search("items", &json!({"search": "wa"})));
-        let outcome = ok(service.search("items", &query));
+        // A second index that does not reference the map does not expand, even
+        // though the map exists.
+        let mut other = index_body();
+        other["name"] = json!("plain");
+        ok(service.create_index(&other));
+        let actions = vec![DocumentAction {
+            kind: ActionKind::Upload,
+            document: json!({"id": "1", "title": "hotels in Washington"}),
+        }];
+        let results = ok(service.index_documents("plain", actions));
+        assert!(results.iter().all(|r| r.succeeded));
+        let query = ok(service.parse_search("plain", &json!({"search": "wa"})));
+        let outcome = ok(service.search("plain", &query));
         assert!(outcome.documents.is_empty());
     }
 }

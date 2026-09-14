@@ -3,8 +3,15 @@
 //! Supports the operator set required by the supported-operations matrix:
 //! `and` / `or` / `not` with parentheses, `eq` / `ne` / `gt` / `ge` / `lt` /
 //! `le` / `in` on string, numeric, and boolean values, the string functions
-//! `startswith` / `endswith` / `contains`, and collection filtering with
-//! `any` / `all`. Anything else is rejected with a clear parse error.
+//! `startswith` / `endswith` / `contains` plus the value-producing
+//! `length` / `indexof` / `substring` / `tolower` / `toupper` / `trim`, the
+//! date functions `datepart` / `dateadd` / `datediff` / `utcdatetime` plus
+//! the `OData` `year` / `month` / `day` / `hour` / `minute` / `second` /
+//! `date` / `time` / `now`, the `search.*` functions (`ismatch` as a
+//! case-insensitive regular expression, `ismatchscoring`, `isempty`,
+//! `isnull`), and collection filtering with `any` / `all` (including one
+//! level of subfield access through the lambda variable). Anything else is
+//! rejected with a clear parse error.
 //!
 //! The parser produces an internal expression tree ([`FilterExpr`]) that is
 //! decoupled from the HTTP representation; the service layer validates the
@@ -85,6 +92,61 @@ crate::string_enum!(pub(crate) StringFunc parse {
     Contains => "contains",
 });
 
+/// A string function that produces a value (an integer or a string) which is
+/// then compared with an operator: `length(field)`, `indexof(field, 'x')`,
+/// `substring(field, start[, length])`, `tolower(field)`, `toupper(field)`,
+/// `trim(field)`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StringValueExpr {
+    /// `length(field)`: the character count of the field's string value.
+    Length { field: String },
+    /// `indexof(field, 'substr')`: the zero-based character index of the first
+    /// occurrence of `substr`, or `-1` when absent.
+    IndexOf { field: String, substr: String },
+    /// `substring(field, start)` / `substring(field, start, length)`: a
+    /// character-range extraction; an out-of-range `start` yields `""`.
+    Substring {
+        field: String,
+        start: i64,
+        length: Option<i64>,
+    },
+    /// `tolower(field)`: the field's string value lowercased.
+    ToLower { field: String },
+    /// `toupper(field)`: the field's string value uppercased.
+    ToUpper { field: String },
+    /// `trim(field)`: the field's string value with surrounding whitespace
+    /// removed.
+    Trim { field: String },
+}
+
+impl StringValueExpr {
+    /// The field the function operates on.
+    #[must_use]
+    pub fn field(&self) -> &str {
+        match self {
+            Self::Length { field }
+            | Self::IndexOf { field, .. }
+            | Self::Substring { field, .. }
+            | Self::ToLower { field }
+            | Self::ToUpper { field }
+            | Self::Trim { field } => field,
+        }
+    }
+
+    /// The function's name, for error messages.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Length { .. } => "length",
+            Self::IndexOf { .. } => "indexof",
+            Self::Substring { .. } => "substring",
+            Self::ToLower { .. } => "tolower",
+            Self::ToUpper { .. } => "toupper",
+            Self::Trim { .. } => "trim",
+        }
+    }
+}
+
 /// The internal filter expression tree.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilterExpr {
@@ -107,6 +169,15 @@ pub enum FilterExpr {
         func: StringFunc,
         field: String,
         arg: String,
+    },
+    /// A value-producing string function compared with an operator:
+    /// `length(field) op value`, `indexof(field, 'x') op value`,
+    /// `substring(field, start[, length]) op value`, `tolower(field) op value`,
+    /// `toupper(field) op value`, `trim(field) op value`.
+    StringFuncCompare {
+        expr: StringValueExpr,
+        op: FilterOp,
+        value: FilterValue,
     },
     Any {
         field: String,
@@ -180,6 +251,12 @@ impl FilterExpr {
                     .filter_map(|value| value.as_str())
                     .any(is_match)
             }
+            FilterExpr::StringFuncCompare { expr, op, value } => {
+                let Some(actual) = string_value_result(expr, fields) else {
+                    return false;
+                };
+                compare_filter_values(&actual, *op, value)
+            }
             FilterExpr::Any { field, inner } => fields
                 .get(field)
                 .and_then(Value::as_array)
@@ -195,11 +272,18 @@ impl FilterExpr {
                 compare_filter_values(&actual, *op, value)
             }
             FilterExpr::IsMatch { field, pattern } => {
-                let lowered = pattern.to_lowercase();
+                // The pattern is a case-insensitive regular expression,
+                // validated at parse time, so this cannot fail here.
+                let Ok(regex) = regex::RegexBuilder::new(pattern)
+                    .case_insensitive(true)
+                    .build()
+                else {
+                    return false;
+                };
                 flatten_values(&resolve_field_path(fields, field))
                     .iter()
                     .filter_map(|value| value.as_str())
-                    .any(|text| text.to_lowercase().contains(lowered.as_str()))
+                    .any(|text| regex.is_match(text))
             }
             FilterExpr::IsEmpty { field } => {
                 let resolved = resolve_field_path(fields, field);
@@ -233,6 +317,67 @@ fn flatten_values<'a>(values: &[&'a Value]) -> Vec<&'a Value> {
     } else {
         values.to_vec()
     }
+}
+
+/// Evaluates a value-producing string function against a document, returning
+/// the resulting [`FilterValue`] (a number for `length`/`indexof`, a string
+/// otherwise). Returns `None` when the field has no string value, in which
+/// case the comparison never matches.
+fn string_value_result(expr: &StringValueExpr, fields: &Map<String, Value>) -> Option<FilterValue> {
+    let text = flatten_values(&resolve_field_path(fields, expr.field()))
+        .iter()
+        .find_map(|value| value.as_str())?;
+    Some(match expr {
+        StringValueExpr::Length { .. } => FilterValue::Number(string_int_to_number(
+            string_count_to_int(text.chars().count()),
+        )),
+        StringValueExpr::IndexOf { substr, .. } => {
+            let index = text.find(substr.as_str()).map_or(-1, |byte_index| {
+                string_count_to_int(text[..byte_index].chars().count())
+            });
+            FilterValue::Number(string_int_to_number(index))
+        }
+        StringValueExpr::Substring { start, length, .. } => {
+            FilterValue::String(extract_substring(text, *start, *length))
+        }
+        StringValueExpr::ToLower { .. } => FilterValue::String(text.to_lowercase()),
+        StringValueExpr::ToUpper { .. } => FilterValue::String(text.to_uppercase()),
+        StringValueExpr::Trim { .. } => FilterValue::String(text.trim().to_owned()),
+    })
+}
+
+/// Converts a string character count to `i64`, saturating on (unrepresentable
+/// in practice) astronomically large inputs; real string lengths are tiny.
+fn string_count_to_int(count: usize) -> i64 {
+    i64::try_from(count).unwrap_or(i64::MAX)
+}
+
+/// Converts an exact small integer (`length`/`indexof` result) to `f64` for
+/// filter comparison. Character counts are far below 2^52, so the cast is
+/// exact; it lives here alone so the helpers above stay exact integers.
+#[allow(clippy::cast_precision_loss)]
+fn string_int_to_number(value: i64) -> f64 {
+    value as f64
+}
+
+/// Extracts a character-range substring, matching `OData` semantics: an
+/// out-of-range or negative `start` yields the empty string; `length` bounds
+/// the result (a non-positive length yields the empty string).
+fn extract_substring(text: &str, start: i64, length: Option<i64>) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let start = usize::try_from(start).unwrap_or(usize::MAX);
+    if start >= chars.len() {
+        return String::new();
+    }
+    let end = match length {
+        Some(len) if len <= 0 => start,
+        Some(len) => {
+            let len = usize::try_from(len).unwrap_or(usize::MAX);
+            (start + len).min(chars.len())
+        }
+        None => chars.len(),
+    };
+    chars[start..end].iter().collect()
 }
 
 /// Evaluates a comparison against the values a field path resolved to:
@@ -286,18 +431,24 @@ fn null_comparison(op: FilterOp, actual_null: bool, expected_null: bool) -> bool
 }
 
 /// Evaluates an `any`/`all` inner expression against a single collection
-/// element. The inner expression must be a comparison on the lambda variable.
+/// element. The inner expression must be a comparison on the lambda variable;
+/// the variable may be a plain name (the element itself) or `var/Subfield`
+/// (one level of subfield access into the element object).
 fn element_matches(inner: &FilterExpr, element: &Value) -> bool {
     debug_assert!(
         matches!(inner, FilterExpr::Compare { .. }),
         "any/all inner must be a Compare on the lambda variable"
     );
     match inner {
-        FilterExpr::Compare { op, value, .. } => {
-            if element.is_null() {
-                return null_comparison(*op, true, value_is_null(value));
+        FilterExpr::Compare { field, op, value } => {
+            let actual = match field.split_once('/') {
+                Some((_, subfield)) => element.as_object().and_then(|o| o.get(subfield)),
+                None => Some(element),
+            };
+            match actual {
+                Some(actual) if !actual.is_null() => compare(actual, *op, value),
+                _ => null_comparison(*op, true, value_is_null(value)),
             }
-            compare(element, *op, value)
         }
         _ => false,
     }
@@ -1109,5 +1260,162 @@ mod tests {
         // Unknown fields are rejected like any other comparison.
         assert!(validate(&parse_ok("search.isempty(missing)"), &definition).is_err());
         assert!(validate(&parse_ok("datepart(year, missing) eq 2024"), &definition).is_err());
+        // OData date functions on non-date fields are rejected.
+        assert!(validate(&parse_ok("year(title) eq 2024"), &definition).is_err());
+        assert!(validate(
+            &parse_ok("date(title) eq utcdatetime('2024-01-01T00:00:00Z')"),
+            &definition
+        )
+        .is_err());
+        // String value functions on non-string fields are rejected.
+        assert!(validate(&parse_ok("length(price) eq 5"), &definition).is_err());
+        assert!(validate(&parse_ok("tolower(active) eq 'x'"), &definition).is_err());
+        assert!(validate(&parse_ok("substring(missing, 0) eq 'x'"), &definition).is_err());
+    }
+
+    #[test]
+    fn parses_and_evaluates_odata_date_functions() {
+        let doc = [("published", json!("2024-03-15T10:30:45Z"))];
+        // Component functions extract integer calendar parts.
+        assert!(matches(&parse_ok("year(published) eq 2024"), &doc));
+        assert!(matches(&parse_ok("month(published) eq 3"), &doc));
+        assert!(matches(&parse_ok("day(published) eq 15"), &doc));
+        assert!(matches(&parse_ok("hour(published) eq 10"), &doc));
+        assert!(matches(&parse_ok("minute(published) eq 30"), &doc));
+        assert!(matches(&parse_ok("second(published) eq 45"), &doc));
+        assert!(!matches(&parse_ok("year(published) eq 2023"), &doc));
+        // `date` truncates to midnight UTC.
+        assert!(matches(
+            &parse_ok("date(published) eq utcdatetime('2024-03-15T00:00:00Z')"),
+            &doc
+        ));
+        assert!(!matches(
+            &parse_ok("date(published) eq utcdatetime('2024-03-15T10:30:45Z')"),
+            &doc
+        ));
+        // `time` truncates to the time-of-day on 0001-01-01.
+        assert!(matches(
+            &parse_ok("time(published) eq utcdatetime('0001-01-01T10:30:45Z')"),
+            &doc
+        ));
+        // `now()` is a stable timestamp; a past date is before it.
+        assert!(matches(&parse_ok("published lt now()"), &doc));
+        assert!(!matches(&parse_ok("published gt now()"), &doc));
+        // Missing dates never match.
+        assert!(!matches(&parse_ok("year(published) eq 2024"), &[]));
+        assert!(!matches(
+            &parse_ok("date(published) eq utcdatetime('2024-03-15T00:00:00Z')"),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn parses_and_evaluates_string_value_functions() {
+        let doc = [("title", json!("hello world"))];
+        // `length` is the character count.
+        assert!(matches(&parse_ok("length(title) eq 11"), &doc));
+        assert!(!matches(&parse_ok("length(title) eq 10"), &doc));
+        assert!(matches(&parse_ok("length(title) gt 5"), &doc));
+        // `indexof` is the zero-based index, or -1 when absent.
+        assert!(matches(&parse_ok("indexof(title, 'world') eq 6"), &doc));
+        assert!(matches(&parse_ok("indexof(title, 'x') eq -1"), &doc));
+        // `substring` extracts a character range.
+        assert!(matches(
+            &parse_ok("substring(title, 0, 5) eq 'hello'"),
+            &doc
+        ));
+        assert!(matches(&parse_ok("substring(title, 6) eq 'world'"), &doc));
+        // Out-of-range start and non-positive length yield the empty string.
+        assert!(matches(&parse_ok("substring(title, 100) eq ''"), &doc));
+        assert!(matches(&parse_ok("substring(title, 0, 0) eq ''"), &doc));
+        // `tolower` / `toupper` / `trim`.
+        let padded = [("title", json!("  Hello  "))];
+        assert!(matches(&parse_ok("tolower(title) eq '  hello  '"), &padded));
+        assert!(matches(&parse_ok("toupper(title) eq '  HELLO  '"), &padded));
+        assert!(matches(&parse_ok("trim(title) eq 'Hello'"), &padded));
+        // Missing fields and non-string fields never match.
+        assert!(!matches(&parse_ok("length(title) eq 5"), &[]));
+        assert!(!matches(
+            &parse_ok("length(price) eq 5"),
+            &[("price", json!(10))]
+        ));
+    }
+
+    #[test]
+    fn parses_and_evaluates_ismatch_as_regex() {
+        let doc = [("title", json!("Azure Search Basics"))];
+        // A plain pattern matches as a substring (case-insensitive).
+        assert!(matches(&parse_ok("search.ismatch('azure', title)"), &doc));
+        assert!(matches(&parse_ok("search.ismatch('SEARCH', title)"), &doc));
+        // Regex metacharacters are honored (`.` matches the `u` in "Azure").
+        assert!(matches(&parse_ok("search.ismatch('Az.re', title)"), &doc));
+        assert!(matches(&parse_ok("search.ismatch('^Azure', title)"), &doc));
+        assert!(!matches(&parse_ok("search.ismatch('^solr', title)"), &doc));
+        assert!(matches(&parse_ok("search.ismatch('Basics$', title)"), &doc));
+        // Alternation and character classes.
+        assert!(matches(
+            &parse_ok("search.ismatch('Azure|Solr', title)"),
+            &doc
+        ));
+        assert!(matches(
+            &parse_ok("search.ismatch('[Aa]zure', title)"),
+            &doc
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_ismatch_regex() {
+        // Invalid regex patterns are rejected at parse time.
+        for pattern in ["[", "(unclosed", "a{2,1}", "*bad"] {
+            let input = format!("search.ismatch('{pattern}', title)");
+            assert!(
+                parse_filter(&input).is_err(),
+                "expected error for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_and_evaluates_lambda_subfield_access() {
+        // `any` with a subfield of the element.
+        assert!(matches(
+            &parse_ok("Rooms/any(r: r/Type eq 'suite')"),
+            &[("Rooms", json!([{"Type": "standard"}, {"Type": "suite"}]))]
+        ));
+        assert!(!matches(
+            &parse_ok("Rooms/any(r: r/Type eq 'suite')"),
+            &[("Rooms", json!([{"Type": "standard"}]))]
+        ));
+        // `all` with a subfield.
+        assert!(matches(
+            &parse_ok("Rooms/all(r: r/Rate gt 100)"),
+            &[("Rooms", json!([{"Rate": 150}, {"Rate": 200}]))]
+        ));
+        assert!(!matches(
+            &parse_ok("Rooms/all(r: r/Rate gt 100)"),
+            &[("Rooms", json!([{"Rate": 50}, {"Rate": 200}]))]
+        ));
+        // The lambda variable name is arbitrary.
+        assert!(matches(
+            &parse_ok("Rooms/any(x: x/Type eq 'suite')"),
+            &[("Rooms", json!([{"Type": "suite"}]))]
+        ));
+        // A missing subfield on an element never matches.
+        assert!(!matches(
+            &parse_ok("Rooms/any(r: r/Type eq 'suite')"),
+            &[("Rooms", json!([{"Rate": 100}]))]
+        ));
+    }
+
+    #[test]
+    fn validation_checks_lambda_subfield_access() {
+        let definition = collection_complex_definition();
+        // Valid one-level subfield access.
+        assert!(validate(&parse_ok("Rooms/any(r: r/Type eq 'suite')"), &definition).is_ok());
+        assert!(validate(&parse_ok("Rooms/all(r: r/Rate gt 100)"), &definition).is_ok());
+        // Unknown subfield.
+        assert!(validate(&parse_ok("Rooms/any(r: r/Missing eq 'x')"), &definition).is_err());
+        // Deeper nesting is rejected.
+        assert!(validate(&parse_ok("Rooms/any(r: r/A/B eq 'x')"), &definition).is_err());
     }
 }

@@ -1,5 +1,5 @@
 use axum::http::StatusCode;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::common::*;
 
@@ -306,8 +306,9 @@ async fn filter_string_functions_match_substrings() {
     }
 
     // String functions on non-string fields are rejected explicitly, as are
-    // unsupported functions.
-    for filter in ["startswith(pages, '1')", "length(title) gt 2"] {
+    // unsupported functions (`length` itself is supported now, so the
+    // unsupported case uses a bogus function name).
+    for filter in ["startswith(pages, '1')", "bogusfunc(title) gt 2"] {
         let (status, body) = call(
             app.clone(),
             search_request("books", json!({"search": "*", "filter": filter})),
@@ -472,4 +473,300 @@ async fn filter_search_functions_match() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "InvalidQuery");
+}
+
+async fn app_with_dated_docs() -> axum::Router {
+    let app = app();
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            &format!("/indexes?api-version={API_VERSION}"),
+            Some(API_KEY),
+            Some(json!({
+                "name": "dated",
+                "fields": [
+                    {"name": "id", "type": "Edm.String", "key": true},
+                    {"name": "title", "type": "Edm.String", "filterable": true},
+                    {"name": "published", "type": "Edm.DateTimeOffset", "filterable": true}
+                ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        upload_request(
+            "dated",
+            json!([
+                {"@search.action": "upload", "document": {"id": "1", "title": "spring", "published": "2024-03-15T10:30:45Z"}},
+                {"@search.action": "upload", "document": {"id": "2", "title": "winter", "published": "2023-12-02T08:00:00Z"}}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    app
+}
+
+fn response_ids(body: &Value) -> Vec<String> {
+    body["value"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|d| d["id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn filter_odata_date_functions() {
+    let app = app_with_dated_docs().await;
+    for (filter, expected) in [
+        ("year(published) eq 2024", vec!["1"]),
+        ("month(published) eq 12", vec!["2"]),
+        ("day(published) eq 15", vec!["1"]),
+        ("hour(published) eq 10", vec!["1"]),
+        ("minute(published) eq 30", vec!["1"]),
+        ("second(published) eq 45", vec!["1"]),
+        (
+            "date(published) eq utcdatetime('2024-03-15T00:00:00Z')",
+            vec!["1"],
+        ),
+        (
+            "time(published) eq utcdatetime('0001-01-01T10:30:45Z')",
+            vec!["1"],
+        ),
+        ("published lt now()", vec!["1", "2"]),
+        ("published gt now()", Vec::<&str>::new()),
+        ("year(published) eq 1999", Vec::<&str>::new()),
+    ] {
+        let (status, body) = call(
+            app.clone(),
+            search_request("dated", json!({"search": "*", "filter": filter})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "filter {filter:?}: {body}");
+        assert_eq!(response_ids(&body), expected, "filter {filter:?}");
+    }
+
+    for filter in [
+        "year(title) eq 2024",
+        "date(title) eq utcdatetime('2024-01-01T00:00:00Z')",
+        "month(published) eq",
+    ] {
+        let (status, body) = call(
+            app.clone(),
+            search_request("dated", json!({"search": "*", "filter": filter})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "filter {filter:?}");
+        assert_eq!(body["error"]["code"], "InvalidQuery");
+    }
+}
+
+#[tokio::test]
+async fn filter_string_value_functions() {
+    let app = app();
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            &format!("/indexes?api-version={API_VERSION}"),
+            Some(API_KEY),
+            Some(json!({
+                "name": "titles",
+                "fields": [
+                    {"name": "id", "type": "Edm.String", "key": true},
+                    {"name": "title", "type": "Edm.String", "searchable": true, "filterable": true},
+                    {"name": "pages", "type": "Edm.Int32", "filterable": true}
+                ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        upload_request(
+            "titles",
+            json!([
+                {"@search.action": "upload", "document": {"id": "1", "title": "hello world", "pages": 100}},
+                {"@search.action": "upload", "document": {"id": "2", "title": "  Padded  ", "pages": 200}}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    for (filter, expected) in [
+        ("length(title) eq 11", vec!["1"]),
+        ("length(title) gt 5", vec!["1", "2"]),
+        ("indexof(title, 'world') eq 6", vec!["1"]),
+        ("indexof(title, 'zzz') eq -1", vec!["1", "2"]),
+        ("substring(title, 0, 5) eq 'hello'", vec!["1"]),
+        ("substring(title, 6) eq 'world'", vec!["1"]),
+        ("tolower(title) eq 'hello world'", vec!["1"]),
+        ("toupper(title) eq 'HELLO WORLD'", vec!["1"]),
+        ("trim(title) eq 'Padded'", vec!["2"]),
+        ("length(title) eq 999", Vec::<&str>::new()),
+    ] {
+        let (status, body) = call(
+            app.clone(),
+            search_request("titles", json!({"search": "*", "filter": filter})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "filter {filter:?}: {body}");
+        assert_eq!(response_ids(&body), expected, "filter {filter:?}");
+    }
+
+    for filter in [
+        "length(pages) eq 3",
+        "tolower(pages) eq 'x'",
+        "substring(title, 0.5) eq 'x'",
+        "substring(title) eq 'x'",
+    ] {
+        let (status, body) = call(
+            app.clone(),
+            search_request("titles", json!({"search": "*", "filter": filter})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "filter {filter:?}");
+        assert_eq!(body["error"]["code"], "InvalidQuery");
+    }
+}
+
+#[tokio::test]
+async fn filter_ismatch_uses_case_insensitive_regex() {
+    let app = app();
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            &format!("/indexes?api-version={API_VERSION}"),
+            Some(API_KEY),
+            Some(json!({
+                "name": "regexdocs",
+                "fields": [
+                    {"name": "id", "type": "Edm.String", "key": true},
+                    {"name": "title", "type": "Edm.String", "searchable": true, "filterable": true}
+                ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        upload_request(
+            "regexdocs",
+            json!([
+                {"@search.action": "upload", "document": {"id": "1", "title": "Azure Search Basics"}},
+                {"@search.action": "upload", "document": {"id": "2", "title": "Unrelated"}}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    for (filter, expected) in [
+        ("search.ismatch('Az.re', title)", vec!["1"]),
+        ("search.ismatch('^Azure', title)", vec!["1"]),
+        ("search.ismatch('Basics$', title)", vec!["1"]),
+        ("search.ismatch('Azure|Solr', title)", vec!["1"]),
+        ("search.ismatch('^solr', title)", Vec::<&str>::new()),
+    ] {
+        let (status, body) = call(
+            app.clone(),
+            search_request("regexdocs", json!({"search": "*", "filter": filter})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "filter {filter:?}: {body}");
+        assert_eq!(response_ids(&body), expected, "filter {filter:?}");
+    }
+
+    let (status, body) = call(
+        app,
+        search_request(
+            "regexdocs",
+            json!({"search": "*", "filter": "search.ismatch('[', title)"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "InvalidQuery");
+}
+
+#[tokio::test]
+async fn filter_lambda_subfield_access() {
+    let app = app();
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            &format!("/indexes?api-version={API_VERSION}"),
+            Some(API_KEY),
+            Some(json!({
+                "name": "hotels",
+                "fields": [
+                    {"name": "id", "type": "Edm.String", "key": true},
+                    {
+                        "name": "Rooms",
+                        "type": "Edm.Collection(Edm.ComplexType)",
+                        "fields": [
+                            {"name": "Type", "type": "Edm.String", "filterable": true},
+                            {"name": "Rate", "type": "Edm.Double", "filterable": true}
+                        ]
+                    }
+                ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        upload_request(
+            "hotels",
+            json!([
+                {"@search.action": "upload", "document": {"id": "1", "Rooms": [{"Type": "standard", "Rate": 50}, {"Type": "suite", "Rate": 150}]}},
+                {"@search.action": "upload", "document": {"id": "2", "Rooms": [{"Type": "standard", "Rate": 60}]}},
+                {"@search.action": "upload", "document": {"id": "3", "Rooms": [{"Type": "loft", "Rate": 150}, {"Type": "penthouse", "Rate": 250}]}}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    for (filter, expected) in [
+        ("Rooms/any(r: r/Type eq 'suite')", vec!["1"]),
+        ("Rooms/any(r: r/Rate gt 100)", vec!["1", "3"]),
+        ("Rooms/all(r: r/Rate gt 100)", vec!["3"]),
+        ("Rooms/all(r: r/Type ne 'banned')", vec!["1", "2", "3"]),
+        ("Rooms/any(r: r/Type eq 'missing')", Vec::<&str>::new()),
+    ] {
+        let (status, body) = call(
+            app.clone(),
+            search_request("hotels", json!({"search": "*", "filter": filter})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "filter {filter:?}: {body}");
+        assert_eq!(response_ids(&body), expected, "filter {filter:?}");
+    }
+
+    for filter in [
+        "Rooms/any(r: r/Missing eq 'x')",
+        "Rooms/any(r: r/A/B eq 'x')",
+    ] {
+        let (status, body) = call(
+            app.clone(),
+            search_request("hotels", json!({"search": "*", "filter": filter})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "filter {filter:?}");
+        assert_eq!(body["error"]["code"], "InvalidQuery");
+    }
 }

@@ -1,7 +1,9 @@
 //! `OData` filter parser: tokenizes and parses `$filter` strings.
 
-use super::date::{normalize_datetime, DateExpr, DateOperand, DatePart, DateRef, DateUnit};
-use super::{reverse_op, FilterExpr, FilterOp, FilterValue, StringFunc};
+use super::date::{
+    normalize_datetime, now_iso, DateExpr, DateOperand, DatePart, DateRef, DateUnit,
+};
+use super::{reverse_op, FilterExpr, FilterOp, FilterValue, StringFunc, StringValueExpr};
 
 // ---------------------------------------------------------------------------
 // Parser
@@ -277,8 +279,22 @@ impl Parser {
         if self.peek_ident_is("any") || self.peek_ident_is("all") {
             return K::Collection;
         }
-        if matches!(first, "datepart" | "dateadd" | "datediff" | "utcdatetime")
-            && matches!(self.peek(), Some(Token::LParen))
+        if matches!(
+            first,
+            "datepart"
+                | "dateadd"
+                | "datediff"
+                | "utcdatetime"
+                | "year"
+                | "month"
+                | "day"
+                | "hour"
+                | "minute"
+                | "second"
+                | "date"
+                | "time"
+                | "now"
+        ) && matches!(self.peek(), Some(Token::LParen))
         {
             return K::DateFn;
         }
@@ -376,11 +392,15 @@ impl Parser {
     }
 
     /// Plain comparison: `field op value`, with an optional trailing
-    /// `utcdatetime('...')` on the value side.
+    /// `utcdatetime('...')` or `now()` on the value side.
     fn parse_plain_comparison(&mut self, first: &str) -> Result<FilterExpr, String> {
         let op = self.parse_op()?;
-        // A trailing `utcdatetime('...')`: `field op utcdatetime('...')`.
-        if let Some(iso) = self.try_parse_utcdatetime()? {
+        // A trailing `utcdatetime('...')` or `now()`: `field op <date literal>`.
+        let iso = match self.try_parse_utcdatetime()? {
+            Some(iso) => Some(iso),
+            None => self.try_parse_now(),
+        };
+        if let Some(iso) = iso {
             return Ok(FilterExpr::DateCompare {
                 left: DateOperand::Field(first.to_owned()),
                 op,
@@ -393,6 +413,22 @@ impl Parser {
             op,
             value,
         })
+    }
+
+    /// If the next tokens are a `now()` literal, consumes it and returns the
+    /// normalized current UTC timestamp (captured once at parse time);
+    /// otherwise returns `None` without consuming.
+    fn try_parse_now(&mut self) -> Option<String> {
+        let is_now = matches!(self.peek(), Some(Token::Ident(name)) if name == "now")
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+            && matches!(self.tokens.get(self.pos + 2), Some(Token::RParen));
+        if !is_now {
+            return None;
+        }
+        self.next(); // Consume `now`.
+        self.next(); // Consume '('.
+        self.next(); // Consume ')'.
+        Some(now_iso())
     }
 
     /// If the next tokens are a `utcdatetime('...')` literal, consumes it and
@@ -408,22 +444,31 @@ impl Parser {
         self.parse_utcdatetime_literal().map(Some)
     }
 
-    /// Parses a string-function call after the function name: `(field,
-    /// 'literal')`.
+    /// Parses a string-function call after the function name. Boolean
+    /// predicates (`startswith`/`endswith`/`contains`) and value-producing
+    /// functions (`length`/`indexof`/`substring`/`tolower`/`toupper`/`trim`)
+    /// are dispatched by name.
     fn parse_function_call(&mut self, name: &str) -> Result<FilterExpr, String> {
-        let Some(func) = StringFunc::parse(name) else {
-            return Err(format!(
-                "Unsupported filter function {name:?}; supported functions: \
-                 startswith, endswith, contains."
-            ));
-        };
+        if let Some(func) = StringFunc::parse(name) {
+            return self.parse_string_predicate(func, name);
+        }
+        self.parse_string_value_function(name)
+    }
+
+    /// Parses a boolean string predicate: `startswith(field, 'x')` /
+    /// `endswith(field, 'x')` / `contains(field, 'x')`.
+    fn parse_string_predicate(
+        &mut self,
+        func: StringFunc,
+        name: &str,
+    ) -> Result<FilterExpr, String> {
         self.next(); // Consume '('.
         let field = self.expect_ident("field name")?;
         match self.next() {
             Some(Token::Comma) => {}
             other => {
                 return Err(format!(
-                    "Expected ',' after filter function field name, found {}.",
+                    "Expected ',' after {name} field name, found {}.",
                     describe_token(other.as_ref())
                 ))
             }
@@ -432,7 +477,7 @@ impl Parser {
             Some(Token::String(text)) => text,
             other => {
                 return Err(format!(
-                    "Expected a string literal as the filter function argument, found {}.",
+                    "Expected a string literal as the {name} argument, found {}.",
                     describe_token(other.as_ref())
                 ))
             }
@@ -441,12 +486,89 @@ impl Parser {
             Some(Token::RParen) => {}
             other => {
                 return Err(format!(
-                    "Expected ')' after filter function argument, found {}.",
+                    "Expected ')' after {name} argument, found {}.",
                     describe_token(other.as_ref())
                 ))
             }
         }
         Ok(FilterExpr::StringFunc { func, field, arg })
+    }
+
+    /// Parses a value-producing string function: `length(field) op value`,
+    /// `indexof(field, 'x') op value`, `substring(field, start[, length]) op
+    /// value`, `tolower(field) op value`, `toupper(field) op value`,
+    /// `trim(field) op value`.
+    fn parse_string_value_function(&mut self, name: &str) -> Result<FilterExpr, String> {
+        self.next(); // Consume '('.
+        let field = self.expect_ident("field name")?;
+        let expr = match name {
+            "length" | "tolower" | "toupper" | "trim" => {
+                self.expect_token(&Token::RParen, "')' to close function arguments")?;
+                match name {
+                    "length" => StringValueExpr::Length { field },
+                    "tolower" => StringValueExpr::ToLower { field },
+                    "toupper" => StringValueExpr::ToUpper { field },
+                    _ => StringValueExpr::Trim { field },
+                }
+            }
+            "indexof" => {
+                self.expect_token(&Token::Comma, "',' in indexof arguments")?;
+                let substr = match self.next() {
+                    Some(Token::String(text)) => text,
+                    other => {
+                        return Err(format!(
+                            "Expected a string literal in indexof, found {}.",
+                            describe_token(other.as_ref())
+                        ))
+                    }
+                };
+                self.expect_token(&Token::RParen, "')' to close indexof arguments")?;
+                StringValueExpr::IndexOf { field, substr }
+            }
+            "substring" => {
+                self.expect_token(&Token::Comma, "',' in substring arguments")?;
+                let start = self.parse_integer_arg("substring start")?;
+                let length = if matches!(self.peek(), Some(Token::Comma)) {
+                    self.next();
+                    Some(self.parse_integer_arg("substring length")?)
+                } else {
+                    None
+                };
+                self.expect_token(&Token::RParen, "')' to close substring arguments")?;
+                StringValueExpr::Substring {
+                    field,
+                    start,
+                    length,
+                }
+            }
+            other => {
+                return Err(format!(
+                    "Unsupported filter function {other:?}; supported functions: \
+                     startswith, endswith, contains, length, indexof, substring, tolower, \
+                     toupper, trim."
+                ))
+            }
+        };
+        let op = self.parse_op()?;
+        let value = self.parse_value()?;
+        Ok(FilterExpr::StringFuncCompare { expr, op, value })
+    }
+
+    /// Parses an integer argument (a `Token::Number` with no fractional part)
+    /// for the string value functions.
+    fn parse_integer_arg(&mut self, what: &str) -> Result<i64, String> {
+        match self.next() {
+            Some(Token::Number(n)) if n.fract() == 0.0 => {
+                #[allow(clippy::cast_possible_truncation)]
+                let as_i128 = n as i128;
+                i64::try_from(as_i128)
+                    .map_err(|_| format!("{what} {n} is out of range; expected an integer."))
+            }
+            other => Err(format!(
+                "Expected an integer {what}, found {}.",
+                describe_token(other.as_ref())
+            )),
+        }
     }
 
     /// Expects a specific token, reporting `ctx` (the expected token plus its
@@ -482,10 +604,34 @@ impl Parser {
             "datepart" => DateOperand::Expr(self.parse_datepart_args()?),
             "dateadd" => DateOperand::Expr(self.parse_dateadd_args()?),
             "datediff" => DateOperand::Expr(self.parse_datediff_args()?),
+            // OData component functions: `year(field)` / `month(field)` / ...
+            // evaluate to the same calendar part as `datepart(part, field)`.
+            "year" | "month" | "day" | "hour" | "minute" | "second" => {
+                let part = DatePart::parse(name)
+                    .ok_or_else(|| format!("Unsupported date function {name:?}."))?;
+                let field = self.expect_ident("field name")?;
+                self.expect_token(&Token::RParen, "')' to close function arguments")?;
+                DateOperand::Expr(DateExpr::DatePart { part, field })
+            }
+            "date" => {
+                let field = self.expect_ident("field name")?;
+                self.expect_token(&Token::RParen, "')' to close function arguments")?;
+                DateOperand::Expr(DateExpr::Date { field })
+            }
+            "time" => {
+                let field = self.expect_ident("field name")?;
+                self.expect_token(&Token::RParen, "')' to close function arguments")?;
+                DateOperand::Expr(DateExpr::Time { field })
+            }
+            "now" => {
+                self.expect_token(&Token::RParen, "')' to close now() arguments")?;
+                DateOperand::Expr(DateExpr::Now(now_iso()))
+            }
             _ => {
                 return Err(format!(
                     "Unsupported date function {name:?}; supported functions: \
-                     datepart, dateadd, datediff, utcdatetime."
+                     datepart, dateadd, datediff, utcdatetime, year, month, day, hour, \
+                     minute, second, date, time, now."
                 ));
             }
         };
@@ -648,6 +794,11 @@ impl Parser {
                 ))
             }
         };
+        // The pattern is a regular expression; reject invalid patterns at
+        // parse time (a `400 InvalidQuery`), not per document.
+        if let Err(e) = regex::Regex::new(&pattern) {
+            return Err(format!("Invalid regular expression in search.{name}: {e}."));
+        }
         self.expect_token(&Token::Comma, &format!("',' in search.{name} arguments"))?;
         // The field list is a field name or a comma-separated string
         // of field names (the documented Azure form).

@@ -60,28 +60,24 @@ pub fn validate(expr: &FilterExpr, definition: &IndexDefinition) -> Result<(), S
             }
             Ok(())
         }
-        FilterExpr::Any { field, inner } | FilterExpr::All { field, inner } => {
-            let field_def = require_filterable(field, definition)?;
-            if !field_def.is_collection() {
+        FilterExpr::StringFuncCompare { expr, .. } => {
+            let field_def = require_filterable(expr.field(), definition)?;
+            if !matches!(
+                field_def.field_type,
+                FieldType::String | FieldType::CollectionString
+            ) {
                 return Err(format!(
-                    "Field {field:?} is not a collection; any/all require a collection field."
+                    "Filter function {} on field {:?} requires a string field; \
+                     field type is {:?}.",
+                    expr.name(),
+                    expr.field(),
+                    field_def.field_type.as_str()
                 ));
             }
-            match inner.as_ref() {
-                FilterExpr::Compare { field: inner_field, .. } => {
-                    if inner_field.contains('/') {
-                        return Err(format!(
-                            "any/all on field {field:?} must contain a single comparison on the \
-                              lambda variable; paths into the element (e.g. {inner_field:?}) are \
-                              not supported."
-                        ));
-                    }
-                    Ok(())
-                }
-                _ => Err(format!(
-                    "any/all on field {field:?} must contain a single comparison on the lambda variable."
-                )),
-            }
+            Ok(())
+        }
+        FilterExpr::Any { field, inner } | FilterExpr::All { field, inner } => {
+            validate_lambda(field, inner, definition)
         }
         FilterExpr::DateCompare { left, .. } => {
             for field in left.referenced_fields() {
@@ -111,6 +107,69 @@ pub fn validate(expr: &FilterExpr, definition: &IndexDefinition) -> Result<(), S
             Ok(())
         }
     }
+}
+
+/// Validates an `any`/`all` collection filter: the field must be a
+/// collection, and the lambda body must be a single comparison on the lambda
+/// variable, optionally addressing one subfield level (`var/Subfield`).
+fn validate_lambda(
+    field: &str,
+    inner: &FilterExpr,
+    definition: &IndexDefinition,
+) -> Result<(), String> {
+    let field_def = definition
+        .field_path(field)
+        .ok_or_else(|| format!("Filter references unknown field {field:?}."))?;
+    if !field_def.is_collection() {
+        return Err(format!(
+            "Field {field:?} is not a collection; any/all require a collection field."
+        ));
+    }
+    let FilterExpr::Compare {
+        field: inner_field, ..
+    } = inner
+    else {
+        return Err(format!(
+            "any/all on field {field:?} must contain a single comparison on the lambda variable."
+        ));
+    };
+    let segments: Vec<&str> = inner_field.split('/').collect();
+    if segments.len() > 2 {
+        return Err(format!(
+            "any/all on field {field:?} supports at most one level of subfield \
+              access through the lambda variable; {inner_field:?} is too deep."
+        ));
+    }
+    if segments.len() == 2 {
+        // Subfield access (`var/Subfield`): the subfield must exist and be
+        // filterable. The collection field itself need not be
+        // (collection-of-complex subfields carry the `filterable` flag, not
+        // the parent).
+        let subfield_name = segments[1];
+        let subfield = field_def
+            .subfields
+            .iter()
+            .find(|s| s.name == subfield_name)
+            .ok_or_else(|| {
+                format!(
+                    "any/all on field {field:?} references unknown subfield \
+                      {subfield_name:?}."
+                )
+            })?;
+        if !subfield.filterable {
+            return Err(format!(
+                "Subfield {subfield_name:?} of field {field:?} is not filterable; \
+                  mark it \"filterable\": true in the index schema."
+            ));
+        }
+    } else if !field_def.filterable {
+        // A plain comparison on the element (a scalar collection) requires
+        // the collection field to be filterable.
+        return Err(format!(
+            "Field {field:?} is not filterable; mark it \"filterable\": true in the index schema."
+        ));
+    }
+    Ok(())
 }
 
 fn require_filterable<'a>(

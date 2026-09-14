@@ -98,6 +98,15 @@ pub enum DateExpr {
     },
     /// `utcdatetime('...')`: a literal date, normalized at parse time.
     UtcDateTime(String),
+    /// `date(field)`: the field's date with the time truncated to midnight
+    /// UTC, as a normalized ISO-8601 string.
+    Date { field: String },
+    /// `time(field)`: the field's time with the date truncated to
+    /// `0001-01-01`, as a normalized ISO-8601 string.
+    Time { field: String },
+    /// `now()`: the current UTC timestamp, captured once at parse time so the
+    /// value is stable for the whole query execution.
+    Now(String),
 }
 
 /// The left side of a date comparison: a field (compared as a normalized
@@ -133,6 +142,12 @@ pub(crate) fn parse_datetime(text: &str) -> Option<DateTime<Utc>> {
 /// comparison chronological. Returns `None` when unparseable.
 pub(crate) fn normalize_datetime(text: &str) -> Option<String> {
     parse_datetime(text).map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+}
+
+/// The current UTC timestamp as a normalized ISO-8601 string, for `now()`.
+/// Captured at parse time so a single query sees one stable value.
+pub(crate) fn now_iso() -> String {
+    Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
 /// Resolves a field path to its first date/time value, parsed to UTC. Paths
@@ -274,7 +289,21 @@ impl DateExpr {
                     *unit, &start_dt, &end_dt,
                 ))))
             }
-            DateExpr::UtcDateTime(iso) => Some(FilterValue::String(iso.clone())),
+            DateExpr::UtcDateTime(iso) | DateExpr::Now(iso) => {
+                Some(FilterValue::String(iso.clone()))
+            }
+            DateExpr::Date { field } => {
+                let dt = resolve_datetime(fields, field)?;
+                Some(FilterValue::String(
+                    dt.format("%Y-%m-%dT00:00:00.000Z").to_string(),
+                ))
+            }
+            DateExpr::Time { field } => {
+                let dt = resolve_datetime(fields, field)?;
+                Some(FilterValue::String(
+                    dt.format("0001-01-01T%H:%M:%S%.3fZ").to_string(),
+                ))
+            }
         }
     }
 }
@@ -301,7 +330,10 @@ impl DateOperand {
         match self {
             DateOperand::Field(field)
             | DateOperand::Expr(
-                DateExpr::DatePart { field, .. } | DateExpr::DateAdd { field, .. },
+                DateExpr::DatePart { field, .. }
+                | DateExpr::DateAdd { field, .. }
+                | DateExpr::Date { field }
+                | DateExpr::Time { field },
             ) => vec![field.clone()],
             DateOperand::Expr(DateExpr::DateDiff { start, end, .. }) => {
                 let mut fields = Vec::new();
@@ -312,7 +344,7 @@ impl DateOperand {
                 }
                 fields
             }
-            DateOperand::Expr(DateExpr::UtcDateTime(_)) => Vec::new(),
+            DateOperand::Expr(DateExpr::UtcDateTime(_) | DateExpr::Now(_)) => Vec::new(),
         }
     }
 }

@@ -17,7 +17,7 @@ Phase 2 and Phase 2.1 established the core API surface and vector search. The su
 
 ### 1. Synonym map application
 
-**Current state:** Synonym maps are stored, echoed, and managed (CRUD) but inert — they do not affect search results.
+**Current state:** Implemented — Solr synonym rules are parsed at map creation and applied to analyzed query tokens at search time for indexes that reference the map via `synonymMaps` (unit + contract tests green; Python/C# SDK suites pending).
 
 **Target:** Apply Solr synonym map rules to the full-text query pipeline.
 
@@ -40,7 +40,7 @@ Edge cases:
 
 ### 2. Filter function extensions
 
-**Current state:** The filter parser supports `and`/`or`/`not`, parentheses, comparison operators, `in`, `startswith`/`endswith`/`contains`, and `any`/`all` lambdas. Date functions, additional string functions, `search.ismatch`, and lambda subfield access are rejected with `400 InvalidQuery`.
+**Current state:** Implemented — the parser additionally supports the OData date functions (`year`/`month`/`day`/`hour`/`minute`/`second`/`date`/`time`/`now`), the string functions (`length`/`indexof`/`substring`/`tolower`/`toupper`/`trim`), `search.ismatch` as a case-insensitive regex, and one level of lambda subfield access (`field/any(var: var/Subfield op value)`), alongside the pre-existing `datepart`/`dateadd`/`datediff`/`utcdatetime` functions (unit + contract tests green; Python/C# SDK suites pending).
 
 **Target:** Extend the filter parser to support the full OData function set Azure documents.
 
@@ -453,24 +453,24 @@ source/rust/src/
 
 ### Synonym maps
 
-- [ ] Solr synonym parser handles equivalence groups and directional rules.
-- [ ] Synonym expansion applied to analyzed query tokens in the full-text pipeline.
-- [ ] Fuzzy terms are not synonym-expanded.
-- [ ] Multiple synonym maps on one index: union of expansions.
-- [ ] Index referencing a non-existent synonym map → `400 InvalidIndex`.
-- [ ] Synonym expansion does not affect filter/orderby/facets/select.
-- [ ] Contract tests: synonym-expanded search returns correct results.
+- [x] Solr synonym parser handles equivalence groups and directional rules.
+- [x] Synonym expansion applied to analyzed query tokens in the full-text pipeline.
+- [x] Fuzzy terms are not synonym-expanded.
+- [x] Multiple synonym maps on one index: union of expansions.
+- [x] Index referencing a non-existent synonym map → `400 InvalidIndex`.
+- [x] Synonym expansion does not affect filter/orderby/facets/select.
+- [x] Contract tests: synonym-expanded search returns correct results.
 - [ ] Python SDK test: create map + index, search with synonym term.
 
 ### Filter extensions
 
-- [ ] Date functions: `year`, `month`, `day`, `hour`, `minute`, `second`, `date`, `time`, `now`.
-- [ ] String functions: `length`, `indexof`, `substring`, `tolower`, `toupper`, `trim`.
-- [ ] `search.ismatch` with case-insensitive regex.
-- [ ] Lambda subfield access: `field/any(var: var/Subfield op value)`.
-- [ ] Type mismatch rejection (date function on non-date, string function on non-string).
-- [ ] Invalid regex → `400 InvalidQuery`.
-- [ ] Contract tests: each function, combined expressions, error cases.
+- [x] Date functions: `year`, `month`, `day`, `hour`, `minute`, `second`, `date`, `time`, `now`.
+- [x] String functions: `length`, `indexof`, `substring`, `tolower`, `toupper`, `trim`.
+- [x] `search.ismatch` with case-insensitive regex.
+- [x] Lambda subfield access: `field/any(var: var/Subfield op value)`.
+- [x] Type mismatch rejection (date function on non-date, string function on non-string).
+- [x] Invalid regex → `400 InvalidQuery`.
+- [x] Contract tests: each function, combined expressions, error cases.
 - [ ] Python SDK test: filter with date/string functions, `ismatch`, lambda subfield.
 
 ### Suggest/autocomplete
