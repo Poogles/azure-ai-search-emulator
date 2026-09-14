@@ -75,6 +75,14 @@ Serves on `http://localhost:8080` by default. Configure via environment variable
 
 ### Docker
 
+A pre-built image is published to GHCR on every push to `main`:
+
+```sh
+docker run --rm -p 8080:8080 ghcr.io/poogles/azure-ai-search-emulator:latest
+```
+
+Or build locally:
+
 ```sh
 docker build -t aisearch-emulator source/rust
 docker run --rm -p 8080:8080 aisearch-emulator
@@ -98,6 +106,28 @@ poetry run pytest tests/e2e -v
 ```
 
 The E2E suite starts the container via testcontainers and exercises the official `azure-search-documents` SDK: index CRUD, upload, full-text and match-all search, deleted-index error handling, and a RAG-style vector + hybrid search flow.
+
+## Linting (pre-commit)
+
+Linting and formatting are driven by [pre-commit](https://pre-commit.com/) (see [.pre-commit-config.yaml](.pre-commit-config.yaml)). It runs the generic file checks, `ruff` (format + lint) and `mypy` over the Python harness, and `cargo fmt` / `cargo clippy` over the Rust crate. The same job runs in CI on every commit.
+
+`pre-commit` is provided by the dev shell. Install it as a git hook once so it runs automatically on `git commit`:
+
+```sh
+pre-commit install
+```
+
+To run all hooks manually (e.g. before pushing, or to mirror CI):
+
+```sh
+pre-commit run --all-files
+```
+
+Run a single hook:
+
+```sh
+pre-commit run ruff --all-files
+```
 
 ## Repository layout
 

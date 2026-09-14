@@ -35,6 +35,14 @@ structure. No Azure credentials or network access are required.
 
 ### Docker (recommended)
 
+A pre-built image is published to GHCR on every push to `main`:
+
+```sh
+docker run --rm -p 8080:8080 ghcr.io/poogles/azure-ai-search-emulator:latest
+```
+
+Or build from source:
+
 ```sh
 docker build -t aisearch-emulator source/rust
 docker run --rm -p 8080:8080 aisearch-emulator
