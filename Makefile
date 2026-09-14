@@ -17,7 +17,7 @@ MS_SAMPLES_PATH := sdk/search/azure-search-documents/samples
 help:
 	@echo "Azure AI Search emulator — make targets"
 	@echo ""
-	@echo "  test     Run the Python SDK E2E tests (default)"
+	@echo "  test     Run the Rust checks, then the Python SDK E2E tests (default)"
 	@echo "  test-csharp  Run the C# SDK compatibility suite (.NET 10, xunit)"
 	@echo "  rust     Run Rust fmt, clippy, and unit/contract tests"
 	@echo "  docker   Build the emulator Docker image ($(IMAGE))"
@@ -33,7 +33,7 @@ setup:
 	cd $(PYTHON_DIR) && poetry install
 
 .PHONY: test
-test:
+test: rust
 	@test -x $(PYTHON_DIR)/$(VENV)/bin/python || (echo "virtualenv missing — run 'make setup' first" && exit 1)
 	cd $(PYTHON_DIR) && ./$(VENV)/bin/python -m pytest tests/e2e -v
 
