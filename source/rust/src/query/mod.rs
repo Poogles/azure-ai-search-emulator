@@ -445,6 +445,28 @@ fn maybe_boost(query: Box<dyn Query>, boost: f32) -> Box<dyn Query> {
 /// forms. A `Term` clause also OR-matches its synonym expansions (raw
 /// `(term, expansions)` pairs; expansions are analyzed per field like the
 /// term itself). Fuzzy and phrase clauses do not expand.
+/// Builds the per-field `Should` clauses for a clause: for each in-scope
+/// field, the queries `per_field` builds for it, each wrapped in the
+/// field's boost. Returns `EmptyQuery` when no field produces a query.
+fn per_field_queries(
+    fields: &[SearchableField],
+    boosts: &BTreeMap<String, f32>,
+    per_field: impl Fn(&SearchableField) -> Vec<Box<dyn Query>>,
+) -> Box<dyn Query> {
+    let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+    for searchable in fields {
+        let boost = field_boost(boosts, &searchable.name);
+        for query in per_field(searchable) {
+            clauses.push((Occur::Should, maybe_boost(query, boost)));
+        }
+    }
+    if clauses.is_empty() {
+        Box::new(EmptyQuery)
+    } else {
+        Box::new(BooleanQuery::new(clauses))
+    }
+}
+
 fn clause_query(
     clause: &Clause,
     fields: &[SearchableField],
@@ -452,41 +474,25 @@ fn clause_query(
     synonyms: &[(String, Vec<String>)],
 ) -> Box<dyn Query> {
     match clause {
-        Clause::Term(term) => {
-            let mut term_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-            for searchable in fields {
-                let tokens = analyze_with(term, searchable.analyzer.as_deref());
-                for token in &tokens {
-                    let term = Term::from_field_text(searchable.field, token);
-                    let query: Box<dyn Query> =
-                        Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
-                    term_clauses.push((
-                        Occur::Should,
-                        maybe_boost(query, field_boost(boosts, &searchable.name)),
-                    ));
-                }
-                // Synonym expansions for this term, analyzed with the same
-                // field analyzer so `keyword` fields match verbatim forms and
-                // English fields match stemmed forms.
-                if let Some((_, expansions)) = synonyms.iter().find(|(raw, _)| raw == term) {
-                    for expansion in expansions {
-                        for token in analyze_with(expansion, searchable.analyzer.as_deref()) {
-                            let term = Term::from_field_text(searchable.field, &token);
-                            let query: Box<dyn Query> =
-                                Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
-                            term_clauses.push((
-                                Occur::Should,
-                                maybe_boost(query, field_boost(boosts, &searchable.name)),
-                            ));
-                        }
+        Clause::Term(term) => per_field_queries(fields, boosts, |searchable| {
+            let mut queries: Vec<Box<dyn Query>> = Vec::new();
+            for token in analyze_with(term, searchable.analyzer.as_deref()) {
+                let term = Term::from_field_text(searchable.field, &token);
+                queries.push(Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)));
+            }
+            // Synonym expansions for this term, analyzed with the same
+            // field analyzer so `keyword` fields match verbatim forms and
+            // English fields match stemmed forms.
+            if let Some((_, expansions)) = synonyms.iter().find(|(raw, _)| raw == term) {
+                for expansion in expansions {
+                    for token in analyze_with(expansion, searchable.analyzer.as_deref()) {
+                        let term = Term::from_field_text(searchable.field, &token);
+                        queries.push(Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)));
                     }
                 }
             }
-            if term_clauses.is_empty() {
-                return Box::new(EmptyQuery);
-            }
-            Box::new(BooleanQuery::new(term_clauses))
-        }
+            queries
+        }),
         Clause::FuzzyTerm { term, distance } => {
             // Azure lowercases fuzzy terms but bypasses analysis (no stemming,
             // no stopword removal, no punctuation splitting), so the raw
@@ -495,39 +501,22 @@ fn clause_query(
             if token.is_empty() {
                 return Box::new(EmptyQuery);
             }
-            let mut fuzzy_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(fields.len());
-            for searchable in fields {
+            per_field_queries(fields, boosts, |searchable| {
                 let term = Term::from_field_text(searchable.field, &token);
-                let query: Box<dyn Query> = Box::new(FuzzyTermQuery::new(term, *distance, true));
-                fuzzy_clauses.push((
-                    Occur::Should,
-                    maybe_boost(query, field_boost(boosts, &searchable.name)),
-                ));
-            }
-            Box::new(BooleanQuery::new(fuzzy_clauses))
+                vec![Box::new(FuzzyTermQuery::new(term, *distance, true))]
+            })
         }
-        Clause::Phrase(phrase) => {
-            let mut phrase_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-            for searchable in fields {
-                let tokens = analyze_with(phrase, searchable.analyzer.as_deref());
-                if tokens.is_empty() {
-                    continue;
-                }
-                let terms = tokens
-                    .iter()
-                    .map(|token| Term::from_field_text(searchable.field, token))
-                    .collect();
-                let query: Box<dyn Query> = Box::new(PhraseQuery::new(terms));
-                phrase_clauses.push((
-                    Occur::Should,
-                    maybe_boost(query, field_boost(boosts, &searchable.name)),
-                ));
+        Clause::Phrase(phrase) => per_field_queries(fields, boosts, |searchable| {
+            let tokens = analyze_with(phrase, searchable.analyzer.as_deref());
+            if tokens.is_empty() {
+                return Vec::new();
             }
-            if phrase_clauses.is_empty() {
-                return Box::new(EmptyQuery);
-            }
-            Box::new(BooleanQuery::new(phrase_clauses))
-        }
+            let terms = tokens
+                .iter()
+                .map(|token| Term::from_field_text(searchable.field, token))
+                .collect();
+            vec![Box::new(PhraseQuery::new(terms))]
+        }),
     }
 }
 

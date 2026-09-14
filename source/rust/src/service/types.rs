@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::error::ApiError;
 use crate::filter::FilterExpr;
 use crate::query::{QueryType, SearchMode};
 use crate::storage::Document;
@@ -37,6 +38,55 @@ pub struct DocumentAction {
     pub kind: ActionKind,
     /// The document fields (for `delete`, only the key field is meaningful).
     pub document: Value,
+}
+
+impl DocumentAction {
+    /// Parses one upload-batch action from the wire format. Two shapes are
+    /// accepted:
+    ///   - Documented Azure format: `{"@search.action": "...", "document": {...}}`
+    ///   - Python SDK format: `{"@search.action": "...", ...fields}`
+    ///     (the SDK spreads the document fields at the top level of the action)
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] when the action is not a JSON object, its
+    /// `@search.action` is unsupported, or it has no `document` member.
+    pub fn from_value(value: &Value) -> Result<Self, ApiError> {
+        let action_type = value
+            .get("@search.action")
+            .and_then(Value::as_str)
+            .unwrap_or("upload");
+        let kind = match action_type {
+            "upload" => ActionKind::Upload,
+            "merge" => ActionKind::Merge,
+            "mergeOrUpload" => ActionKind::MergeOrUpload,
+            "delete" => ActionKind::Delete,
+            other => {
+                return Err(ApiError::unsupported(
+                    "UnsupportedAction",
+                    format!("Document action {other:?} is not supported by the emulator."),
+                ))
+            }
+        };
+        let document = match value.get("document") {
+            Some(document) => document.clone(),
+            None => Value::Object(
+                value
+                    .as_object()
+                    .ok_or_else(|| {
+                        ApiError::bad_request(
+                            "InvalidDocuments",
+                            "Each batch action must be a JSON object.",
+                        )
+                    })?
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != "@search.action")
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+        };
+        Ok(Self { kind, document })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

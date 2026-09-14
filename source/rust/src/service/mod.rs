@@ -49,6 +49,25 @@ use self::validation::{
     finite_f32, key_display, key_field_name, validate_document, validate_schema,
 };
 
+/// The resolved state of a search: the effective paging parameters plus the
+/// per-side score lists, ready to merge, order, and project.
+struct SearchPlan {
+    skip: u64,
+    orderby: Vec<OrderBy>,
+    full_text: FullTextQuery,
+    documents: Vec<Document>,
+    full_text_scores: BTreeMap<String, f32>,
+    vector_lists: Vec<(f32, BTreeMap<String, f32>)>,
+}
+
+/// A projected search page: the response documents, their per-document
+/// scores, and their highlight fragments.
+struct SearchPage {
+    documents: Vec<Document>,
+    scores: BTreeMap<String, f32>,
+    highlights: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+}
+
 pub struct SearchService {
     storage: Arc<dyn Storage>,
     engine: Arc<SearchEngine>,
@@ -897,7 +916,44 @@ impl SearchService {
     /// token is invalid or stale, or the vector queries changed mid-paging.
     pub fn search(&self, index: &str, query: &SearchQuery) -> Result<SearchOutcome, ApiError> {
         let definition = self.require_index(index)?;
+        let SearchPlan {
+            skip,
+            orderby,
+            full_text,
+            documents,
+            full_text_scores,
+            vector_lists,
+        } = self.resolve_plan(&definition, query)?;
+        let (scored, total, facets) =
+            Self::execute_plan(&orderby, &documents, full_text_scores, &vector_lists, query);
+        let (page, has_more, next_skip) = Self::paginate(scored, skip, query.top, total);
+        let page = Self::project_page(page, query, &full_text, &definition);
+        Ok(SearchOutcome {
+            total,
+            documents: page.documents,
+            scores: page.scores,
+            highlights: page.highlights,
+            facets,
+            has_more,
+            next_skip,
+        })
+    }
 
+    /// Resolves a search request into a [`SearchPlan`]: the effective paging
+    /// state (a continuation token is authoritative for skip/filter/orderby
+    /// and must reference the current document state), the prepared full-text
+    /// query, and the per-side score lists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] (`400 InvalidQuery`) when a continuation token
+    /// is invalid or the vector queries changed mid-paging, or the query
+    /// engine fails.
+    fn resolve_plan(
+        &self,
+        definition: &IndexDefinition,
+        query: &SearchQuery,
+    ) -> Result<SearchPlan, ApiError> {
         // The request's vector-query identity, bound into continuation tokens.
         let current_vector_hash: Option<u64> = query
             .paging
@@ -905,10 +961,7 @@ impl SearchService {
             .as_ref()
             .map(|raw| vector_query_hash(raw, query.vector_filter_mode.as_str()));
 
-        // A continuation token is authoritative for skip/filter/orderby and
-        // must reference the current document state.
-        let (skip, filter, orderby) =
-            Self::resolve_paging(query, &definition, current_vector_hash)?;
+        let (skip, filter, orderby) = Self::resolve_paging(query, definition, current_vector_hash)?;
 
         let full_text = prepare_full_text(self, query)?;
         let vector_active = !query.vector_queries.is_empty();
@@ -939,13 +992,35 @@ impl SearchService {
             BTreeMap::new()
         };
 
+        Ok(SearchPlan {
+            skip,
+            orderby,
+            full_text,
+            documents,
+            full_text_scores,
+            vector_lists,
+        })
+    }
+
+    /// Executes the scored half of a [`SearchPlan`]: merges the per-side score
+    /// lists (RRF fusion when both sides produced hits, otherwise a plain
+    /// union keeping native scores — best score wins), orders the hits, and
+    /// computes facets over the full matched set. Returns the ordered hits,
+    /// the match total, and the facets.
+    fn execute_plan(
+        orderby: &[OrderBy],
+        documents: &[Document],
+        full_text_scores: BTreeMap<String, f32>,
+        vector_lists: &[(f32, BTreeMap<String, f32>)],
+        query: &SearchQuery,
+    ) -> (Vec<(Document, f32)>, u64, Option<Value>) {
         // Hybrid merge: when both sides produced hits, fuse them with weighted
         // Reciprocal Rank Fusion (RRF, k=60) — the full-text list at weight
         // 1.0 and each vector-query list at its own `weight` — so a document
         // ranked well on either side surfaces and a heavier query contributes
         // more. When only one side is active (vector-only or full-text-only)
         // keep the native scores via a plain union (best score wins).
-        let merged = Self::merge_scores(full_text_scores, &vector_lists);
+        let merged = Self::merge_scores(full_text_scores, vector_lists);
         let doc_map: BTreeMap<&str, &Document> = documents
             .iter()
             .map(|doc| (doc.key.as_str(), doc))
@@ -954,7 +1029,7 @@ impl SearchService {
             .into_iter()
             .filter_map(|(key, score)| doc_map.get(key.as_str()).map(|doc| ((*doc).clone(), score)))
             .collect();
-        order_scored(&mut scored, &orderby);
+        order_scored(&mut scored, orderby);
 
         let total = u64::try_from(scored.len()).unwrap_or(u64::MAX);
         let matched: Vec<Document> = scored.iter().map(|(doc, _)| doc.clone()).collect();
@@ -963,19 +1038,7 @@ impl SearchService {
         } else {
             Some(compute_facets(&matched, &query.facets))
         };
-
-        let (page, has_more, next_skip) = Self::paginate(scored, skip, query.top, total);
-        let (documents, page_scores, highlights) =
-            Self::project_page(page, query, &full_text, &definition);
-        Ok(SearchOutcome {
-            total,
-            documents,
-            scores: page_scores,
-            highlights,
-            facets,
-            has_more,
-            next_skip,
-        })
+        (scored, total, facets)
     }
 
     /// Merges full-text and vector score lists: RRF fusion when both sides
@@ -1026,18 +1089,13 @@ impl SearchService {
     /// Projects a page into response documents: per-document scores,
     /// highlight fragments, and omission of non-retrievable vectors unless
     /// explicitly selected.
-    #[allow(clippy::type_complexity)]
     fn project_page(
         page: Vec<(Document, f32)>,
         query: &SearchQuery,
         full_text: &FullTextQuery,
         definition: &IndexDefinition,
-    ) -> (
-        Vec<Document>,
-        BTreeMap<String, f32>,
-        BTreeMap<String, BTreeMap<String, Vec<String>>>,
-    ) {
-        let page_scores: BTreeMap<String, f32> = page
+    ) -> SearchPage {
+        let scores: BTreeMap<String, f32> = page
             .iter()
             .map(|(doc, score)| (doc.key.clone(), *score))
             .collect();
@@ -1063,7 +1121,11 @@ impl SearchService {
                 doc
             })
             .collect();
-        (documents, page_scores, highlights)
+        SearchPage {
+            documents,
+            scores,
+            highlights,
+        }
     }
 
     /// Resolves the effective `(skip, filter, orderby)` for a search. When a
@@ -1268,26 +1330,19 @@ impl SearchService {
             ));
         }
         let limit = usize::try_from(top).unwrap_or(usize::MAX);
-        let mut seen = std::collections::BTreeSet::new();
+        let mut seen = BTreeSet::new();
         let mut completions = Vec::new();
-        for document in &documents {
-            if let Some(expr) = &filter_expr {
-                if !expr.matches(&document.fields) {
-                    continue;
-                }
-            }
-            for field_name in &suggester.search_fields {
-                for value in document.resolve_path(field_name) {
-                    for word in field_words(value) {
-                        if word.to_lowercase().contains(&needle) && seen.insert(word.clone()) {
-                            completions.push(AutocompleteCompletion {
-                                query_plus_text: format!("{search} {word}"),
-                                text: word,
-                            });
-                            if completions.len() >= limit {
-                                return Ok(completions);
-                            }
-                        }
+        for (_, words) in
+            Self::suggester_candidates(&documents, &suggester, filter_expr.as_ref(), &needle)
+        {
+            for word in words {
+                if seen.insert(word.clone()) {
+                    completions.push(AutocompleteCompletion {
+                        query_plus_text: format!("{search} {word}"),
+                        text: word,
+                    });
+                    if completions.len() >= limit {
+                        return Ok(completions);
                     }
                 }
             }
@@ -1323,37 +1378,18 @@ impl SearchService {
         }
         let limit = usize::try_from(top).unwrap_or(usize::MAX);
         let mut suggestions = Vec::new();
-        for document in &documents {
-            if let Some(expr) = &filter_expr {
-                if !expr.matches(&document.fields) {
-                    continue;
-                }
-            }
-            let mut matched = None;
-            for field_name in &suggester.search_fields {
-                for value in document.resolve_path(field_name) {
-                    for word in field_words(value) {
-                        if word.to_lowercase().contains(&needle) {
-                            matched = Some(word);
-                            break;
-                        }
-                    }
-                    if matched.is_some() {
-                        break;
-                    }
-                }
-                if matched.is_some() {
-                    break;
-                }
-            }
-            if let Some(text) = matched {
-                suggestions.push(Suggestion {
-                    document: document.clone(),
-                    text,
-                });
-                if suggestions.len() >= limit {
-                    break;
-                }
+        for (document, words) in
+            Self::suggester_candidates(&documents, &suggester, filter_expr.as_ref(), &needle)
+        {
+            let Some(text) = words.into_iter().next() else {
+                continue;
+            };
+            suggestions.push(Suggestion {
+                document: document.clone(),
+                text,
+            });
+            if suggestions.len() >= limit {
+                break;
             }
         }
         Ok(suggestions)
@@ -1386,6 +1422,41 @@ impl SearchService {
             .get_documents(&definition.name)
             .map_err(|e| ApiError::not_found(e.to_string()))?;
         Ok((documents, suggester))
+    }
+
+    /// The words of a document's suggester search fields, in field order,
+    /// then value order, then word order.
+    fn suggester_words<'a>(
+        document: &'a Document,
+        suggester: &'a Suggester,
+    ) -> impl Iterator<Item = String> + 'a {
+        suggester.search_fields.iter().flat_map(|field_name| {
+            document
+                .resolve_path(field_name)
+                .into_iter()
+                .flat_map(field_words)
+        })
+    }
+
+    /// The suggester's candidate documents with their matching words: each
+    /// document passing `filter` (in key order) paired with the words of the
+    /// suggester's search fields that contain `needle` (case-insensitive).
+    /// Documents with no matching word are omitted.
+    fn suggester_candidates<'a>(
+        documents: &'a [Document],
+        suggester: &'a Suggester,
+        filter: Option<&'a FilterExpr>,
+        needle: &'a str,
+    ) -> impl Iterator<Item = (&'a Document, Vec<String>)> {
+        documents.iter().filter_map(move |document| {
+            if !filter.is_none_or(|expr| expr.matches(&document.fields)) {
+                return None;
+            }
+            let words = Self::suggester_words(document, suggester)
+                .filter(|word| word.to_lowercase().contains(needle))
+                .collect::<Vec<_>>();
+            (!words.is_empty()).then_some((document, words))
+        })
     }
 
     pub fn reset(&self) {

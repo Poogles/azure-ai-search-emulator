@@ -321,12 +321,12 @@ impl Parser {
         }
         let op = self.parse_op()?;
         // A trailing `utcdatetime('...')`: `field op utcdatetime('...')`.
-        if let Some(Token::Ident(name)) = self.peek() {
-            if name == "utcdatetime" && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
-            {
-                self.next(); // Consume `utcdatetime`.
-                return self.parse_field_vs_utcdatetime(&first, op);
-            }
+        if let Some(iso) = self.try_parse_utcdatetime()? {
+            return Ok(FilterExpr::DateCompare {
+                left: DateOperand::Field(first.clone()),
+                op,
+                value: FilterValue::String(iso),
+            });
         }
         let value = self.parse_value()?;
         Ok(FilterExpr::Compare {
@@ -334,6 +334,19 @@ impl Parser {
             op,
             value,
         })
+    }
+
+    /// If the next tokens are a `utcdatetime('...')` literal, consumes it and
+    /// returns the normalized ISO-8601 string; otherwise returns `None`
+    /// without consuming.
+    fn try_parse_utcdatetime(&mut self) -> Result<Option<String>, String> {
+        let is_utcdatetime = matches!(self.peek(), Some(Token::Ident(name)) if name == "utcdatetime")
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen));
+        if !is_utcdatetime {
+            return Ok(None);
+        }
+        self.next(); // Consume `utcdatetime`.
+        self.parse_utcdatetime_literal().map(Some)
     }
 
     /// Parses a string-function call after the function name: `(field,
@@ -416,69 +429,9 @@ impl Parser {
         }
         self.next(); // Consume '('.
         let left = match name {
-            "datepart" => {
-                let part_name = self.expect_ident("date part")?;
-                let part = DatePart::parse(&part_name).ok_or_else(|| {
-                    format!(
-                        "Unknown datepart {part_name:?}; supported parts: year, quarter, month, \
-                         week, day, hour, minute, second, dayofweek, dayofyear."
-                    )
-                })?;
-                self.expect_comma("datepart")?;
-                let field = self.expect_ident("field name")?;
-                self.expect_rparen("datepart")?;
-                DateOperand::Expr(DateExpr::DatePart { part, field })
-            }
-            "dateadd" => {
-                let unit_name = self.expect_ident("date unit")?;
-                let unit = DateUnit::parse(&unit_name).ok_or_else(|| {
-                    format!(
-                        "Unknown dateadd unit {unit_name:?}; supported units: year, quarter, \
-                         month, week, day, hour, minute, second."
-                    )
-                })?;
-                self.expect_comma("dateadd")?;
-                let interval = match self.next() {
-                    Some(Token::Number(n)) if n.fract() == 0.0 => {
-                        // `as` saturates on overflow; the `try_from` below
-                        // rejects the saturated value as out of range.
-                        #[allow(clippy::cast_possible_truncation)]
-                        let as_i128 = n as i128;
-                        i64::try_from(as_i128).map_err(|_| {
-                            format!("dateadd interval {n} is out of range; expected an integer.")
-                        })?
-                    }
-                    other => {
-                        return Err(format!(
-                            "Expected an integer interval in dateadd, found {}.",
-                            describe_token(other.as_ref())
-                        ))
-                    }
-                };
-                self.expect_comma("dateadd")?;
-                let field = self.expect_ident("field name")?;
-                self.expect_rparen("dateadd")?;
-                DateOperand::Expr(DateExpr::DateAdd {
-                    unit,
-                    interval,
-                    field,
-                })
-            }
-            "datediff" => {
-                let unit_name = self.expect_ident("date unit")?;
-                let unit = DateUnit::parse(&unit_name).ok_or_else(|| {
-                    format!(
-                        "Unknown datediff unit {unit_name:?}; supported units: year, quarter, \
-                         month, week, day, hour, minute, second."
-                    )
-                })?;
-                self.expect_comma("datediff")?;
-                let start = self.parse_date_ref("datediff")?;
-                self.expect_comma("datediff")?;
-                let end = self.parse_date_ref("datediff")?;
-                self.expect_rparen("datediff")?;
-                DateOperand::Expr(DateExpr::DateDiff { unit, start, end })
-            }
+            "datepart" => DateOperand::Expr(self.parse_datepart_args()?),
+            "dateadd" => DateOperand::Expr(self.parse_dateadd_args()?),
+            "datediff" => DateOperand::Expr(self.parse_datediff_args()?),
             _ => {
                 return Err(format!(
                     "Unsupported date function {name:?}; supported functions: \
@@ -491,16 +444,82 @@ impl Parser {
         Ok(FilterExpr::DateCompare { left, op, value })
     }
 
+    /// Parses `datepart(part, field)` after `(`: the date part and the field.
+    fn parse_datepart_args(&mut self) -> Result<DateExpr, String> {
+        let part_name = self.expect_ident("date part")?;
+        let part = DatePart::parse(&part_name).ok_or_else(|| {
+            format!(
+                "Unknown datepart {part_name:?}; supported parts: year, quarter, month, \
+                 week, day, hour, minute, second, dayofweek, dayofyear."
+            )
+        })?;
+        self.expect_comma("datepart")?;
+        let field = self.expect_ident("field name")?;
+        self.expect_rparen("datepart")?;
+        Ok(DateExpr::DatePart { part, field })
+    }
+
+    /// Parses `dateadd(unit, interval, field)` after `(`: the unit, an
+    /// integer interval, and the field.
+    fn parse_dateadd_args(&mut self) -> Result<DateExpr, String> {
+        let unit_name = self.expect_ident("date unit")?;
+        let unit = DateUnit::parse(&unit_name).ok_or_else(|| {
+            format!(
+                "Unknown dateadd unit {unit_name:?}; supported units: year, quarter, \
+                 month, week, day, hour, minute, second."
+            )
+        })?;
+        self.expect_comma("dateadd")?;
+        let interval = match self.next() {
+            Some(Token::Number(n)) if n.fract() == 0.0 => {
+                // `as` saturates on overflow; the `try_from` below
+                // rejects the saturated value as out of range.
+                #[allow(clippy::cast_possible_truncation)]
+                let as_i128 = n as i128;
+                i64::try_from(as_i128).map_err(|_| {
+                    format!("dateadd interval {n} is out of range; expected an integer.")
+                })?
+            }
+            other => {
+                return Err(format!(
+                    "Expected an integer interval in dateadd, found {}.",
+                    describe_token(other.as_ref())
+                ))
+            }
+        };
+        self.expect_comma("dateadd")?;
+        let field = self.expect_ident("field name")?;
+        self.expect_rparen("dateadd")?;
+        Ok(DateExpr::DateAdd {
+            unit,
+            interval,
+            field,
+        })
+    }
+
+    /// Parses `datediff(unit, start, end)` after `(`: the unit and the two
+    /// endpoints (each a field or a `utcdatetime` literal).
+    fn parse_datediff_args(&mut self) -> Result<DateExpr, String> {
+        let unit_name = self.expect_ident("date unit")?;
+        let unit = DateUnit::parse(&unit_name).ok_or_else(|| {
+            format!(
+                "Unknown datediff unit {unit_name:?}; supported units: year, quarter, \
+                 month, week, day, hour, minute, second."
+            )
+        })?;
+        self.expect_comma("datediff")?;
+        let start = self.parse_date_ref("datediff")?;
+        self.expect_comma("datediff")?;
+        let end = self.parse_date_ref("datediff")?;
+        self.expect_rparen("datediff")?;
+        Ok(DateExpr::DateDiff { unit, start, end })
+    }
+
     /// Parses a comparison right-hand value: a `utcdatetime('...')` literal
     /// (normalized to ISO-8601) or a plain literal value.
     fn parse_value_or_utcdatetime(&mut self) -> Result<FilterValue, String> {
-        if let Some(Token::Ident(name)) = self.peek() {
-            if name == "utcdatetime" && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
-            {
-                self.next(); // Consume `utcdatetime`.
-                let iso = self.parse_utcdatetime_literal()?;
-                return Ok(FilterValue::String(iso));
-            }
+        if let Some(iso) = self.try_parse_utcdatetime()? {
+            return Ok(FilterValue::String(iso));
         }
         self.parse_value()
     }
@@ -508,13 +527,8 @@ impl Parser {
     /// Parses a `datediff` endpoint: a field name or a `utcdatetime('...')`
     /// literal.
     fn parse_date_ref(&mut self, func: &str) -> Result<DateRef, String> {
-        if let Some(Token::Ident(name)) = self.peek() {
-            if name == "utcdatetime" && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
-            {
-                self.next(); // Consume `utcdatetime`.
-                let iso = self.parse_utcdatetime_literal()?;
-                return Ok(DateRef::Literal(iso));
-            }
+        if let Some(iso) = self.try_parse_utcdatetime()? {
+            return Ok(DateRef::Literal(iso));
         }
         Ok(DateRef::Field(
             self.expect_ident(&format!("{func} date field"))?,
@@ -543,20 +557,6 @@ impl Parser {
         })
     }
 
-    /// Parses `field op utcdatetime('...')` after the field name and operator.
-    fn parse_field_vs_utcdatetime(
-        &mut self,
-        field: &str,
-        op: FilterOp,
-    ) -> Result<FilterExpr, String> {
-        let iso = self.parse_utcdatetime_literal()?;
-        Ok(FilterExpr::DateCompare {
-            left: DateOperand::Field(field.to_owned()),
-            op,
-            value: FilterValue::String(iso),
-        })
-    }
-
     /// Parses a `search.*` function call after the function name, with `(`
     /// peeked: `search.ismatch('pattern', field)`,
     /// `search.ismatchscoring('pattern', field)`, `search.isempty(field)`,
@@ -565,84 +565,94 @@ impl Parser {
         self.next(); // Consume '('.
         match name {
             "ismatch" | "ismatchscoring" => {
-                let pattern = match self.next() {
-                    Some(Token::String(text)) => text,
-                    other => {
-                        return Err(format!(
-                            "Expected a search pattern string in search.{name}, found {}.",
-                            describe_token(other.as_ref())
-                        ))
-                    }
-                };
-                self.expect_comma(&format!("search.{name}"))?;
-                // The field list is a field name or a comma-separated string
-                // of field names (the documented Azure form).
-                let mut fields = Vec::new();
-                match self.next() {
-                    Some(Token::Ident(field)) => fields.push(field),
-                    Some(Token::String(list)) => {
-                        for field in list.split(',') {
-                            let field = field.trim();
-                            if field.is_empty() {
-                                return Err(format!(
-                                    "Empty field name in search.{name} field list {list:?}."
-                                ));
-                            }
-                            fields.push(field.to_owned());
-                        }
-                    }
-                    other => {
-                        return Err(format!(
-                            "Expected a field name in search.{name}, found {}.",
-                            describe_token(other.as_ref())
-                        ))
-                    }
-                }
-                // Extra parameters (query type, search mode) are accepted but
-                // inert.
-                while matches!(self.peek(), Some(Token::Comma)) {
-                    self.next();
-                    match self.next() {
-                        Some(Token::String(_) | Token::Ident(_)) => {}
-                        other => {
-                            return Err(format!(
-                                "Expected a string in search.{name} options, found {}.",
-                                describe_token(other.as_ref())
-                            ))
-                        }
-                    }
-                }
-                self.expect_rparen(&format!("search.{name}"))?;
-                let mut exprs: Vec<FilterExpr> = fields
-                    .into_iter()
-                    .map(|field| FilterExpr::IsMatch {
-                        field,
-                        pattern: pattern.clone(),
-                    })
-                    .collect();
+                let mut exprs = self.parse_ismatch_args(name)?;
+                // A single field is the bare expression; multiple fields
+                // OR together.
                 if exprs.len() == 1 {
                     Ok(exprs.pop().unwrap_or_else(|| FilterExpr::IsMatch {
                         field: String::new(),
-                        pattern,
+                        pattern: String::new(),
                     }))
                 } else {
                     Ok(FilterExpr::Or(exprs))
                 }
             }
-            "isempty" => {
-                let field = self.expect_ident("field name")?;
-                self.expect_rparen("search.isempty")?;
-                Ok(FilterExpr::IsEmpty { field })
-            }
-            "isnull" => {
-                let field = self.expect_ident("field name")?;
-                self.expect_rparen("search.isnull")?;
-                Ok(FilterExpr::IsNull { field })
-            }
+            "isempty" | "isnull" => self.parse_isempty_isnull(name),
             _ => Err(format!(
                 "Unsupported search function 'search.{name}'; supported functions: \
                  ismatch, ismatchscoring, isempty, isnull."
             )),
+        }
+    }
+
+    /// Parses `ismatch('pattern', field[, ...])` / `ismatchscoring(...)`
+    /// after `(`: the pattern, the field list, and any inert extra options.
+    /// Returns one `IsMatch` expression per listed field.
+    fn parse_ismatch_args(&mut self, name: &str) -> Result<Vec<FilterExpr>, String> {
+        let pattern = match self.next() {
+            Some(Token::String(text)) => text,
+            other => {
+                return Err(format!(
+                    "Expected a search pattern string in search.{name}, found {}.",
+                    describe_token(other.as_ref())
+                ))
+            }
+        };
+        self.expect_comma(&format!("search.{name}"))?;
+        // The field list is a field name or a comma-separated string
+        // of field names (the documented Azure form).
+        let mut fields = Vec::new();
+        match self.next() {
+            Some(Token::Ident(field)) => fields.push(field),
+            Some(Token::String(list)) => {
+                for field in list.split(',') {
+                    let field = field.trim();
+                    if field.is_empty() {
+                        return Err(format!(
+                            "Empty field name in search.{name} field list {list:?}."
+                        ));
+                    }
+                    fields.push(field.to_owned());
+                }
+            }
+            other => {
+                return Err(format!(
+                    "Expected a field name in search.{name}, found {}.",
+                    describe_token(other.as_ref())
+                ))
+            }
+        }
+        // Extra parameters (query type, search mode) are accepted but
+        // inert.
+        while matches!(self.peek(), Some(Token::Comma)) {
+            self.next();
+            match self.next() {
+                Some(Token::String(_) | Token::Ident(_)) => {}
+                other => {
+                    return Err(format!(
+                        "Expected a string in search.{name} options, found {}.",
+                        describe_token(other.as_ref())
+                    ))
+                }
+            }
+        }
+        self.expect_rparen(&format!("search.{name}"))?;
+        Ok(fields
+            .into_iter()
+            .map(|field| FilterExpr::IsMatch {
+                field,
+                pattern: pattern.clone(),
+            })
+            .collect())
+    }
+
+    /// Parses `isempty(field)` / `isnull(field)` after `(`.
+    fn parse_isempty_isnull(&mut self, name: &str) -> Result<FilterExpr, String> {
+        let field = self.expect_ident("field name")?;
+        self.expect_rparen(&format!("search.{name}"))?;
+        match name {
+            "isempty" => Ok(FilterExpr::IsEmpty { field }),
+            _ => Ok(FilterExpr::IsNull { field }),
         }
     }
 

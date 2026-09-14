@@ -16,7 +16,7 @@ use serde_json::{json, Map, Value};
 use crate::config::Config;
 use crate::error::ApiError;
 use crate::query::SearchEngine;
-use crate::service::{ActionKind, DocumentAction, ResourceKind, SearchOutcome, SearchService};
+use crate::service::{DocumentAction, ResourceKind, SearchOutcome, SearchService};
 use crate::vector::VectorEngine;
 use crate::version::VersionAdapter;
 use named_resources::{
@@ -215,50 +215,10 @@ async fn upload_documents(
     // The SDK serializes an `IndexBatch` as `{"value": [...]}`; a bare array is
     // also accepted for direct HTTP use.
     let actions = batch_items(&batch)?;
-    let mut batch = Vec::with_capacity(actions.len());
-    for action in actions {
-        let action_type = action
-            .get("@search.action")
-            .and_then(Value::as_str)
-            .unwrap_or("upload");
-        let kind = match action_type {
-            "upload" => ActionKind::Upload,
-            "merge" => ActionKind::Merge,
-            "mergeOrUpload" => ActionKind::MergeOrUpload,
-            "delete" => ActionKind::Delete,
-            other => {
-                return Err(ApiError::unsupported(
-                    "UnsupportedAction",
-                    format!("Document action {other:?} is not supported by the emulator."),
-                ))
-            }
-        };
-        // Two wire shapes are accepted:
-        //   - Documented Azure format: {"@search.action": "...", "document": {...}}
-        //   - Python SDK format:       {"@search.action": "...", ...fields}
-        //     (the SDK spreads the document fields at the top level of the action)
-        let doc = match action.get("document") {
-            Some(document) => document.clone(),
-            None => Value::Object(
-                action
-                    .as_object()
-                    .ok_or_else(|| {
-                        ApiError::bad_request(
-                            "InvalidDocuments",
-                            "Each batch action must be a JSON object.",
-                        )
-                    })?
-                    .iter()
-                    .filter(|(key, _)| key.as_str() != "@search.action")
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect(),
-            ),
-        };
-        batch.push(DocumentAction {
-            kind,
-            document: doc,
-        });
-    }
+    let batch = actions
+        .iter()
+        .map(DocumentAction::from_value)
+        .collect::<Result<Vec<_>, ApiError>>()?;
     let results = state.service.index_documents(&name, batch)?;
     let value = Value::Array(
         results
@@ -269,55 +229,78 @@ async fn upload_documents(
     Ok(Json(json!({ "value": value })))
 }
 
-/// `GET /indexes('{name}')/docs('{key}')` — Get Document. Any other method
-/// on a two-segment path is not an Azure route: it falls through with the
-/// same empty 404 the router's fallback would produce, so unimplemented
-/// routes keep their pinned signatures (e.g. `POST .../search.analyze`).
+/// Two-segment `OData` paths: routes on the first segment's prefix — the
+/// knowledge-base `retrieve` route or the index document route. (The `OData`
+/// segment `knowledgebases('name')` is a single dynamic segment, so the
+/// prefix cannot be expressed in the router's static patterns.)
 async fn document_by_key(
     State(state): State<AppState>,
     method: Method,
     Path((raw_name, raw_key)): Path<(String, String)>,
 ) -> Response {
-    // `POST /knowledgebases('{name}')/retrieve` — agentic retrieval. The
-    // emulator performs no model inference (an initial-design non-goal), so it
-    // returns an empty retrieval response; the knowledge base must exist.
-    // Other methods on the retrieve route are 405; any other second segment
-    // on a knowledge base is not an Azure route (404).
-    let knowledge_base = ResourceKind::KnowledgeBase;
-    if raw_name.starts_with(knowledge_base.path_prefix()) {
-        if raw_key != "retrieve" {
-            return StatusCode::NOT_FOUND.into_response();
-        }
-        if method != Method::POST {
-            return StatusCode::METHOD_NOT_ALLOWED.into_response();
-        }
-        let name = match parse_named_segment(
-            &raw_name,
-            knowledge_base.path_prefix(),
-            knowledge_base.label(),
-            knowledge_base.invalid_code(),
-        ) {
-            Ok(name) => name,
-            Err(error) => return error.into_response(),
-        };
-        return match state.service.get_named_resource(knowledge_base, &name) {
-            Ok(_) => Json(json!({
-                "response": [],
-                "activity": [],
-                "references": []
-            }))
-            .into_response(),
-            Err(error) => error.into_response(),
-        };
+    if raw_name.starts_with(ResourceKind::KnowledgeBase.path_prefix()) {
+        knowledge_base_retrieve(&state, &method, &raw_name, &raw_key)
+    } else {
+        get_document_by_key(&state, &method, &raw_name, &raw_key)
     }
-    if method != Method::GET {
+}
+
+/// `POST /knowledgebases('{name}')/retrieve` — agentic retrieval. The
+/// emulator performs no model inference (an initial-design non-goal), so it
+/// returns an empty retrieval response; the knowledge base must exist.
+/// Other methods on the retrieve route are 405; any other second segment
+/// on a knowledge base is not an Azure route (404).
+fn knowledge_base_retrieve(
+    state: &AppState,
+    method: &Method,
+    raw_name: &str,
+    raw_key: &str,
+) -> Response {
+    if raw_key != "retrieve" {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let name = match parse_index_name(&raw_name) {
+    if method != Method::POST {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    let knowledge_base = ResourceKind::KnowledgeBase;
+    let name = match parse_named_segment(
+        raw_name,
+        knowledge_base.path_prefix(),
+        knowledge_base.label(),
+        knowledge_base.invalid_code(),
+    ) {
         Ok(name) => name,
         Err(error) => return error.into_response(),
     };
-    let key = match parse_document_key(&raw_key) {
+    match state.service.get_named_resource(knowledge_base, &name) {
+        Ok(_) => Json(json!({
+            "response": [],
+            "activity": [],
+            "references": []
+        }))
+        .into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// `GET /indexes('{name}')/docs('{key}')` — Get Document. Any other method
+/// on a two-segment path is not an Azure route: it falls through with the
+/// same empty 404 the router's fallback would produce, so unimplemented
+/// routes keep their pinned signatures (e.g. `POST .../search.analyze`).
+fn get_document_by_key(
+    state: &AppState,
+    method: &Method,
+    raw_name: &str,
+    raw_key: &str,
+) -> Response {
+    if method != Method::GET {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let name = match parse_index_name(raw_name) {
+        Ok(name) => name,
+        Err(error) => return error.into_response(),
+    };
+    let key = match parse_document_key(raw_key) {
         Ok(key) => key,
         Err(error) => return error.into_response(),
     };
@@ -506,7 +489,28 @@ fn search_response(
     if let Some(facets) = &outcome.facets {
         map.insert("@search.facets".to_owned(), facets.clone());
     }
-    let value = outcome
+    map.insert(
+        "value".to_owned(),
+        Value::Array(build_page_entries(query, outcome)),
+    );
+    if let Some(token) = continuation {
+        map.insert(
+            "@odata.nextLink".to_owned(),
+            Value::String(build_next_link(name, api_version, token)),
+        );
+        map.insert(
+            "@search.nextPageParameters".to_owned(),
+            build_next_page_params(raw_request, token, outcome.next_skip),
+        );
+    }
+    Value::Object(map)
+}
+
+/// The `value` array of a search response: one entry per page document with
+/// its `@search.score`, its `@search.highlights` (when present), and the
+/// selected fields.
+fn build_page_entries(query: &crate::service::SearchQuery, outcome: &SearchOutcome) -> Vec<Value> {
+    outcome
         .documents
         .iter()
         .map(|doc| {
@@ -532,37 +536,39 @@ fn search_response(
             }
             Value::Object(entry)
         })
-        .collect();
-    map.insert("value".to_owned(), Value::Array(value));
-    if let Some(token) = continuation {
-        let mut next_link = format!("/indexes('{name}')/docs/search.post.search");
-        let mut params = Vec::new();
-        if let Some(version) = api_version {
-            params.push(format!("api-version={version}"));
-        }
-        params.push(format!("continuation={token}"));
-        next_link.push('?');
-        next_link.push_str(&params.join("&"));
-        map.insert("@odata.nextLink".to_owned(), Value::String(next_link));
-        // The pinned Python SDK pages by re-POSTing `@search.nextPageParameters`
-        // (a serialized search request) rather than following nextLink, so the
-        // next request is the original body plus the continuation token. The
-        // SDK drops unknown properties on re-serialization, so the paging
-        // cursor is also carried in the first-class `skip` property (which
-        // survives the round-trip); `continuation` additionally binds the
-        // result-set state (filter/orderby) for clients that preserve it.
-        let mut next_params = match raw_request {
-            Value::Object(map) => map.clone(),
-            _ => Map::new(),
-        };
-        next_params.insert("continuation".to_owned(), Value::String(token.to_owned()));
-        next_params.insert("skip".to_owned(), Value::from(outcome.next_skip));
-        map.insert(
-            "@search.nextPageParameters".to_owned(),
-            Value::Object(next_params),
-        );
+        .collect()
+}
+
+/// The `@odata.nextLink` for the next page: the search route with the
+/// request's `api-version` (when present) and the continuation token.
+fn build_next_link(name: &str, api_version: Option<&String>, token: &str) -> String {
+    let mut next_link = format!("/indexes('{name}')/docs/search.post.search");
+    let mut params = Vec::new();
+    if let Some(version) = api_version {
+        params.push(format!("api-version={version}"));
     }
-    Value::Object(map)
+    params.push(format!("continuation={token}"));
+    next_link.push('?');
+    next_link.push_str(&params.join("&"));
+    next_link
+}
+
+/// The `@search.nextPageParameters` compatibility shim: the original request
+/// body plus the paging cursor. The pinned Python SDK pages by re-POSTing
+/// this (a serialized search request) rather than following nextLink, so the
+/// next request is the original body plus the continuation token. The SDK
+/// drops unknown properties on re-serialization, so the paging cursor is
+/// also carried in the first-class `skip` property (which survives the
+/// round-trip); `continuation` additionally binds the result-set state
+/// (filter/orderby) for clients that preserve it.
+fn build_next_page_params(raw_request: &Value, token: &str, next_skip: u64) -> Value {
+    let mut next_params = match raw_request {
+        Value::Object(map) => map.clone(),
+        _ => Map::new(),
+    };
+    next_params.insert("continuation".to_owned(), Value::String(token.to_owned()));
+    next_params.insert("skip".to_owned(), Value::from(next_skip));
+    Value::Object(next_params)
 }
 
 // ---------------------------------------------------------------------------
@@ -822,5 +828,54 @@ fn operation_for(method: &axum::http::Method, path: &str) -> &'static str {
         "DELETE" => "deleteIndex",
         "GET" => "getIndex",
         _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_page_params_carry_the_original_body_plus_cursor() {
+        let raw = json!({ "search": "azure", "top": 2, "filter": "price gt 1" });
+        let params = build_next_page_params(&raw, "tok123", 7);
+        assert_eq!(
+            params,
+            json!({
+                "search": "azure",
+                "top": 2,
+                "filter": "price gt 1",
+                "continuation": "tok123",
+                "skip": 7,
+            })
+        );
+    }
+
+    #[test]
+    fn next_page_params_tolerate_a_non_object_body() {
+        let params = build_next_page_params(&Value::Null, "tok123", 3);
+        assert_eq!(params, json!({ "continuation": "tok123", "skip": 3 }));
+    }
+
+    #[test]
+    fn next_page_params_override_existing_cursor_keys() {
+        let raw = json!({ "continuation": "stale", "skip": 1 });
+        let params = build_next_page_params(&raw, "fresh", 9);
+        assert_eq!(params["continuation"], json!("fresh"));
+        assert_eq!(params["skip"], json!(9));
+    }
+
+    #[test]
+    fn next_link_carries_version_and_token() {
+        let link = build_next_link("items", Some(&"2024-07-01".to_owned()), "tok123");
+        assert_eq!(
+            link,
+            "/indexes('items')/docs/search.post.search?api-version=2024-07-01&continuation=tok123"
+        );
+        let link = build_next_link("items", None, "tok123");
+        assert_eq!(
+            link,
+            "/indexes('items')/docs/search.post.search?continuation=tok123"
+        );
     }
 }

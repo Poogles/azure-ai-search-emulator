@@ -469,14 +469,35 @@ pub(crate) fn parse_vector_query(
             ));
         }
     }
-    let (fields, expected) = parse_vector_query_fields(obj, definition)?;
-    let vector = parse_vector_query_vector(obj, &fields, expected)?;
-    let k = match obj
+    let fields = VectorFieldSet::parse(obj, definition)?;
+    let vector = fields.parse_vector(obj)?;
+    let k = parse_vector_k(obj)?;
+    let exhaustive = obj
+        .get("exhaustive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // `weight` scales this query's contribution to the hybrid RRF fusion; it
+    // must be a finite positive number (default `1.0` when absent).
+    let weight = parse_vector_weight(obj)?;
+    Ok(VectorQuery {
+        fields: fields.names,
+        vector,
+        k,
+        exhaustive,
+        weight,
+    })
+}
+
+/// Parses a vector query's `k` (`k_nearest_neighbors` / `kNearestNeighbors`
+/// SDK aliases accepted): a positive integer up to [`MAX_VECTOR_K`] (default
+/// [`DEFAULT_VECTOR_K`] when absent).
+fn parse_vector_k(obj: &Map<String, Value>) -> Result<usize, ApiError> {
+    match obj
         .get("k")
         .or_else(|| obj.get("k_nearest_neighbors"))
         .or_else(|| obj.get("kNearestNeighbors"))
     {
-        None | Some(Value::Null) => DEFAULT_VECTOR_K,
+        None | Some(Value::Null) => Ok(DEFAULT_VECTOR_K),
         Some(value) => value
             .as_u64()
             .and_then(|n| usize::try_from(n).ok())
@@ -486,134 +507,153 @@ pub(crate) fn parse_vector_query(
                     "InvalidQuery",
                     "Vector query 'k' must be a positive integer (max 1000).",
                 )
-            })?,
-    };
-    let exhaustive = obj
-        .get("exhaustive")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    // `weight` scales this query's contribution to the hybrid RRF fusion; it
-    // must be a finite positive number (default `1.0` when absent).
-    let weight = match obj.get("weight") {
-        None | Some(Value::Null) => 1.0,
-        Some(value) => {
-            let invalid = || {
-                ApiError::bad_request(
-                    "InvalidQuery",
-                    "Vector query 'weight' must be a finite positive number.",
-                )
-            };
-            let as_f64 = value.as_f64().ok_or_else(invalid)?;
-            let weight = finite_f32(as_f64).ok_or_else(invalid)?;
-            if weight <= 0.0 {
-                return Err(invalid());
-            }
-            weight
-        }
-    };
-    Ok(VectorQuery {
-        fields,
-        vector,
-        k,
-        exhaustive,
-        weight,
-    })
+            }),
+    }
 }
 
-/// Parses a vector query's `fields`: every entry must be a vector field in
-/// the schema. Returns the field names plus the shared dimension the query
-/// vector must match (fields with different dimensions cannot share one
-/// query vector).
-pub(crate) fn parse_vector_query_fields(
-    obj: &Map<String, Value>,
-    definition: &IndexDefinition,
-) -> Result<(Vec<String>, usize), ApiError> {
-    let fields_value = obj.get("fields").ok_or_else(|| {
-        ApiError::bad_request("InvalidQuery", "Each vector query must define \"fields\".")
-    })?;
-    let fields = string_items(fields_value, "vector query fields")?;
-    if fields.is_empty() {
-        return Err(ApiError::bad_request(
-            "InvalidQuery",
-            "Vector query \"fields\" is empty.",
-        ));
-    }
-    let mut expected: Option<usize> = None;
-    for name in &fields {
-        let field_def = definition
-            .field(name)
-            .filter(|f| f.is_vector_field())
-            .ok_or_else(|| {
-                ApiError::bad_request(
-                    "InvalidQuery",
-                    format!(
-                        "Vector query field {name:?} is not a vector field in index {:?}.",
-                        definition.name
-                    ),
-                )
-            })?;
-        let dimensions = field_def.vector_dimensions.unwrap_or(0);
-        match expected {
-            None => expected = Some(dimensions),
-            Some(d) if d == dimensions => {}
-            Some(d) => {
-                return Err(ApiError::bad_request(
-                    "InvalidQuery",
-                    format!(
-                        "Vector query targets fields with different dimensions ({d} vs {dimensions})."
-                    ),
-                ));
-            }
-        }
-    }
-    Ok((fields, expected.unwrap_or(0)))
-}
-
-/// Parses a vector query's `vector`: an array of finite numbers whose length
-/// matches every listed field's dimensions.
-pub(crate) fn parse_vector_query_vector(
-    obj: &Map<String, Value>,
-    fields: &[String],
-    expected: usize,
-) -> Result<Vec<f32>, ApiError> {
-    let raw_vector = obj.get("vector").ok_or_else(|| {
-        ApiError::bad_request("InvalidQuery", "Each vector query must define \"vector\".")
-    })?;
-    let items = raw_vector.as_array().ok_or_else(|| {
+/// Parses a vector query's `weight`: a finite positive number (default
+/// `1.0` when absent).
+fn parse_vector_weight(obj: &Map<String, Value>) -> Result<f32, ApiError> {
+    let invalid = || {
         ApiError::bad_request(
             "InvalidQuery",
-            "Vector query \"vector\" must be an array of numbers.",
+            "Vector query 'weight' must be a finite positive number.",
         )
-    })?;
-    let first_field = fields.first().map_or("", String::as_str);
-    if items.len() != expected {
-        return Err(ApiError::bad_request(
-            "InvalidQuery",
-            format!(
-                "Vector query for {first_field:?} has dimension {}, expected {expected}.",
-                items.len()
-            ),
-        ));
-    }
-    let mut vector = Vec::with_capacity(items.len());
-    for item in items {
-        match item.as_f64().and_then(finite_f32) {
-            Some(narrowed) => vector.push(narrowed),
-            None if item.is_number() => {
-                return Err(ApiError::bad_request(
-                    "InvalidQuery",
-                    format!("Vector query for {first_field:?} contains non-finite values."),
-                ));
+    };
+    match obj.get("weight") {
+        None | Some(Value::Null) => Ok(1.0),
+        Some(value) => {
+            let as_f64 = value.as_f64().ok_or_else(invalid)?;
+            let weight = finite_f32(as_f64).ok_or_else(invalid)?;
+            if !is_finite_positive(weight) {
+                return Err(invalid());
             }
-            None => {
-                return Err(ApiError::bad_request(
-                    "InvalidQuery",
-                    format!("Vector query for {first_field:?} must contain only numeric values."),
-                ));
-            }
+            Ok(weight)
         }
     }
-    Ok(vector)
+}
+
+/// Whether a weight is usable: a finite positive number.
+fn is_finite_positive(weight: f32) -> bool {
+    weight.is_finite() && weight > 0.0
+}
+
+/// A vector query's resolved field set: the field names and the shared
+/// dimension every query vector must match (fields with different
+/// dimensions cannot share one query vector).
+struct VectorFieldSet {
+    names: Vec<String>,
+    dim: usize,
+}
+
+impl VectorFieldSet {
+    /// Parses a vector query's `fields`: every entry must be a vector field
+    /// in the schema.
+    fn parse(obj: &Map<String, Value>, definition: &IndexDefinition) -> Result<Self, ApiError> {
+        let fields_value = obj.get("fields").ok_or_else(|| {
+            ApiError::bad_request("InvalidQuery", "Each vector query must define \"fields\".")
+        })?;
+        let names = string_items(fields_value, "vector query fields")?;
+        if names.is_empty() {
+            return Err(ApiError::bad_request(
+                "InvalidQuery",
+                "Vector query \"fields\" is empty.",
+            ));
+        }
+        let mut dim: Option<usize> = None;
+        for name in &names {
+            let field_def = definition
+                .field(name)
+                .filter(|f| f.is_vector_field())
+                .ok_or_else(|| {
+                    ApiError::bad_request(
+                        "InvalidQuery",
+                        format!(
+                            "Vector query field {name:?} is not a vector field in index {:?}.",
+                            definition.name
+                        ),
+                    )
+                })?;
+            let dimensions = field_def.vector_dimensions.unwrap_or(0);
+            match dim {
+                None => dim = Some(dimensions),
+                Some(d) if d == dimensions => {}
+                Some(d) => {
+                    return Err(ApiError::bad_request(
+                        "InvalidQuery",
+                        format!(
+                            "Vector query targets fields with different dimensions ({d} vs {dimensions})."
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(Self {
+            names,
+            dim: dim.unwrap_or(0),
+        })
+    }
+
+    /// Parses the query's `vector` against this field set: an array of
+    /// finite numbers whose length matches the shared dimension.
+    fn parse_vector(&self, obj: &Map<String, Value>) -> Result<Vec<f32>, ApiError> {
+        let raw_vector = obj.get("vector").ok_or_else(|| {
+            ApiError::bad_request("InvalidQuery", "Each vector query must define \"vector\".")
+        })?;
+        let items = raw_vector.as_array().ok_or_else(|| {
+            ApiError::bad_request(
+                "InvalidQuery",
+                "Vector query \"vector\" must be an array of numbers.",
+            )
+        })?;
+        self.check_vector_len(items.len())?;
+        let mut vector = Vec::with_capacity(items.len());
+        for item in items {
+            match item.as_f64().and_then(finite_f32) {
+                Some(narrowed) => vector.push(narrowed),
+                None if item.is_number() => {
+                    return Err(ApiError::bad_request(
+                        "InvalidQuery",
+                        format!(
+                            "Vector query for {:?} contains non-finite values.",
+                            self.first_field()
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(ApiError::bad_request(
+                        "InvalidQuery",
+                        format!(
+                            "Vector query for {:?} must contain only numeric values.",
+                            self.first_field()
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(vector)
+    }
+
+    /// Checks a vector's length against the shared dimension.
+    fn check_vector_len(&self, len: usize) -> Result<(), ApiError> {
+        if len != self.dim {
+            return Err(ApiError::bad_request(
+                "InvalidQuery",
+                format!(
+                    "Vector query for {:?} has dimension {}, expected {}.",
+                    self.first_field(),
+                    len,
+                    self.dim
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The first field name, for error messages.
+    fn first_field(&self) -> &str {
+        self.names.first().map_or("", String::as_str)
+    }
 }
 
 /// Parses a `searchFields` value: comma-separated field names (or a JSON
@@ -638,7 +678,7 @@ pub(crate) fn parse_search_fields(
                         ),
                     )
                 })?;
-                if !weight.is_finite() || weight <= 0.0 {
+                if !is_finite_positive(weight) {
                     return Err(ApiError::bad_request(
                         "InvalidQuery",
                         format!(
