@@ -492,6 +492,19 @@ public class SdkTests : EmulatorTestBase
         Assert.Equal("beachfront", (string)geo["label"]);
         Assert.False(address.ContainsKey("city"));
 
+        // A collection-of-complex subfield projects each element.
+        var staysProjected = await RunSearch<SearchDocument>(
+            searchClient,
+            new SearchOptions { Filter = "id eq '1'", Select = { "address/stays/type" } }, "*");
+        Assert.Single(staysProjected);
+        var staysAddress = Assert.IsType<SearchDocument>(staysProjected[0]["address"]);
+        var stays = Assert.IsType<object[]>(staysAddress["stays"]);
+        Assert.Equal(
+            new[] { "suite", "standard" },
+            stays.Select(s => (string)Assert.IsType<SearchDocument>(s)["type"]));
+        Assert.False(staysAddress.ContainsKey("city"));
+        Assert.False(staysAddress.ContainsKey("geo"));
+
         var ordered = await RunSearch<SearchDocument>(
             searchClient, new SearchOptions { OrderBy = { "address/geo/lat desc" } }, "*");
         Assert.Equal(new[] { "2", "1" }, ordered.Select(d => (string)d["id"]));
