@@ -56,10 +56,12 @@ Differences fall into two categories:
 
 ### Autocomplete and suggest
 
-- Autocomplete and suggest use **case-insensitive prefix or infix matching** of the search text against the whitespace-separated words of the suggester's search fields. Azure uses its full suggester algorithm (analyzing infix matching with scoring, fuzzy matching, and `searchMode` behaviour).
-- Autocomplete returns distinct completed terms (`text` + `queryPlusText`); suggest returns the matching documents (all fields) plus an `@search.text` field carrying the first matched word.
-- Results are ordered by index key (deterministic), not by relevance; `top` (default 5) limits the count.
-- A `filter` narrows the candidate documents (like the search route): only documents matching the filter are considered for suggestions/completions. The suggester's `searchMode` and the other options the SDKs support on these routes (`select`, `searchFields`, `orderby`, fuzzy matching, highlight tags, `autocompleteMode`, `minimumCoverage`) are accepted but inert.
+- Autocomplete and suggest use **case-insensitive infix matching** of each whitespace-separated search term against the whitespace-separated words of the suggester's search fields (or the `searchFields` subset). A document matches a suggestion when every term matches some word. Azure uses its full suggester algorithm (analyzing infix matching with scoring, fuzzy matching, and `searchMode` behaviour).
+- Autocomplete returns distinct completed terms (`text` + `queryPlusText`); suggest returns the matching documents (projected to `select` when given, otherwise all fields) plus an `@search.text` field carrying the first word matching the first term (with highlight tags applied when both are given).
+- Results are ordered by index key (deterministic), not by relevance, unless `orderby` overrides the order; `top` (default 5) limits the count.
+- `autocompleteMode`: `oneTerm` completes the last term; `twoTerms` suggests matching consecutive two-word index phrases; `oneTermWithContext` additionally requires the preceding terms to appear in the candidate document. Single-term input behaves as `oneTerm` in every mode.
+- `fuzzy` (`useFuzzyMatching`) adds single-edit (Levenshtein ≤ 1) typo tolerance to the infix match.
+- A `filter` narrows the candidate documents (like the search route): only documents matching the filter are considered for suggestions/completions. `minimumCoverage` is accepted but inert (the matching algorithm is prefix/infix, not term-coverage-based).
 - **Rationale:** substring matching covers the assertions the reference samples make (a term that prefixes a field word); real suggester scoring is out of scope for a test double.
 
 ### Filter matching
@@ -104,9 +106,8 @@ Differences fall into two categories:
 
 ### Synonym maps
 
-- Synonym maps are stored, echoed, and managed (create/update/get/list/delete) but **inert**: they do not affect search results. Azure rewrites queries using the map's rules; the emulator never applies them.
+- Synonym maps are stored, echoed, and managed (create/update/get/list/delete) and **applied to full-text search**: Solr equivalence and directional rules expand analyzed query tokens for indexes referencing the map (index-level or per-field `synonymMaps`). Fuzzy terms are not expanded.
 - Etags are opaque counter strings, not Azure's hex entity tags.
-- **Rationale:** the CRUD surface is implemented so samples and clients that manage maps work unchanged; applying Solr synonym rules to the query pipeline is out of scope for a test double. Test assertions must not expect synonym expansion in search results.
 
 ### Index aliases
 
@@ -118,8 +119,15 @@ Differences fall into two categories:
 
 ### Collection-of-complex fields
 
-- `Edm.Collection(Edm.ComplexType)` fields accept arrays of objects and full-text index searchable string subfields across all elements. Filters use the same `Address/State` path syntax as single complex types, with any-element semantics (a direct path matches when any element satisfies the comparison); ordering through a collection is existential. Lambda bodies that address subfields of the element (e.g. `Rooms/any(r: r/Type eq 'x')`) are rejected explicitly — use a direct path instead.
-- **Rationale:** the schema and document surface is implemented so indexes with collection-of-complex fields round-trip; complex-collection lambda evaluation is out of scope.
+- `Edm.Collection(Edm.ComplexType)` fields accept arrays of objects and full-text index searchable string subfields across all elements, at any nesting depth. Filters use the same `Address/State` path syntax as single complex types, with any-element semantics (a direct path matches when any element satisfies the comparison, including ordering operators); `orderby` through a nested path uses the first resolved value. Lambda bodies may address (possibly nested) subfields of the element (e.g. `Rooms/any(r: r/Type eq 'x')`, `Rooms/any(r: r/Room/Floor gt 2)`).
+- **Rationale:** the schema and document surface is implemented so indexes with collection-of-complex fields round-trip; deep-collection lambda evaluation follows the same any-element semantics as direct paths.
+
+### Additional `Edm` types
+
+- `Edm.Int8` accepts the SDK wire spelling `Edm.SByte` as an alias (both spellings, including collection forms); `Edm.Byte` (unsigned) is rejected as unsupported.
+- `Edm.Time` values must be zero-padded `"HH:MM:SS"` with an optional fractional-seconds suffix; ordering comparisons are lexicographic on that form (chronological for well-formed values).
+- `Edm.Duration` values must be ISO 8601 durations (weeks cannot be combined with other components; fractional seconds allowed); only `eq`/`ne` comparisons apply, and `sortable` is rejected at schema creation.
+- `Edm.Binary` values must be base64-decodable strings (standard or URL-safe alphabet); only `eq`/`ne` comparisons apply, and `sortable` is rejected at schema creation.
 
 ### Knowledge sources, knowledge bases, and agentic retrieval
 

@@ -770,3 +770,90 @@ async fn filter_lambda_subfield_access() {
         assert_eq!(body["error"]["code"], "InvalidQuery");
     }
 }
+
+async fn app_with_typed_docs() -> axum::Router {
+    let app = app();
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            &format!("/indexes?api-version={API_VERSION}"),
+            Some(API_KEY),
+            Some(json!({
+                "name": "typed",
+                "fields": [
+                    {"name": "id", "type": "Edm.String", "key": true},
+                    {"name": "level", "type": "Edm.Int8", "filterable": true, "sortable": true},
+                    {"name": "code", "type": "Edm.Int16", "filterable": true, "sortable": true},
+                    {"name": "at", "type": "Edm.Time", "filterable": true, "sortable": true},
+                    {"name": "dur", "type": "Edm.Duration", "filterable": true},
+                    {"name": "blob", "type": "Edm.Binary", "filterable": true}
+                ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        upload_request(
+            "typed",
+            json!([
+                {"@search.action": "upload", "document": {
+                    "id": "1", "level": 10, "code": 1000,
+                    "at": "08:00:00", "dur": "P1D", "blob": "aGVsbG8="}},
+                {"@search.action": "upload", "document": {
+                    "id": "2", "level": -5, "code": 2000,
+                    "at": "18:30:00", "dur": "PT2H", "blob": "d29ybGQ="}}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    app
+}
+
+#[tokio::test]
+async fn filter_narrow_integer_time_duration_binary_comparisons() {
+    let app = app_with_typed_docs().await;
+    for (filter, expected) in [
+        ("level gt 0", vec!["1"]),
+        ("level in (10, -5)", vec!["1", "2"]),
+        ("code lt 1500", vec!["1"]),
+        ("at gt '12:00:00'", vec!["2"]),
+        ("at eq '08:00:00'", vec!["1"]),
+        ("dur eq 'P1D'", vec!["1"]),
+        ("dur ne 'P1D'", vec!["2"]),
+        ("blob eq 'aGVsbG8='", vec!["1"]),
+    ] {
+        let (status, body) = call(
+            app.clone(),
+            search_request("typed", json!({"search": "*", "filter": filter})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "filter {filter:?} rejected: {body}");
+        assert_eq!(response_ids(&body), expected, "filter {filter:?}");
+    }
+    // Ordering comparisons on Duration/Binary are rejected (eq/ne only).
+    for filter in ["dur gt 'P1D'", "dur lt 'PT1H'", "blob gt 'aGVsbG8='"] {
+        let (status, body) = call(
+            app.clone(),
+            search_request("typed", json!({"search": "*", "filter": filter})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "filter {filter:?} accepted: {body}"
+        );
+        assert_eq!(body["error"]["code"], "InvalidQuery");
+    }
+    // orderby on the sortable narrow/time fields works.
+    let (status, body) = call(
+        app.clone(),
+        search_request("typed", json!({"search": "*", "orderby": "at desc"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "typed orderby failed: {body}");
+    assert_eq!(response_ids(&body), vec!["2", "1"]);
+}

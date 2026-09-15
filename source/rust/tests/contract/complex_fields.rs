@@ -452,3 +452,292 @@ async fn filter_on_collection_of_complex_path_matches_any_element() {
     assert_eq!(body["value"].as_array().map(Vec::len), Some(1));
     assert_eq!(body["value"][0]["HotelId"], "1");
 }
+
+fn nested_definition(name: &str) -> Value {
+    json!({
+        "name": name,
+        "fields": [
+            {"name": "HotelId", "type": "Edm.String", "key": true, "filterable": true, "sortable": true},
+            {
+                "name": "Address",
+                "type": "Edm.ComplexType",
+                "fields": [
+                    {"name": "City", "type": "Edm.String", "searchable": true, "filterable": true},
+                    {
+                        "name": "Geo",
+                        "type": "Edm.ComplexType",
+                        "fields": [
+                            {"name": "Lat", "type": "Edm.Double", "filterable": true, "sortable": true, "facetable": true},
+                            {"name": "Label", "type": "Edm.String", "searchable": true, "filterable": true, "facetable": true}
+                        ]
+                    },
+                    {
+                        "name": "Stays",
+                        "type": "Edm.Collection(Edm.ComplexType)",
+                        "fields": [
+                            {"name": "Type", "type": "Edm.String", "filterable": true},
+                            {
+                                "name": "Room",
+                                "type": "Edm.ComplexType",
+                                "fields": [
+                                    {"name": "Floor", "type": "Edm.Int32", "filterable": true}
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    })
+}
+
+async fn create_nested_index(app: &axum::Router) -> (StatusCode, Value) {
+    let app = app.clone();
+    let uri = format!("/indexes?api-version={API_VERSION}");
+    call(
+        app,
+        request(
+            "POST",
+            &uri,
+            Some(API_KEY),
+            Some(nested_definition("hotels")),
+        ),
+    )
+    .await
+}
+
+async fn seed_nested(app: &axum::Router) {
+    let (status, body) = call(
+        app.clone(),
+        upload_request(
+            "hotels",
+            json!([
+                {"@search.action": "upload", "document": {
+                    "HotelId": "1",
+                    "Address": {
+                        "City": "Miami",
+                        "Geo": {"Lat": 25.7, "Label": "beachfront"},
+                        "Stays": [
+                            {"Type": "suite", "Room": {"Floor": 3}},
+                            {"Type": "standard", "Room": {"Floor": 1}}
+                        ]
+                    }
+                }},
+                {"@search.action": "upload", "document": {
+                    "HotelId": "2",
+                    "Address": {
+                        "City": "Seattle",
+                        "Geo": {"Lat": 47.6, "Label": "downtown"},
+                        "Stays": [{"Type": "standard", "Room": {"Floor": 2}}]
+                    }
+                }}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "nested seed failed: {body}");
+    for item in body["value"].as_array().cloned().unwrap_or_default() {
+        assert_eq!(item["status"], true, "nested upload failed: {item}");
+    }
+}
+
+fn nested_ids(body: &Value) -> Vec<String> {
+    body["value"]
+        .as_array()
+        .map(|docs| {
+            docs.iter()
+                .map(|d| d["HotelId"].as_str().unwrap_or_default().to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn create_index_accepts_deeply_nested_complex_types() {
+    let app = app();
+    let (status, body) = create_nested_index(&app).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "nested schema rejected: {body}"
+    );
+}
+
+#[tokio::test]
+async fn nested_complex_filter_paths_resolve() {
+    let app = app();
+    let (status, _) = create_nested_index(&app).await;
+    assert_eq!(status, StatusCode::CREATED);
+    seed_nested(&app).await;
+
+    for (filter, expected) in [
+        ("Address/Geo/Label eq 'beachfront'", vec!["1"]),
+        ("Address/Geo/Lat gt 40", vec!["2"]),
+        ("Address/Stays/Type eq 'suite'", vec!["1"]),
+        ("Address/Stays/Room/Floor gt 2", vec!["1"]),
+    ] {
+        let (status, body) = call(
+            app.clone(),
+            search_request("hotels", json!({"search": "*", "filter": filter})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "filter {filter:?} rejected: {body}");
+        assert_eq!(nested_ids(&body), expected, "filter {filter:?}");
+    }
+}
+
+#[tokio::test]
+async fn nested_complex_fields_are_full_text_indexed() {
+    let app = app();
+    let (status, _) = create_nested_index(&app).await;
+    assert_eq!(status, StatusCode::CREATED);
+    seed_nested(&app).await;
+
+    // "beachfront" appears only in the doubly-nested Geo/Label subfield.
+    let (status, body) = call(
+        app,
+        search_request("hotels", json!({"search": "beachfront"})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "nested full-text search failed: {body}"
+    );
+    assert_eq!(nested_ids(&body), vec!["1"]);
+}
+
+#[tokio::test]
+async fn nested_lambda_subfield_access() {
+    let app = app();
+    let (status, _) = create_nested_index(&app).await;
+    assert_eq!(status, StatusCode::CREATED);
+    seed_nested(&app).await;
+
+    // Two levels through the lambda variable: element -> Room -> Floor.
+    let (status, body) = call(
+        app.clone(),
+        search_request(
+            "hotels",
+            json!({"search": "*", "filter": "Address/Stays/any(s: s/Room/Floor gt 2)"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "deep lambda rejected: {body}");
+    assert_eq!(nested_ids(&body), vec!["1"]);
+
+    // Unknown deep subfields are still rejected.
+    let (status, body) = call(
+        app,
+        search_request(
+            "hotels",
+            json!({"search": "*", "filter": "Address/Stays/any(s: s/Room/Missing eq 1)"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "bad deep lambda accepted: {body}"
+    );
+    assert_eq!(body["error"]["code"], "InvalidQuery");
+}
+
+#[tokio::test]
+async fn nested_select_paths_project_sub_objects() {
+    let app = app();
+    let (status, _) = create_nested_index(&app).await;
+    assert_eq!(status, StatusCode::CREATED);
+    seed_nested(&app).await;
+
+    // A nested path returns only the selected subfield.
+    let (status, body) = call(
+        app.clone(),
+        search_request(
+            "hotels",
+            json!({"search": "*", "select": "HotelId,Address/Geo/Label", "orderby": "HotelId"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "nested select failed: {body}");
+    let value = body["value"].as_array().cloned().unwrap_or_default();
+    assert_eq!(value.len(), 2);
+    assert_eq!(value[0]["Address"], json!({"Geo": {"Label": "beachfront"}}));
+    assert_eq!(value[0].get("HotelId").and_then(Value::as_str), Some("1"));
+    assert!(value[0]
+        .get("Address")
+        .and_then(|a| a.get("City"))
+        .is_none());
+
+    // A collection-of-complex subfield projects each element.
+    let (status, body) = call(
+        app.clone(),
+        search_request(
+            "hotels",
+            json!({"search": "*", "select": "Address/Stays/Type", "filter": "HotelId eq '1'"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "collection select failed: {body}");
+    assert_eq!(
+        body["value"][0]["Address"],
+        json!({"Stays": [{"Type": "suite"}, {"Type": "standard"}]})
+    );
+
+    // Unknown nested paths are rejected.
+    let (status, body) = call(
+        app,
+        search_request(
+            "hotels",
+            json!({"search": "*", "select": "Address/Missing"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "bad nested select accepted: {body}"
+    );
+    assert_eq!(body["error"]["code"], "InvalidQuery");
+}
+
+#[tokio::test]
+async fn nested_orderby_and_facets_use_terminal_flags() {
+    let app = app();
+    let (status, _) = create_nested_index(&app).await;
+    assert_eq!(status, StatusCode::CREATED);
+    seed_nested(&app).await;
+
+    // orderby through nested complex types (terminal is sortable).
+    let (status, body) = call(
+        app.clone(),
+        search_request(
+            "hotels",
+            json!({"search": "*", "orderby": "Address/Geo/Lat desc"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "nested orderby failed: {body}");
+    assert_eq!(nested_ids(&body), vec!["2", "1"]);
+
+    // Facets on a nested facetable subfield.
+    let (status, body) = call(
+        app.clone(),
+        search_request(
+            "hotels",
+            json!({"search": "*", "facets": ["Address/Geo/Label"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "nested facet failed: {body}");
+    let facet_values: Vec<String> = body["@search.facets"]["Address/Geo/Label"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|e| e["value"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(facet_values, vec!["beachfront", "downtown"]);
+}

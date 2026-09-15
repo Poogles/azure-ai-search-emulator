@@ -361,3 +361,63 @@ async fn delete_removes_document() {
     assert_eq!(body["value"].as_array().map(Vec::len), Some(1));
     assert_eq!(body["value"][0]["id"], "2");
 }
+
+#[tokio::test]
+async fn upload_validates_narrow_integer_time_duration_binary_values() {
+    let app = app();
+    let uri = format!("/indexes?api-version={API_VERSION}");
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            &uri,
+            Some(API_KEY),
+            Some(json!({
+                "name": "typed",
+                "fields": [
+                    {"name": "id", "type": "Edm.String", "key": true},
+                    {"name": "level", "type": "Edm.Int8"},
+                    {"name": "code", "type": "Edm.Int16"},
+                    {"name": "at", "type": "Edm.Time"},
+                    {"name": "dur", "type": "Edm.Duration"},
+                    {"name": "blob", "type": "Edm.Binary"}
+                ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = call(
+        app,
+        upload_request(
+            "typed",
+            json!([
+                {"@search.action": "upload", "document": {
+                    "id": "ok", "level": 100, "code": 30000,
+                    "at": "10:30:45", "dur": "P1DT2H", "blob": "aGVsbG8="}},
+                {"@search.action": "upload", "document": {
+                    "id": "bad-int", "level": 1000, "code": 1,
+                    "at": "10:30:45", "dur": "P1D", "blob": "aGk="}},
+                {"@search.action": "upload", "document": {
+                    "id": "bad-time", "level": 1, "code": 1,
+                    "at": "25:00:00", "dur": "P1D", "blob": "aGk="}},
+                {"@search.action": "upload", "document": {
+                    "id": "bad-dur", "level": 1, "code": 1,
+                    "at": "10:30:45", "dur": "tomorrow", "blob": "aGk="}},
+                {"@search.action": "upload", "document": {
+                    "id": "bad-blob", "level": 1, "code": 1,
+                    "at": "10:30:45", "dur": "P1D", "blob": "***"}}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let results = body["value"].as_array().cloned().unwrap_or_default();
+    assert_eq!(results.len(), 5);
+    assert_eq!(results[0]["status"], true);
+    for result in &results[1..] {
+        assert_eq!(result["status"], false, "invalid doc accepted: {result}");
+        assert_eq!(result["statusCode"], 400);
+    }
+}

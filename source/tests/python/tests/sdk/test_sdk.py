@@ -633,6 +633,97 @@ def test_suggest_and_autocomplete_filter(
     assert completions[0].query_plus_text == "bos Boston"
 
 
+def test_suggest_and_autocomplete_options(
+    index_client: SearchIndexClient, search_client: SearchClient
+) -> None:
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchField(name="title", type=SearchFieldDataType.String, searchable=True),
+                SearchField(
+                    name="category", type=SearchFieldDataType.String, searchable=True
+                ),
+                SimpleField(name="price", type=SearchFieldDataType.Double, sortable=True),
+            ],
+            suggesters=[SearchSuggester(name="sg", source_fields=["title", "category"])],
+        )
+    )
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "Boston Harbor Hotel", "category": "hotel", "price": 300.0},
+            {"id": "2", "title": "Seattle Downtown", "category": "boston getaway", "price": 100.0},
+            {"id": "3", "title": "New York Hotel", "category": "hotel", "price": 150.0},
+            {"id": "4", "title": "York Peppermint", "category": "candy", "price": 50.0},
+        ]
+    )
+
+    # search_fields restricts matching to the listed suggester fields: "bos"
+    # matches doc 1 via title and doc 2 via category; title-only keeps doc 1.
+    suggestions = search_client.suggest(
+        search_text="bos", suggester_name="sg", search_fields=["title"]
+    )
+    assert [doc["id"] for doc in suggestions] == ["1"]
+    completions = search_client.autocomplete(
+        search_text="bos", suggester_name="sg", search_fields=["category"]
+    )
+    assert [item.text for item in completions] == ["boston"]
+
+    # select projects the suggested documents (key and @search.text stay).
+    suggestions = search_client.suggest(
+        search_text="bos", suggester_name="sg", select=["title"]
+    )
+    assert [doc["id"] for doc in suggestions] == ["1", "2"]
+    assert suggestions[0]["title"] == "Boston Harbor Hotel"
+    assert "category" not in suggestions[0]
+    assert suggestions[0].text == "Boston"
+
+    # order_by reorders suggestions (default is key order).
+    suggestions = search_client.suggest(
+        search_text="bos", suggester_name="sg", order_by=["price asc"]
+    )
+    assert [doc["id"] for doc in suggestions] == ["2", "1"]
+
+    # Fuzzy matching tolerates a single-character typo on both routes.
+    assert search_client.suggest(search_text="bostn", suggester_name="sg") == []
+    suggestions = search_client.suggest(
+        search_text="bostn", suggester_name="sg", use_fuzzy_matching=True
+    )
+    assert [doc["id"] for doc in suggestions] == ["1", "2"]
+    completions = search_client.autocomplete(
+        search_text="bostn", suggester_name="sg", use_fuzzy_matching=True
+    )
+    assert [item.text for item in completions] == ["Boston", "boston"]
+
+    # Highlight tags wrap the matched portion of the suggestion text.
+    suggestions = search_client.suggest(
+        search_text="bos",
+        suggester_name="sg",
+        highlight_pre_tag="<b>",
+        highlight_post_tag="</b>",
+    )
+    assert suggestions[0].text == "<b>Bos</b>ton"
+
+    # minimum_coverage is accepted but inert.
+    suggestions = search_client.suggest(
+        search_text="bos", suggester_name="sg", minimum_coverage=50.0
+    )
+    assert [doc["id"] for doc in suggestions] == ["1", "2"]
+
+    # Autocomplete modes for multi-term input.
+    completions = search_client.autocomplete(search_text="new y", suggester_name="sg")
+    assert "York" in [item.text for item in completions]
+    completions = search_client.autocomplete(
+        search_text="new y", suggester_name="sg", mode="twoTerms"
+    )
+    assert [item.text for item in completions] == ["New York"]
+    completions = search_client.autocomplete(
+        search_text="york pep", suggester_name="sg", mode="oneTermWithContext"
+    )
+    assert [item.text for item in completions] == ["Peppermint"]
+
+
 def test_synonym_map_crud(index_client: SearchIndexClient) -> None:
     created = index_client.create_synonym_map(SynonymMap(name="sm", synonyms=["a", "b"]))
     assert created.name == "sm"
@@ -651,6 +742,243 @@ def test_synonym_map_crud(index_client: SearchIndexClient) -> None:
     index_client.delete_synonym_map("sm")
     with pytest.raises(ResourceNotFoundError):
         index_client.get_synonym_map("sm")
+
+
+def test_synonym_map_search_expansion(
+    index_client: SearchIndexClient, clean_emulator: str
+) -> None:
+    index_client.create_synonym_map(SynonymMap(name="sm", synonyms=["wa, washington"]))
+    index_client.create_synonym_map(SynonymMap(name="sm2", synonyms=["boston => beantown"]))
+    index_client.create_index(
+        SearchIndex(
+            name="syn-idx",
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchableField(
+                    name="title",
+                    type=SearchFieldDataType.String,
+                    synonym_map_names=["sm", "sm2"],
+                ),
+            ],
+        )
+    )
+    search_client = SearchClient(
+        endpoint=clean_emulator, index_name="syn-idx", credential=CREDENTIAL
+    )
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "hotels in Washington"},
+            {"id": "2", "title": "staying in Beantown tonight"},
+            {"id": "3", "title": "flights to Boston"},
+        ]
+    )
+
+    # Equivalence group is bidirectional: "wa" expands to "washington".
+    assert {doc["id"] for doc in search_client.search(search_text="wa")} == {"1"}
+    assert {doc["id"] for doc in search_client.search(search_text="washington")} == {"1"}
+
+    # Directional rule: "boston" expands to "beantown", but not the reverse.
+    assert {doc["id"] for doc in search_client.search(search_text="boston")} == {"2", "3"}
+    assert {doc["id"] for doc in search_client.search(search_text="beantown")} == {"2"}
+
+    # Fuzzy terms are not synonym-expanded.
+    assert list(search_client.search(search_text="wa~")) == []
+
+    # Maps not referenced by the index are inert.
+    index_client.create_synonym_map(SynonymMap(name="other", synonyms=["other, washington"]))
+    assert {doc["id"] for doc in search_client.search(search_text="other")} == set()
+
+
+def test_nested_complex_types(
+    index_client: SearchIndexClient, search_client: SearchClient
+) -> None:
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(
+                    name="id", type=SearchFieldDataType.String, key=True, filterable=True
+                ),
+                SearchField(
+                    name="address",
+                    type=SearchFieldDataType.ComplexType,
+                    fields=[
+                        SearchableField(name="city", type=SearchFieldDataType.String, filterable=True),
+                        SearchField(
+                            name="geo",
+                            type=SearchFieldDataType.ComplexType,
+                            fields=[
+                                SearchableField(
+                                    name="label",
+                                    type=SearchFieldDataType.String,
+                                    filterable=True,
+                                ),
+                                SimpleField(
+                                    name="lat",
+                                    type=SearchFieldDataType.Double,
+                                    filterable=True,
+                                    sortable=True,
+                                ),
+                            ],
+                        ),
+                        SearchField(
+                            name="stays",
+                            type=SearchFieldDataType.Collection(SearchFieldDataType.ComplexType),
+                            fields=[
+                                SearchField(
+                                    name="type", type=SearchFieldDataType.String, filterable=True
+                                ),
+                                SearchField(
+                                    name="room",
+                                    type=SearchFieldDataType.ComplexType,
+                                    fields=[
+                                        SimpleField(
+                                            name="floor",
+                                            type=SearchFieldDataType.Int32,
+                                            filterable=True,
+                                        )
+                                    ],
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+        )
+    )
+    results = search_client.upload_documents(
+        documents=[
+            {
+                "id": "1",
+                "address": {
+                    "city": "Miami",
+                    "geo": {"lat": 25.7, "label": "beachfront"},
+                    "stays": [
+                        {"type": "suite", "room": {"floor": 3}},
+                        {"type": "standard", "room": {"floor": 1}},
+                    ],
+                },
+            },
+            {
+                "id": "2",
+                "address": {
+                    "city": "Seattle",
+                    "geo": {"lat": 47.6, "label": "downtown"},
+                    "stays": [{"type": "standard", "room": {"floor": 2}}],
+                },
+            },
+        ]
+    )
+    assert all(r.succeeded for r in results)
+
+    # Filter paths resolve through nested complex types.
+    found = list(search_client.search(search_text="*", filter="address/geo/label eq 'beachfront'"))
+    assert [doc["id"] for doc in found] == ["1"]
+    found = list(search_client.search(search_text="*", filter="address/geo/lat gt 40"))
+    assert [doc["id"] for doc in found] == ["2"]
+    found = list(
+        search_client.search(search_text="*", filter="address/stays/room/floor gt 2")
+    )
+    assert [doc["id"] for doc in found] == ["1"]
+
+    # Searchable string subfields at any depth are full-text indexed.
+    found = list(search_client.search(search_text="beachfront"))
+    assert [doc["id"] for doc in found] == ["1"]
+
+    # Lambda subfield access works at depth through the element variable.
+    found = list(
+        search_client.search(
+            search_text="*", filter="address/stays/any(s: s/room/floor gt 2)"
+        )
+    )
+    assert [doc["id"] for doc in found] == ["1"]
+
+    # Nested select paths project sub-objects.
+    found = list(
+        search_client.search(
+            search_text="*", select=["id", "address/geo/label"], filter="id eq '1'"
+        )
+    )
+    assert found[0]["address"] == {"geo": {"label": "beachfront"}}
+    assert "city" not in found[0]["address"]
+    found = list(
+        search_client.search(
+            search_text="*", select=["address/stays/type"], filter="id eq '1'"
+        )
+    )
+    assert found[0]["address"] == {"stays": [{"type": "suite"}, {"type": "standard"}]}
+
+    # orderby resolves through nested complex types.
+    found = list(search_client.search(search_text="*", order_by=["address/geo/lat desc"]))
+    assert [doc["id"] for doc in found] == ["2", "1"]
+
+
+def test_additional_edm_types(
+    index_client: SearchIndexClient, search_client: SearchClient
+) -> None:
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SimpleField(
+                    name="level", type=SearchFieldDataType.S_BYTE, filterable=True, sortable=True
+                ),
+                SimpleField(
+                    name="code", type=SearchFieldDataType.Int16, filterable=True, sortable=True
+                ),
+                SimpleField(name="at", type="Edm.Time", filterable=True, sortable=True),
+                SimpleField(name="dur", type="Edm.Duration", filterable=True),
+                SimpleField(name="blob", type="Edm.Binary", filterable=True),
+            ],
+        )
+    )
+    results = search_client.upload_documents(
+        documents=[
+            {
+                "id": "1",
+                "level": 100,
+                "code": 1000,
+                "at": "08:00:00",
+                "dur": "P1D",
+                "blob": "aGVsbG8=",
+            },
+            {
+                "id": "2",
+                "level": -5,
+                "code": 2000,
+                "at": "18:30:00",
+                "dur": "PT2H",
+                "blob": "d29ybGQ=",
+            },
+            # Out-of-range / malformed values are per-document errors.
+            {"id": "bad-level", "level": 1000, "code": 1, "at": "08:00:00", "dur": "P1D", "blob": "aGk="},
+            {"id": "bad-time", "level": 1, "code": 1, "at": "25:00:00", "dur": "P1D", "blob": "aGk="},
+        ]
+    )
+    assert results[0].succeeded
+    assert results[1].succeeded
+    assert not results[2].succeeded
+    assert not results[3].succeeded
+
+    found = list(search_client.search(search_text="*", filter="level gt 0"))
+    assert [doc["id"] for doc in found] == ["1"]
+    found = list(search_client.search(search_text="*", filter="code lt 1500"))
+    assert [doc["id"] for doc in found] == ["1"]
+    found = list(search_client.search(search_text="*", filter="at gt '12:00:00'"))
+    assert [doc["id"] for doc in found] == ["2"]
+    found = list(search_client.search(search_text="*", filter="dur eq 'P1D'"))
+    assert [doc["id"] for doc in found] == ["1"]
+    found = list(search_client.search(search_text="*", filter="blob eq 'aGVsbG8='"))
+    assert [doc["id"] for doc in found] == ["1"]
+    found = list(search_client.search(search_text="*", order_by=["at desc"]))
+    assert [doc["id"] for doc in found] == ["2", "1"]
+
+    # Ordering comparisons on Duration/Binary are rejected (eq/ne only).
+    with pytest.raises(HttpResponseError):
+        list(search_client.search(search_text="*", filter="dur gt 'P1D'"))
+    with pytest.raises(HttpResponseError):
+        list(search_client.search(search_text="*", filter="blob gt 'aGVsbG8='"))
 
 
 def test_alias_crud(index_client: SearchIndexClient) -> None:
@@ -905,6 +1233,105 @@ def test_search_filter_string_functions(priced_docs: SearchClient) -> None:
     assert [doc["id"] for doc in found] == ["3"]
     found = list(priced_docs.search(search_text="*", filter="title in ('cheap red', 'other')"))
     assert [doc["id"] for doc in found] == ["1"]
+
+
+def test_search_filter_date_string_ismatch_lambda(
+    index_client: SearchIndexClient, search_client: SearchClient
+) -> None:
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchableField(name="title", type=SearchFieldDataType.String, filterable=True),
+                SimpleField(
+                    name="published",
+                    type=SearchFieldDataType.DateTimeOffset,
+                    filterable=True,
+                ),
+                SearchField(
+                    name="rooms",
+                    type=SearchFieldDataType.Collection(SearchFieldDataType.ComplexType),
+                    fields=[
+                        SearchField(name="type", type=SearchFieldDataType.String, filterable=True),
+                        SearchField(name="rate", type=SearchFieldDataType.Double, filterable=True),
+                    ],
+                ),
+            ],
+        )
+    )
+    results = search_client.upload_documents(
+        documents=[
+            {
+                "id": "1",
+                "title": "Azure Search",
+                "published": "2024-03-15T10:30:45Z",
+                "rooms": [{"type": "standard", "rate": 50.0}, {"type": "suite", "rate": 150.0}],
+            },
+            {
+                "id": "2",
+                "title": "hello world",
+                "published": "2023-07-04T08:00:00Z",
+                "rooms": [{"type": "standard", "rate": 60.0}],
+            },
+            {
+                "id": "3",
+                "title": "  padded  ",
+                "published": "2024-03-15T22:15:00Z",
+                "rooms": [{"type": "loft", "rate": 200.0}],
+            },
+        ]
+    )
+    assert all(r.succeeded for r in results)
+
+    # OData date functions on Edm.DateTimeOffset fields.
+    found = list(search_client.search(search_text="*", filter="year(published) eq 2024"))
+    assert {doc["id"] for doc in found} == {"1", "3"}
+    found = list(search_client.search(search_text="*", filter="month(published) eq 3"))
+    assert {doc["id"] for doc in found} == {"1", "3"}
+    found = list(search_client.search(search_text="*", filter="day(published) eq 4"))
+    assert [doc["id"] for doc in found] == ["2"]
+    found = list(search_client.search(search_text="*", filter="hour(published) eq 10"))
+    assert [doc["id"] for doc in found] == ["1"]
+    found = list(
+        search_client.search(
+            search_text="*",
+            filter="date(published) eq utcdatetime('2024-03-15T00:00:00Z')",
+        )
+    )
+    assert {doc["id"] for doc in found} == {"1", "3"}
+    found = list(search_client.search(search_text="*", filter="published lt now()"))
+    assert {doc["id"] for doc in found} == {"1", "2", "3"}
+
+    # Value-producing string functions.
+    found = list(search_client.search(search_text="*", filter="length(title) eq 11"))
+    assert [doc["id"] for doc in found] == ["2"]
+    found = list(search_client.search(search_text="*", filter="indexof(title, 'world') eq 6"))
+    assert [doc["id"] for doc in found] == ["2"]
+    found = list(
+        search_client.search(search_text="*", filter="substring(title, 0, 5) eq 'hello'")
+    )
+    assert [doc["id"] for doc in found] == ["2"]
+    found = list(search_client.search(search_text="*", filter="tolower(title) eq 'azure search'"))
+    assert [doc["id"] for doc in found] == ["1"]
+    found = list(search_client.search(search_text="*", filter="toupper(title) eq 'HELLO WORLD'"))
+    assert [doc["id"] for doc in found] == ["2"]
+    found = list(search_client.search(search_text="*", filter="trim(title) eq 'padded'"))
+    assert [doc["id"] for doc in found] == ["3"]
+
+    # search.ismatch: case-insensitive regex against string fields.
+    found = list(search_client.search(search_text="*", filter="search.ismatch('azure.*', title)"))
+    assert [doc["id"] for doc in found] == ["1"]
+    found = list(search_client.search(search_text="*", filter="search.ismatch('^HELLO', title)"))
+    assert [doc["id"] for doc in found] == ["2"]
+    with pytest.raises(HttpResponseError):
+        list(search_client.search(search_text="*", filter="search.ismatch('[', title)"))
+
+    # Lambda bodies addressing subfields of the element variable.
+    found = list(search_client.search(search_text="*", filter="rooms/any(r: r/type eq 'suite')"))
+    assert [doc["id"] for doc in found] == ["1"]
+    found = list(search_client.search(search_text="*", filter="rooms/any(r: r/rate gt 100)"))
+    assert {doc["id"] for doc in found} == {"1", "3"}
 
 
 def test_search_orderby_nulls_first_ascending_last_descending(

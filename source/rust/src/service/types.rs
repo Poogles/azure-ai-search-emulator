@@ -225,3 +225,87 @@ pub struct Suggestion {
     pub document: Document,
     pub text: String,
 }
+
+/// The `autocompleteMode` for autocomplete: how the search text is completed.
+/// Mirrors the Azure wire values (`oneTerm` / `twoTerms` /
+/// `oneTermWithContext`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AutocompleteMode {
+    /// Complete the last whitespace-separated term (the default).
+    #[default]
+    OneTerm,
+    /// Suggest matching two-term phrases from the index.
+    TwoTerms,
+    /// Complete the last term, requiring the preceding terms to appear in
+    /// the candidate document.
+    OneTermWithContext,
+}
+
+impl AutocompleteMode {
+    /// Parses an `autocompleteMode` value (case-insensitive).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string for anything other than `oneTerm` /
+    /// `twoTerms` / `oneTermWithContext`.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.to_ascii_lowercase().as_str() {
+            "oneterm" => Ok(Self::OneTerm),
+            "twoterms" => Ok(Self::TwoTerms),
+            "onetermwithcontext" => Ok(Self::OneTermWithContext),
+            _ => Err(format!(
+                "Invalid autocompleteMode {value:?}; supported values: \
+                 'oneTerm', 'twoTerms', 'oneTermWithContext'."
+            )),
+        }
+    }
+}
+
+/// Validated suggest options: the subset of the suggest request affecting
+/// matching, ordering, and projection. `minimumCoverage` is accepted but
+/// inert (prefix/infix matching is not coverage-based); `select` is empty
+/// when all fields are returned (`*` or absent).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SuggestOptions {
+    /// Fields to match against (`None` means the suggester's fields).
+    pub search_fields: Option<Vec<String>>,
+    /// Projected fields (empty means all fields).
+    pub select: Vec<String>,
+    /// Result ordering (empty means key order).
+    pub orderby: Vec<OrderBy>,
+    /// Whether typo-tolerant (1-edit) matching applies.
+    pub fuzzy: bool,
+    /// Highlight tags wrapping the matched portion of `@search.text`
+    /// (`None` means no highlighting; both tags are required for effect).
+    pub highlight_tags: Option<(String, String)>,
+}
+
+/// Validated autocomplete options. `select` does not apply (completions are
+/// `text`/`queryPlusText` only); `minimumCoverage` and lone highlight tags
+/// are accepted but inert.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AutocompleteOptions {
+    /// Fields to match against (`None` means the suggester's fields).
+    pub search_fields: Option<Vec<String>>,
+    /// Candidate ordering (empty means key order).
+    pub orderby: Vec<OrderBy>,
+    /// Whether typo-tolerant (1-edit) matching applies.
+    pub fuzzy: bool,
+    /// How the search text is completed.
+    pub mode: AutocompleteMode,
+}
+
+/// Raw (unvalidated) suggest/autocomplete options, merged from the request
+/// body and query string by the API layer. The service layer validates them
+/// against the index definition when executing the request.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RawSuggesterOptions {
+    pub search_fields: Option<Value>,
+    pub select: Option<Value>,
+    pub orderby: Option<Value>,
+    pub fuzzy: Option<Value>,
+    pub autocomplete_mode: Option<String>,
+    pub highlight_pre_tag: Option<String>,
+    pub highlight_post_tag: Option<String>,
+    pub minimum_coverage: Option<Value>,
+}

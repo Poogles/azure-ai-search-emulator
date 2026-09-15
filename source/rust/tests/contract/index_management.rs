@@ -242,3 +242,66 @@ async fn delete_missing_index_returns_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"]["code"], "ResourceNotFound");
 }
+
+fn typed_definition(name: &str) -> serde_json::Value {
+    json!({
+        "name": name,
+        "fields": [
+            {"name": "id", "type": "Edm.String", "key": true},
+            {"name": "level", "type": "Edm.Int8", "filterable": true, "sortable": true},
+            {"name": "code", "type": "Edm.Int16", "filterable": true, "sortable": true},
+            {"name": "at", "type": "Edm.Time", "filterable": true, "sortable": true},
+            {"name": "dur", "type": "Edm.Duration", "filterable": true},
+            {"name": "blob", "type": "Edm.Binary", "filterable": true},
+            {"name": "blobs", "type": "Edm.Collection(Edm.Binary)", "filterable": true},
+            {"name": "alias", "type": "Edm.SByte", "filterable": true}
+        ]
+    })
+}
+
+#[tokio::test]
+async fn create_index_accepts_narrow_integer_time_duration_binary_types() {
+    let app = app();
+    let uri = format!("/indexes?api-version={API_VERSION}");
+    let (status, body) = call(
+        app,
+        request("POST", &uri, Some(API_KEY), Some(typed_definition("typed"))),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "new Edm types rejected: {body}"
+    );
+}
+
+#[tokio::test]
+async fn create_index_rejects_time_duration_collections_and_sortable_equality_only() {
+    let app = app();
+    let uri = format!("/indexes?api-version={API_VERSION}");
+    for fields in [
+        json!([{"name": "id", "type": "Edm.String", "key": true},
+               {"name": "at", "type": "Edm.Collection(Edm.Time)"}]),
+        json!([{"name": "id", "type": "Edm.String", "key": true},
+               {"name": "dur", "type": "Edm.Collection(Edm.Duration)"}]),
+        json!([{"name": "id", "type": "Edm.String", "key": true},
+               {"name": "dur", "type": "Edm.Duration", "sortable": true}]),
+        json!([{"name": "id", "type": "Edm.String", "key": true},
+               {"name": "blob", "type": "Edm.Binary", "sortable": true}]),
+        json!([{"name": "id", "type": "Edm.String", "key": true},
+               {"name": "b", "type": "Edm.Byte"}]),
+    ] {
+        let (status, body) = call(
+            app.clone(),
+            request(
+                "POST",
+                &uri,
+                Some(API_KEY),
+                Some(json!({"name": "bad", "fields": fields})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "bad type accepted: {body}");
+        assert_eq!(body["error"]["code"], "InvalidIndex");
+    }
+}

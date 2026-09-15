@@ -491,3 +491,366 @@ async fn suggest_and_autocomplete_filter_narrow_candidates() {
         .unwrap_or_default();
     assert_eq!(texts, vec!["boston"]);
 }
+
+fn suggest_ids(body: &Value) -> Vec<String> {
+    body["value"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|d| d["id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn completion_texts(body: &Value) -> Vec<String> {
+    body["value"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|c| c["text"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn suggest_search_fields_restricts_matching() {
+    let app = app();
+    let (status, _) = create_suggester_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+    seed(&app).await;
+
+    // "bos" matches doc 1 via title and doc 2 via tags; restricting to the
+    // title field keeps only doc 1.
+    let (status, body) = call(
+        app.clone(),
+        suggest_request(
+            "items",
+            json!({"search": "bos", "suggesterName": "sg", "searchFields": ["title"]}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "searchFields suggest failed: {body}"
+    );
+    assert_eq!(suggest_ids(&body), vec!["1"]);
+
+    // Unknown, non-searchable, and non-suggester fields are rejected.
+    for search_fields in [json!(["missing"]), json!(["id"]), json!("title, missing")] {
+        let (status, body) = call(
+            app.clone(),
+            suggest_request(
+                "items",
+                json!({"search": "bos", "suggesterName": "sg", "searchFields": search_fields}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "searchFields {search_fields}: {body}"
+        );
+        assert_eq!(body["error"]["code"], "InvalidQuery");
+    }
+
+    // Autocomplete restricts matching the same way.
+    let (status, body) = call(
+        app,
+        autocomplete_request(
+            "items",
+            json!({"search": "bos", "suggesterName": "sg", "searchFields": ["tags"]}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "searchFields autocomplete failed: {body}"
+    );
+    assert_eq!(completion_texts(&body), vec!["boston"]);
+}
+
+#[tokio::test]
+async fn suggest_select_projects_documents() {
+    let app = app();
+    let (status, _) = create_suggester_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+    seed(&app).await;
+
+    let (status, body) = call(
+        app.clone(),
+        suggest_request(
+            "items",
+            json!({"search": "bos", "suggesterName": "sg", "select": ["title"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "select suggest failed: {body}");
+    let value = body["value"].as_array().cloned().unwrap_or_default();
+    assert_eq!(value.len(), 2);
+    for doc in &value {
+        assert!(doc.get("id").is_some(), "key missing: {doc}");
+        assert!(doc.get("title").is_some(), "selected field missing: {doc}");
+        assert!(doc.get("tags").is_none(), "unselected field present: {doc}");
+        assert!(
+            doc.get("@search.text").is_some(),
+            "@search.text missing: {doc}"
+        );
+    }
+
+    // Unknown select fields are rejected.
+    let (status, body) = call(
+        app,
+        suggest_request(
+            "items",
+            json!({"search": "bos", "suggesterName": "sg", "select": ["missing"]}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "bad select accepted: {body}"
+    );
+    assert_eq!(body["error"]["code"], "InvalidQuery");
+}
+
+#[tokio::test]
+async fn suggest_and_autocomplete_orderby_reorders_results() {
+    let app = app();
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            &format!("/indexes?api-version={API_VERSION}"),
+            Some(API_KEY),
+            Some(json!({
+                "name": "items",
+                "fields": [
+                    {"name": "id", "type": "Edm.String", "key": true},
+                    {"name": "title", "type": "Edm.String", "searchable": true},
+                    {"name": "price", "type": "Edm.Double", "sortable": true}
+                ],
+                "suggesters": [{"name": "sg", "searchFields": ["title"]}]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        upload_request(
+            "items",
+            json!([
+                {"@search.action": "upload", "document": {"id": "1", "title": "Boston One", "price": 300.0}},
+                {"@search.action": "upload", "document": {"id": "2", "title": "Boston Two", "price": 100.0}}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Default: key order.
+    let (status, body) = call(
+        app.clone(),
+        suggest_request("items", json!({"search": "bos", "suggesterName": "sg"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(suggest_ids(&body), vec!["1", "2"]);
+
+    // orderby price asc flips the order.
+    let (status, body) = call(
+        app.clone(),
+        suggest_request(
+            "items",
+            json!({"search": "bos", "suggesterName": "sg", "orderby": "price asc"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "orderby suggest failed: {body}");
+    assert_eq!(suggest_ids(&body), vec!["2", "1"]);
+
+    // @search.score, unknown, and non-sortable fields are rejected.
+    for orderby in ["@search.score", "missing", "title"] {
+        let (status, body) = call(
+            app.clone(),
+            suggest_request(
+                "items",
+                json!({"search": "bos", "suggesterName": "sg", "orderby": orderby}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "orderby {orderby}: {body}");
+        assert_eq!(body["error"]["code"], "InvalidQuery");
+    }
+}
+
+#[tokio::test]
+async fn autocomplete_modes_complete_multi_term_input() {
+    let app = app();
+    let (status, _) = create_suggester_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        upload_request(
+            "items",
+            json!([
+                {"@search.action": "upload", "document": {"id": "1", "title": "New York Hotel", "tags": ["suite"]}},
+                {"@search.action": "upload", "document": {"id": "2", "title": "York Peppermint", "tags": ["candy"]}}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // oneTerm (default): only the last term is completed.
+    let (status, body) = call(
+        app.clone(),
+        autocomplete_request("items", json!({"search": "new y", "suggesterName": "sg"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        completion_texts(&body).contains(&"York".to_owned()),
+        "{body}"
+    );
+
+    // twoTerms: matching consecutive word pairs are suggested as phrases.
+    let (status, body) = call(
+        app.clone(),
+        autocomplete_request(
+            "items",
+            json!({"search": "new y", "suggesterName": "sg", "autocompleteMode": "twoTerms"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "twoTerms failed: {body}");
+    assert_eq!(completion_texts(&body), vec!["New York"]);
+
+    // oneTermWithContext: preceding terms must appear in the document.
+    let (status, body) = call(
+        app.clone(),
+        autocomplete_request(
+            "items",
+            json!({"search": "york pep", "suggesterName": "sg", "autocompleteMode": "oneTermWithContext"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "oneTermWithContext failed: {body}");
+    assert_eq!(completion_texts(&body), vec!["Peppermint"]);
+
+    // Unknown modes are rejected.
+    let (status, body) = call(
+        app,
+        autocomplete_request(
+            "items",
+            json!({"search": "new y", "suggesterName": "sg", "autocompleteMode": "threeTerms"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "bad mode accepted: {body}");
+    assert_eq!(body["error"]["code"], "InvalidQuery");
+}
+
+#[tokio::test]
+async fn suggest_and_autocomplete_fuzzy_matches_typos() {
+    let app = app();
+    let (status, _) = create_suggester_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+    seed(&app).await;
+
+    // "bostn" matches nothing exactly.
+    let (status, body) = call(
+        app.clone(),
+        suggest_request("items", json!({"search": "bostn", "suggesterName": "sg"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(suggest_ids(&body).is_empty());
+
+    // fuzzy: true tolerates the single-character typo on both routes.
+    let (status, body) = call(
+        app.clone(),
+        suggest_request(
+            "items",
+            json!({"search": "bostn", "suggesterName": "sg", "fuzzy": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "fuzzy suggest failed: {body}");
+    assert_eq!(suggest_ids(&body).len(), 2);
+    let (status, body) = call(
+        app.clone(),
+        autocomplete_request(
+            "items",
+            json!({"search": "bostn", "suggesterName": "sg", "fuzzy": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "fuzzy autocomplete failed: {body}");
+    assert_eq!(completion_texts(&body).len(), 2);
+
+    // A non-boolean fuzzy flag is rejected.
+    let (status, body) = call(
+        app,
+        suggest_request(
+            "items",
+            json!({"search": "bos", "suggesterName": "sg", "fuzzy": "yes"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "bad fuzzy accepted: {body}"
+    );
+    assert_eq!(body["error"]["code"], "InvalidQuery");
+}
+
+#[tokio::test]
+async fn suggest_highlight_tags_wrap_matched_text() {
+    let app = app();
+    let (status, _) = create_suggester_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+    seed(&app).await;
+
+    // No tags: the plain matched word (current behaviour).
+    let (status, body) = call(
+        app.clone(),
+        suggest_request("items", json!({"search": "bos", "suggesterName": "sg"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["value"][0]["@search.text"], "Boston");
+
+    // Both tags wrap the matched portion of @search.text.
+    let (status, body) = call(
+        app.clone(),
+        suggest_request(
+            "items",
+            json!({"search": "bos", "suggesterName": "sg",
+                   "highlightPreTag": "<b>", "highlightPostTag": "</b>"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "highlight suggest failed: {body}");
+    assert_eq!(body["value"][0]["@search.text"], "<b>Bos</b>ton");
+
+    // minimumCoverage is accepted but inert.
+    let (status, body) = call(
+        app,
+        suggest_request(
+            "items",
+            json!({"search": "bos", "suggesterName": "sg", "minimumCoverage": 50.0}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "minimumCoverage rejected: {body}");
+    assert_eq!(suggest_ids(&body).len(), 2);
+}

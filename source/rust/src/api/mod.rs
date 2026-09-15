@@ -16,7 +16,9 @@ use serde_json::{json, Map, Value};
 use crate::config::Config;
 use crate::error::{ApiError, ErrorCode};
 use crate::query::SearchEngine;
-use crate::service::{DocumentAction, ResourceKind, SearchOutcome, SearchService};
+use crate::service::{
+    DocumentAction, RawSuggesterOptions, ResourceKind, SearchOutcome, SearchService,
+};
 use crate::vector::VectorEngine;
 use crate::version::VersionAdapter;
 use named_resources::{
@@ -351,11 +353,15 @@ async fn autocomplete_documents(
 ) -> Result<Json<Value>, ApiError> {
     let name = parse_index_name(&raw_name)?;
     let raw = parse_body(&body)?;
-    let (search_text, suggester_name, top, filter) = suggest_request_params(&raw, uri.query())?;
-    let completions =
-        state
-            .service
-            .autocomplete(&name, &suggester_name, &search_text, top, filter.as_deref())?;
+    let params = suggest_request_params(&raw, uri.query())?;
+    let completions = state.service.autocomplete(
+        &name,
+        &params.suggester_name,
+        &params.search_text,
+        params.top,
+        params.filter.as_deref(),
+        &params.options,
+    )?;
     let value = completions
         .iter()
         .map(|c| {
@@ -380,11 +386,15 @@ async fn suggest_documents(
 ) -> Result<Json<Value>, ApiError> {
     let name = parse_index_name(&raw_name)?;
     let raw = parse_body(&body)?;
-    let (search_text, suggester_name, top, filter) = suggest_request_params(&raw, uri.query())?;
-    let suggestions =
-        state
-            .service
-            .suggest(&name, &suggester_name, &search_text, top, filter.as_deref())?;
+    let params = suggest_request_params(&raw, uri.query())?;
+    let suggestions = state.service.suggest(
+        &name,
+        &params.suggester_name,
+        &params.search_text,
+        params.top,
+        params.filter.as_deref(),
+        &params.options,
+    )?;
     let value = suggestions
         .iter()
         .map(|s| {
@@ -530,9 +540,17 @@ fn build_page_entries(query: &crate::service::SearchQuery, outcome: &SearchOutco
                     .collect();
                 entry.insert("@search.highlights".to_owned(), Value::Object(highlights));
             }
-            for (key, value) in &doc.fields {
-                if query.select.is_empty() || query.select.iter().any(|s| s == key) {
+            if query.select.is_empty() {
+                for (key, value) in &doc.fields {
                     entry.insert(key.clone(), value.clone());
+                }
+            } else {
+                // Top-level names select whole fields; nested paths
+                // (`Address/City`) project sub-objects.
+                for (key, value) in
+                    crate::service::project_select_fields(&doc.fields, &query.select)
+                {
+                    entry.insert(key, value);
                 }
             }
             Value::Object(entry)
@@ -732,15 +750,28 @@ fn query_param<'a>(query: &'a str, key: &str) -> Option<Cow<'a, str>> {
         .map(|(_, value)| value)
 }
 
+/// A parsed suggest/autocomplete request: the search text, suggester name,
+/// result limit, optional filter, and the raw (unvalidated) route options.
+/// The service layer validates the options against the index definition.
+struct SuggestRequestParams {
+    search_text: String,
+    suggester_name: String,
+    top: u64,
+    filter: Option<String>,
+    options: RawSuggesterOptions,
+}
+
 /// Extracts the suggest/autocomplete request parameters: the search text
 /// (`search`), the suggester name (`suggesterName`), and the result limit
-/// (`top`, default 5). The pinned SDK sends these in the JSON body; the
+/// (`top`, default 5), plus the route options (`searchFields`, `select`,
+/// `orderby`, `fuzzy`, `autocompleteMode`, highlight tags,
+/// `minimumCoverage`). The pinned SDK sends these in the JSON body; the
 /// query-string form (used by the GET variants of the routes) is also
-/// accepted.
+/// accepted (body wins when both are present).
 fn suggest_request_params(
     raw: &Value,
     query: Option<&str>,
-) -> Result<(String, String, u64, Option<String>), ApiError> {
+) -> Result<SuggestRequestParams, ApiError> {
     let param = |keys: &[&str]| -> Option<String> {
         keys.iter().find_map(|key| {
             let from_body = raw.get(key).and_then(Value::as_str).map(Cow::Borrowed);
@@ -778,7 +809,90 @@ fn suggest_request_params(
     // An optional `filter` narrows the candidate documents (like the search
     // route); absent or empty means no narrowing.
     let filter = param(&["filter"]);
-    Ok((search_text, suggester_name, top, filter))
+    Ok(SuggestRequestParams {
+        search_text,
+        suggester_name,
+        top,
+        filter,
+        options: RawSuggesterOptions {
+            search_fields: body_or_query_list(raw, query, &["searchFields"]),
+            select: body_or_query_list(raw, query, &["select", "$select"]),
+            orderby: body_or_query_list(raw, query, &["orderby", "$orderby"]),
+            fuzzy: body_or_query_bool(raw, query, &["fuzzy", "useFuzzyMatching"], "fuzzy")?,
+            autocomplete_mode: param(&["autocompleteMode", "mode"]),
+            highlight_pre_tag: param(&["highlightPreTag"]),
+            highlight_post_tag: param(&["highlightPostTag"]),
+            minimum_coverage: body_or_query_number(raw, query, &["minimumCoverage"])?,
+        },
+    })
+}
+
+/// A body-or-query list option (JSON array/string in the body, or a
+/// comma-separated query value); body wins when both are present.
+fn body_or_query_list(raw: &Value, query: Option<&str>, keys: &[&str]) -> Option<Value> {
+    for key in keys {
+        match raw.get(*key) {
+            None | Some(Value::Null) => {}
+            Some(value) => return Some(value.clone()),
+        }
+    }
+    query
+        .and_then(|q| keys.iter().find_map(|key| query_param(q, key)))
+        .map(|value| Value::String(value.into_owned()))
+}
+
+/// A body-or-query boolean option; a query-string value must be
+/// `true`/`false` (anything else is `400 InvalidQuery`).
+fn body_or_query_bool(
+    raw: &Value,
+    query: Option<&str>,
+    keys: &[&str],
+    name: &str,
+) -> Result<Option<Value>, ApiError> {
+    for key in keys {
+        match raw.get(*key) {
+            None | Some(Value::Null) => {}
+            Some(value) => return Ok(Some(value.clone())),
+        }
+    }
+    match query.and_then(|q| keys.iter().find_map(|key| query_param(q, key))) {
+        None => Ok(None),
+        Some(value) => match value.to_ascii_lowercase().as_str() {
+            "true" => Ok(Some(Value::Bool(true))),
+            "false" => Ok(Some(Value::Bool(false))),
+            _ => Err(ApiError::bad_request(
+                ErrorCode::InvalidQuery,
+                format!("{name} must be a boolean."),
+            )),
+        },
+    }
+}
+
+/// A body-or-query numeric option; a query-string value must parse as a
+/// number (anything else is `400 InvalidQuery`).
+fn body_or_query_number(
+    raw: &Value,
+    query: Option<&str>,
+    keys: &[&str],
+) -> Result<Option<Value>, ApiError> {
+    for key in keys {
+        match raw.get(*key) {
+            None | Some(Value::Null) => {}
+            Some(value) => return Ok(Some(value.clone())),
+        }
+    }
+    match query.and_then(|q| keys.iter().find_map(|key| query_param(q, key))) {
+        None => Ok(None),
+        Some(value) => value
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(Value::Number)
+            .map(Some)
+            .ok_or_else(|| {
+                ApiError::bad_request(ErrorCode::InvalidQuery, "minimumCoverage must be a number.")
+            }),
+    }
 }
 
 /// Parses a `top`/`$top` query-string value: must be a positive integer.

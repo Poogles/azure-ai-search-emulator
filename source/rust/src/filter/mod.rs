@@ -257,14 +257,29 @@ impl FilterExpr {
                 };
                 compare_filter_values(&actual, *op, value)
             }
-            FilterExpr::Any { field, inner } => fields
-                .get(field)
-                .and_then(Value::as_array)
-                .is_some_and(|items| items.iter().any(|item| element_matches(inner, item))),
-            FilterExpr::All { field, inner } => fields
-                .get(field)
-                .and_then(Value::as_array)
-                .is_some_and(|items| items.iter().all(|item| element_matches(inner, item))),
+            FilterExpr::Any { field, inner } => {
+                let resolved = resolve_field_path(fields, field);
+                // A missing path matches nothing (like a missing field).
+                !resolved.is_empty()
+                    && resolved.into_iter().any(|value| match value {
+                        Value::Array(items) => {
+                            items.iter().any(|item| element_matches(inner, item))
+                        }
+                        element => element_matches(inner, element),
+                    })
+            }
+            FilterExpr::All { field, inner } => {
+                let resolved = resolve_field_path(fields, field);
+                // A missing path matches nothing (like a missing field); a
+                // present-but-empty collection is vacuously true.
+                !resolved.is_empty()
+                    && resolved.into_iter().all(|value| match value {
+                        Value::Array(items) => {
+                            items.iter().all(|item| element_matches(inner, item))
+                        }
+                        element => element_matches(inner, element),
+                    })
+            }
             FilterExpr::DateCompare { left, op, value } => {
                 let Some(actual) = left.evaluate(fields) else {
                     return false;
@@ -432,26 +447,59 @@ fn null_comparison(op: FilterOp, actual_null: bool, expected_null: bool) -> bool
 
 /// Evaluates an `any`/`all` inner expression against a single collection
 /// element. The inner expression must be a comparison on the lambda variable;
-/// the variable may be a plain name (the element itself) or `var/Subfield`
-/// (one level of subfield access into the element object).
+/// the variable may be a plain name (the element itself) or a (possibly
+/// nested) subfield path through the element object (`var/Subfield`,
+/// `var/A/B`, ...). Intermediate arrays use any-element semantics.
 fn element_matches(inner: &FilterExpr, element: &Value) -> bool {
     debug_assert!(
         matches!(inner, FilterExpr::Compare { .. }),
         "any/all inner must be a Compare on the lambda variable"
     );
     match inner {
-        FilterExpr::Compare { field, op, value } => {
-            let actual = match field.split_once('/') {
-                Some((_, subfield)) => element.as_object().and_then(|o| o.get(subfield)),
-                None => Some(element),
-            };
-            match actual {
-                Some(actual) if !actual.is_null() => compare(actual, *op, value),
-                _ => null_comparison(*op, true, value_is_null(value)),
+        FilterExpr::Compare { field, op, value } => match field.split_once('/') {
+            Some((_, rest)) => {
+                let resolved = resolve_in_element(element, rest);
+                compare_field_values(&resolved, *op, value)
             }
-        }
+            None => {
+                if element.is_null() {
+                    null_comparison(*op, true, value_is_null(value))
+                } else {
+                    compare(element, *op, value)
+                }
+            }
+        },
         _ => false,
     }
+}
+
+/// Resolves a `/`-separated subfield path against a collection element:
+/// object segments descend into objects, array segments resolve against
+/// every element (any-element semantics).
+fn resolve_in_element<'a>(element: &'a Value, path: &str) -> Vec<&'a Value> {
+    let mut current = vec![element];
+    for segment in path.split('/') {
+        let mut next = Vec::new();
+        for value in current {
+            match value {
+                Value::Object(map) => {
+                    if let Some(resolved) = map.get(segment) {
+                        next.push(resolved);
+                    }
+                }
+                Value::Array(items) => {
+                    for item in items {
+                        if let Some(resolved) = item.as_object().and_then(|map| map.get(segment)) {
+                            next.push(resolved);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        current = next;
+    }
+    current
 }
 
 /// Exact float comparison is the correct filter semantics (JSON numbers

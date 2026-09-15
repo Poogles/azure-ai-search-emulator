@@ -16,9 +16,9 @@ pub use continuation::ContinuationToken;
 pub use resources::{NamedResource, ResourceKind};
 pub use synonyms::SynonymMap;
 pub use types::{
-    ActionKind, AutocompleteCompletion, DocumentAction, Facet, IndexingResultItem, OrderBy,
-    PagingState, SearchField, SearchOutcome, SearchQuery, Suggestion, VectorFilterMode,
-    VectorQuery,
+    ActionKind, AutocompleteCompletion, AutocompleteMode, AutocompleteOptions, DocumentAction,
+    Facet, IndexingResultItem, OrderBy, PagingState, RawSuggesterOptions, SearchField,
+    SearchOutcome, SearchQuery, SuggestOptions, Suggestion, VectorFilterMode, VectorQuery,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1321,15 +1321,24 @@ impl SearchService {
         )
     }
 
-    /// Runs an autocomplete query: case-insensitive prefix or infix matching
-    /// of the search text against the whitespace-separated words of the
-    /// suggester's search fields. Returns up to `top` distinct completions,
-    /// ordered by first appearance (documents in key order, then field order).
+    /// Runs an autocomplete query: completes the search text against the
+    /// whitespace-separated words of the suggester's search fields
+    /// (case-insensitive infix match). Returns up to `top` distinct
+    /// completions, ordered by first appearance (candidates in key order, then
+    /// field order) unless `orderby` overrides the candidate order.
+    ///
+    /// `options.mode` selects how multi-term input is completed (`oneTerm`
+    /// completes the last term; `twoTerms` suggests matching two-term phrases;
+    /// `oneTermWithContext` additionally requires the preceding terms to
+    /// appear in the candidate document). `options.fuzzy` adds 1-edit
+    /// typo-tolerant matching.
     ///
     /// # Errors
     ///
     /// Returns an [`ApiError`] if the index does not exist, the suggester is
-    /// not defined on the index, or the search text is empty.
+    /// not defined on the index, the search text is empty, or an option is
+    /// invalid (unknown/non-searchable `searchFields`, unknown/non-sortable
+    /// `orderby`, unknown `autocompleteMode`, non-boolean `fuzzy`).
     pub fn autocomplete(
         &self,
         index: &str,
@@ -1337,27 +1346,77 @@ impl SearchService {
         search_text: &str,
         top: u64,
         filter: Option<&str>,
+        raw: &RawSuggesterOptions,
     ) -> Result<Vec<AutocompleteCompletion>, ApiError> {
-        let (documents, suggester) = self.suggester_documents(index, suggester_name)?;
+        let definition = self.require_index(index)?;
+        let suggester = definition
+            .suggester(suggester_name)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    ErrorCode::InvalidQuery,
+                    format!("Suggester {suggester_name:?} is not defined on index {index:?}."),
+                )
+            })?;
+        let options = Self::resolve_autocomplete_options(&definition, &suggester, raw)?;
         let filter_expr = filter.map(parse_filter_option).transpose()?;
         let search = search_text.trim();
-        let needle = search.to_lowercase();
-        if needle.is_empty() {
+        if search.is_empty() {
             return Err(ApiError::bad_request(
                 ErrorCode::InvalidQuery,
                 "The autocomplete search text must be a non-empty string.",
             ));
         }
+        let terms: Vec<String> = search.split_whitespace().map(str::to_lowercase).collect();
+        let fields: Vec<String> = options
+            .search_fields
+            .unwrap_or_else(|| suggester.search_fields.clone());
+        let documents = self.storage.get_documents(&definition.name)?;
+        let candidates =
+            Self::ordered_candidates(&documents, &options.orderby, filter_expr.as_ref());
         let limit = usize::try_from(top).unwrap_or(usize::MAX);
         let mut seen = BTreeSet::new();
         let mut completions = Vec::new();
-        for (_, words) in
-            Self::suggester_candidates(&documents, &suggester, filter_expr.as_ref(), &needle)
-        {
-            for word in words {
+        if options.mode == AutocompleteMode::TwoTerms && terms.len() >= 2 {
+            let previous = &terms[terms.len() - 2];
+            let last = &terms[terms.len() - 1];
+            let prefix = terms[..terms.len() - 2].join(" ");
+            for document in &candidates {
+                for phrase in two_term_phrases(document, &fields, previous, last, options.fuzzy) {
+                    if seen.insert(phrase.clone()) {
+                        completions.push(AutocompleteCompletion {
+                            query_plus_text: if prefix.is_empty() {
+                                phrase.clone()
+                            } else {
+                                format!("{prefix} {phrase}")
+                            },
+                            text: phrase,
+                        });
+                        if completions.len() >= limit {
+                            return Ok(completions);
+                        }
+                    }
+                }
+            }
+            return Ok(completions);
+        }
+        let needle = terms.last().cloned().unwrap_or_default();
+        let context = &terms[..terms.len().saturating_sub(1)];
+        for document in &candidates {
+            if !context_matches(document, &fields, context) {
+                continue;
+            }
+            for word in suggester_field_words(document, &fields) {
+                if !word_matches(&word, &needle, options.fuzzy) {
+                    continue;
+                }
                 if seen.insert(word.clone()) {
                     completions.push(AutocompleteCompletion {
-                        query_plus_text: format!("{search} {word}"),
+                        query_plus_text: if context.is_empty() {
+                            format!("{search} {word}")
+                        } else {
+                            format!("{} {word}", context.join(" "))
+                        },
                         text: word,
                     });
                     if completions.len() >= limit {
@@ -1369,15 +1428,20 @@ impl SearchService {
         Ok(completions)
     }
 
-    /// Runs a suggest query: a document matches when any whitespace-separated
-    /// word of the suggester's search fields contains the search text
-    /// (case-insensitive prefix or infix match). Returns up to `top` matching
-    /// documents in key order, each with the first matched word.
+    /// Runs a suggest query: a document matches when every whitespace-separated
+    /// term of the search text matches (case-insensitive infix, or 1-edit
+    /// fuzzy when enabled) some word of the suggester's search fields.
+    /// Returns up to `top` matching documents in key order (or `orderby`
+    /// order), each with the first word matching the first term as
+    /// `@search.text` (with highlight tags applied when both are given) and
+    /// projected to `options.select` when present.
     ///
     /// # Errors
     ///
     /// Returns an [`ApiError`] if the index does not exist, the suggester is
-    /// not defined on the index, or the search text is empty.
+    /// not defined on the index, the search text is empty, or an option is
+    /// invalid (unknown/non-searchable `searchFields`, unknown `select`
+    /// fields, unknown/non-sortable `orderby`, non-boolean `fuzzy`).
     pub fn suggest(
         &self,
         index: &str,
@@ -1385,47 +1449,8 @@ impl SearchService {
         search_text: &str,
         top: u64,
         filter: Option<&str>,
+        raw: &RawSuggesterOptions,
     ) -> Result<Vec<Suggestion>, ApiError> {
-        let (documents, suggester) = self.suggester_documents(index, suggester_name)?;
-        let filter_expr = filter.map(parse_filter_option).transpose()?;
-        let needle = search_text.trim().to_lowercase();
-        if needle.is_empty() {
-            return Err(ApiError::bad_request(
-                ErrorCode::InvalidQuery,
-                "The suggest search text must be a non-empty string.",
-            ));
-        }
-        let limit = usize::try_from(top).unwrap_or(usize::MAX);
-        let mut suggestions = Vec::new();
-        for (document, words) in
-            Self::suggester_candidates(&documents, &suggester, filter_expr.as_ref(), &needle)
-        {
-            let Some(text) = words.into_iter().next() else {
-                continue;
-            };
-            suggestions.push(Suggestion {
-                document: document.clone(),
-                text,
-            });
-            if suggestions.len() >= limit {
-                break;
-            }
-        }
-        Ok(suggestions)
-    }
-
-    /// Looks up the index and its suggester, returning the index's documents
-    /// (in key order) and a clone of the suggester definition.
-    ///
-    /// # Errors
-    ///
-    /// Returns an [`ApiError`] if the index does not exist or the suggester
-    /// is not defined on the index.
-    fn suggester_documents(
-        &self,
-        index: &str,
-        suggester_name: &str,
-    ) -> Result<(Vec<Document>, Suggester), ApiError> {
         let definition = self.require_index(index)?;
         let suggester = definition
             .suggester(suggester_name)
@@ -1436,43 +1461,141 @@ impl SearchService {
                     format!("Suggester {suggester_name:?} is not defined on index {index:?}."),
                 )
             })?;
+        let options = Self::resolve_suggest_options(&definition, &suggester, raw)?;
+        let filter_expr = filter.map(parse_filter_option).transpose()?;
+        let search = search_text.trim();
+        if search.is_empty() {
+            return Err(ApiError::bad_request(
+                ErrorCode::InvalidQuery,
+                "The suggest search text must be a non-empty string.",
+            ));
+        }
+        let terms: Vec<String> = search.split_whitespace().map(str::to_lowercase).collect();
+        let fields: Vec<String> = options
+            .search_fields
+            .unwrap_or_else(|| suggester.search_fields.clone());
         let documents = self.storage.get_documents(&definition.name)?;
-        Ok((documents, suggester))
-    }
-
-    /// The words of a document's suggester search fields, in field order,
-    /// then value order, then word order.
-    fn suggester_words<'a>(
-        document: &'a Document,
-        suggester: &'a Suggester,
-    ) -> impl Iterator<Item = String> + 'a {
-        suggester.search_fields.iter().flat_map(|field_name| {
-            document
-                .resolve_path(field_name)
-                .into_iter()
-                .flat_map(field_words)
-        })
-    }
-
-    /// The suggester's candidate documents with their matching words: each
-    /// document passing `filter` (in key order) paired with the words of the
-    /// suggester's search fields that contain `needle` (case-insensitive).
-    /// Documents with no matching word are omitted.
-    fn suggester_candidates<'a>(
-        documents: &'a [Document],
-        suggester: &'a Suggester,
-        filter: Option<&'a FilterExpr>,
-        needle: &'a str,
-    ) -> impl Iterator<Item = (&'a Document, Vec<String>)> {
-        documents.iter().filter_map(move |document| {
-            if !filter.is_none_or(|expr| expr.matches(&document.fields)) {
-                return None;
+        let candidates =
+            Self::ordered_candidates(&documents, &options.orderby, filter_expr.as_ref());
+        let limit = usize::try_from(top).unwrap_or(usize::MAX);
+        let mut suggestions = Vec::new();
+        for document in &candidates {
+            let words = suggester_field_words(document, &fields);
+            if !terms.iter().all(|term| {
+                words
+                    .iter()
+                    .any(|word| word_matches(word, term, options.fuzzy))
+            }) {
+                continue;
             }
-            let words = Self::suggester_words(document, suggester)
-                .filter(|word| word.to_lowercase().contains(needle))
-                .collect::<Vec<_>>();
-            (!words.is_empty()).then_some((document, words))
+            let Some(matched) = words
+                .iter()
+                .find(|word| word_matches(word, &terms[0], options.fuzzy))
+                .cloned()
+            else {
+                continue;
+            };
+            let text = match &options.highlight_tags {
+                Some((pre, post)) => highlight_word(&matched, &terms[0], options.fuzzy, pre, post),
+                None => matched,
+            };
+            suggestions.push(Suggestion {
+                document: project_document(document, &definition, &options.select),
+                text,
+            });
+            if suggestions.len() >= limit {
+                break;
+            }
+        }
+        Ok(suggestions)
+    }
+
+    /// Validates raw suggest options against the index definition and
+    /// suggester.
+    fn resolve_suggest_options(
+        definition: &IndexDefinition,
+        suggester: &Suggester,
+        raw: &RawSuggesterOptions,
+    ) -> Result<SuggestOptions, ApiError> {
+        use self::parsing::{
+            parse_suggester_fuzzy, parse_suggester_orderby, parse_suggester_search_fields,
+            validate_suggester_minimum_coverage,
+        };
+        validate_suggester_minimum_coverage(raw.minimum_coverage.as_ref())?;
+        Ok(SuggestOptions {
+            search_fields: parse_suggester_search_fields(
+                raw.search_fields.as_ref(),
+                definition,
+                suggester,
+            )?,
+            select: match raw.select.as_ref() {
+                None => Vec::new(),
+                Some(value) => parse_select(value, definition)?,
+            },
+            orderby: parse_suggester_orderby(raw.orderby.as_ref(), definition)?,
+            fuzzy: parse_suggester_fuzzy(raw.fuzzy.as_ref())?,
+            highlight_tags: match (&raw.highlight_pre_tag, &raw.highlight_post_tag) {
+                (Some(pre), Some(post)) => Some((pre.clone(), post.clone())),
+                _ => None,
+            },
         })
+    }
+
+    /// Validates raw autocomplete options against the index definition and
+    /// suggester (`select` and lone highlight tags are accepted but inert).
+    fn resolve_autocomplete_options(
+        definition: &IndexDefinition,
+        suggester: &Suggester,
+        raw: &RawSuggesterOptions,
+    ) -> Result<AutocompleteOptions, ApiError> {
+        use self::parsing::{
+            parse_suggester_fuzzy, parse_suggester_orderby, parse_suggester_search_fields,
+            validate_suggester_minimum_coverage,
+        };
+        validate_suggester_minimum_coverage(raw.minimum_coverage.as_ref())?;
+        if let Some(select) = raw.select.as_ref() {
+            parse_select(select, definition)?;
+        }
+        Ok(AutocompleteOptions {
+            search_fields: parse_suggester_search_fields(
+                raw.search_fields.as_ref(),
+                definition,
+                suggester,
+            )?,
+            orderby: parse_suggester_orderby(raw.orderby.as_ref(), definition)?,
+            fuzzy: parse_suggester_fuzzy(raw.fuzzy.as_ref())?,
+            mode: match raw.autocomplete_mode.as_deref() {
+                None => AutocompleteMode::OneTerm,
+                Some(mode) => AutocompleteMode::parse(mode).map_err(ApiError::invalid_query)?,
+            },
+        })
+    }
+
+    /// Candidate documents passing `filter`, in key order or `orderby` order.
+    /// `orderby` clauses were validated at option-resolution time, so scoring
+    /// is a dummy: only the field ordering matters, with the key as
+    /// tie-breaker.
+    fn ordered_candidates(
+        documents: &[Document],
+        orderby: &[OrderBy],
+        filter: Option<&FilterExpr>,
+    ) -> Vec<Document> {
+        let mut passing: Vec<Document> = documents
+            .iter()
+            .filter(|document| filter.is_none_or(|expr| expr.matches(&document.fields)))
+            .cloned()
+            .collect();
+        if orderby.is_empty() {
+            passing.sort_by(|a, b| a.key.cmp(&b.key));
+        } else {
+            let mut scored: Vec<(Document, f32)> = passing
+                .into_iter()
+                .map(|document| (document, 0.0))
+                .collect();
+            order_scored(&mut scored, orderby);
+            passing = scored.into_iter().map(|(document, _)| document).collect();
+        }
+        passing
     }
 
     pub fn reset(&self) {
@@ -1681,6 +1804,227 @@ fn prepare_full_text(
     Ok(full_text)
 }
 
+/// The words of a document's suggester fields (restricted to `fields`), in
+/// field order, then value order, then word order.
+fn suggester_field_words(document: &Document, fields: &[String]) -> Vec<String> {
+    fields
+        .iter()
+        .flat_map(|field_name| {
+            document
+                .resolve_path(field_name)
+                .into_iter()
+                .flat_map(field_words)
+        })
+        .collect()
+}
+
+/// Whether a suggester word matches a lowercased search term:
+/// case-insensitive infix match, or (when `fuzzy`) a Levenshtein distance of
+/// at most 1 (a single substituted, missing, or extra character).
+fn word_matches(word: &str, term: &str, fuzzy: bool) -> bool {
+    let lower = word.to_lowercase();
+    if lower.contains(term) {
+        return true;
+    }
+    fuzzy && levenshtein_distance(&lower, term) <= 1
+}
+
+/// The Levenshtein edit distance between two strings (character-based).
+fn levenshtein_distance(first: &str, second: &str) -> usize {
+    let first: Vec<char> = first.chars().collect();
+    let second: Vec<char> = second.chars().collect();
+    if first.is_empty() {
+        return second.len();
+    }
+    if second.is_empty() {
+        return first.len();
+    }
+    let mut previous: Vec<usize> = (0..=second.len()).collect();
+    let mut current = vec![0; second.len() + 1];
+    for (i, &left) in first.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, &right) in second.iter().enumerate() {
+            let substitution = previous[j] + usize::from(left != right);
+            current[j + 1] = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[second.len()]
+}
+
+/// Whether every context term appears (case-insensitive infix) in some word
+/// of the document's suggester fields (`oneTermWithContext` support: the
+/// already-typed terms must appear in the candidate document).
+fn context_matches(document: &Document, fields: &[String], context: &[String]) -> bool {
+    if context.is_empty() {
+        return true;
+    }
+    let words = suggester_field_words(document, fields);
+    context
+        .iter()
+        .all(|term| words.iter().any(|word| word.to_lowercase().contains(term)))
+}
+
+/// Two-term phrases matching `twoTerms` autocomplete input: consecutive word
+/// pairs (within one field value) whose first word equals `previous`
+/// (case-insensitive) and whose second word starts with `last` (or is within
+/// 1 edit when `fuzzy`). Original casing is preserved.
+fn two_term_phrases(
+    document: &Document,
+    fields: &[String],
+    previous: &str,
+    last: &str,
+    fuzzy: bool,
+) -> Vec<String> {
+    let mut phrases = Vec::new();
+    for field_name in fields {
+        for value in document.resolve_path(field_name) {
+            for pair in field_words(value).windows(2) {
+                let (Some(first), Some(second)) = (pair.first(), pair.get(1)) else {
+                    continue;
+                };
+                if first.to_lowercase() != previous {
+                    continue;
+                }
+                let lower = second.to_lowercase();
+                if lower.starts_with(last) || (fuzzy && levenshtein_distance(&lower, last) <= 1) {
+                    phrases.push(format!("{first} {second}"));
+                }
+            }
+        }
+    }
+    phrases
+}
+
+/// Wraps the term-matching portion of a suggester word in highlight tags: the
+/// infix occurrence for exact matches, the whole word for fuzzy-only matches.
+/// Character-based so non-ASCII words slice on valid boundaries.
+fn highlight_word(word: &str, term: &str, fuzzy: bool, pre: &str, post: &str) -> String {
+    let lower = word.to_lowercase();
+    let word_chars: Vec<char> = word.chars().collect();
+    let lower_chars: Vec<char> = lower.chars().collect();
+    let term_chars: Vec<char> = term.chars().collect();
+    if !term_chars.is_empty() {
+        if let Some(start) = lower_chars
+            .windows(term_chars.len())
+            .position(|window| window == term_chars.as_slice())
+        {
+            let end = start + term_chars.len();
+            let before: String = word_chars[..start].iter().collect();
+            let matched: String = word_chars[start..end].iter().collect();
+            let after: String = word_chars[end..].iter().collect();
+            return format!("{before}{pre}{matched}{post}{after}");
+        }
+    }
+    if fuzzy {
+        return format!("{pre}{word}{post}");
+    }
+    word.to_owned()
+}
+
+/// Projects a suggester document to `select` (empty means all fields): the
+/// key field plus the selected fields (nested paths supported).
+fn project_document(
+    document: &Document,
+    definition: &IndexDefinition,
+    select: &[String],
+) -> Document {
+    if select.is_empty() {
+        return document.clone();
+    }
+    let mut fields = project_select_fields(&document.fields, select);
+    if let Some(key_field) = definition.key_field() {
+        if let Some(value) = document.fields.get(&key_field.name) {
+            fields.insert(key_field.name.clone(), value.clone());
+        }
+    }
+    Document {
+        key: document.key.clone(),
+        fields,
+    }
+}
+
+/// Projects document fields to a `select` list (empty means all fields).
+/// Entries may be top-level names (`title`, included whole) or nested paths
+/// (`Address/City` → `{"Address": {"City": ...}}`;
+/// `Rooms/Type` → `{"Rooms": [{"Type": ...}, ...]}`). A path resolving to a
+/// non-leaf selects the whole sub-object. Fields absent from the document
+/// are omitted.
+pub(crate) fn project_select_fields(
+    fields: &Map<String, Value>,
+    select: &[String],
+) -> Map<String, Value> {
+    if select.is_empty() {
+        return fields.clone();
+    }
+    let mut grouped: std::collections::BTreeMap<&str, Vec<Option<&str>>> =
+        std::collections::BTreeMap::new();
+    for path in select {
+        match path.split_once('/') {
+            Some((first, rest)) => grouped.entry(first).or_default().push(Some(rest)),
+            None => grouped.entry(path.as_str()).or_default().push(None),
+        }
+    }
+    let mut out = Map::new();
+    for (first, rests) in grouped {
+        let Some(value) = fields.get(first) else {
+            continue;
+        };
+        if rests.iter().any(Option::is_none) {
+            out.insert(first.to_owned(), value.clone());
+        } else {
+            let subpaths: Vec<&str> = rests.into_iter().flatten().collect();
+            if let Some(projected) = project_select_value(value, &subpaths) {
+                out.insert(first.to_owned(), projected);
+            }
+        }
+    }
+    out
+}
+
+/// Projects one value to nested `select` subpaths: objects keep the selected
+/// sub-object (empty projections are omitted), arrays project each element
+/// (elements projecting to empty are dropped; a fully-dropped array stays an
+/// empty array), and scalars with remaining subpaths project to nothing
+/// (unreachable for schema-validated paths, but documents may be sparse).
+fn project_select_value(value: &Value, subpaths: &[&str]) -> Option<Value> {
+    match value {
+        Value::Object(map) => {
+            let mut grouped: std::collections::BTreeMap<&str, Vec<Option<&str>>> =
+                std::collections::BTreeMap::new();
+            for path in subpaths {
+                match path.split_once('/') {
+                    Some((first, rest)) => grouped.entry(first).or_default().push(Some(rest)),
+                    None => grouped.entry(path).or_default().push(None),
+                }
+            }
+            let mut out = Map::new();
+            for (first, rests) in grouped {
+                let Some(sub) = map.get(first) else {
+                    continue;
+                };
+                if rests.iter().any(Option::is_none) {
+                    out.insert(first.to_owned(), sub.clone());
+                } else {
+                    let nested: Vec<&str> = rests.into_iter().flatten().collect();
+                    if let Some(projected) = project_select_value(sub, &nested) {
+                        out.insert(first.to_owned(), projected);
+                    }
+                }
+            }
+            (!out.is_empty()).then_some(Value::Object(out))
+        }
+        Value::Array(items) => {
+            let projected: Vec<Value> = items
+                .iter()
+                .filter_map(|item| project_select_value(item, subpaths))
+                .collect();
+            Some(Value::Array(projected))
+        }
+        _ => None,
+    }
+}
+
 /// Maps a query-engine failure onto an Azure-compatible [`ApiError`].
 fn engine_error(index: &str, error: QueryError) -> ApiError {
     match error {
@@ -1878,16 +2222,6 @@ mod tests {
                     {"name": "Address", "type": "Edm.ComplexType", "fields": []}
                 ]
             }),
-            // Subfields must be scalar (or collection-of-scalar) types.
-            json!({
-                "name": "y",
-                "fields": [
-                    {"name": "id", "type": "Edm.String", "key": true},
-                    {"name": "Address", "type": "Edm.ComplexType",
-                     "fields": [{"name": "Inner", "type": "Edm.ComplexType",
-                                 "fields": [{"name": "City", "type": "Edm.String"}]}]}
-                ]
-            }),
             // Subfield names must be unique.
             json!({
                 "name": "y",
@@ -1895,16 +2229,63 @@ mod tests {
                     {"name": "id", "type": "Edm.String", "key": true},
                     {"name": "Address", "type": "Edm.ComplexType",
                      "fields": [
-                         {"name": "City", "type": "Edm.String"},
-                         {"name": "City", "type": "Edm.Int32"}
-                     ]}
+                          {"name": "City", "type": "Edm.String"},
+                          {"name": "City", "type": "Edm.Int32"}
+                      ]}
                 ]
             }),
+            // Nested complex types are accepted to any depth.
         ];
+        let nested = json!({
+            "name": "nested",
+            "fields": [
+                {"name": "id", "type": "Edm.String", "key": true},
+                {"name": "Address", "type": "Edm.ComplexType",
+                 "fields": [
+                     {"name": "Inner", "type": "Edm.ComplexType",
+                      "fields": [{"name": "City", "type": "Edm.String", "searchable": true, "filterable": true}]},
+                     {"name": "Geo", "type": "Edm.Collection(Edm.ComplexType)",
+                      "fields": [{"name": "Lat", "type": "Edm.Double", "filterable": true}]}
+                 ]}
+            ]
+        });
+        assert!(
+            service.create_index(&nested).is_ok(),
+            "nested complex rejected"
+        );
         for body in &invalid_bodies {
             assert!(
                 service.create_index(body).is_err(),
                 "expected rejection: {body}"
+            );
+        }
+        // Nested invalid shapes are still rejected: a key, a vector, or
+        // searchable/sortable/facetable flags on a nested complex field, an
+        // empty nested fields array, duplicate nested names, and an
+        // unsupported nested scalar type.
+        let nested_invalid = [
+            json!({"name": "Inner", "type": "Edm.ComplexType", "key": true,
+                   "fields": [{"name": "City", "type": "Edm.String"}]}),
+            json!({"name": "Inner", "type": "Edm.ComplexType", "searchable": true,
+                   "fields": [{"name": "City", "type": "Edm.String"}]}),
+            json!({"name": "Inner", "type": "Edm.ComplexType", "fields": []}),
+            json!({"name": "Inner", "type": "Edm.Collection(Edm.ComplexType)",
+                   "fields": [{"name": "City", "type": "Edm.String"},
+                              {"name": "City", "type": "Edm.Int32"}]}),
+            json!({"name": "Inner", "type": "Edm.ComplexType",
+                   "fields": [{"name": "City", "type": "Edm.Byte"}]}),
+        ];
+        for inner in &nested_invalid {
+            let body = json!({
+                "name": "y",
+                "fields": [
+                    {"name": "id", "type": "Edm.String", "key": true},
+                    {"name": "Address", "type": "Edm.ComplexType", "fields": [inner]}
+                ]
+            });
+            assert!(
+                service.create_index(&body).is_err(),
+                "expected nested rejection: {body}"
             );
         }
     }
@@ -2515,17 +2896,46 @@ mod tests {
                 json!({"id": "3", "title": "Seattle Downtown", "tags": ["wifi"]}),
             ],
         );
-        let completions = ok(service.autocomplete("items", "sg", "bos", 5, None));
+        let completions = ok(service.autocomplete(
+            "items",
+            "sg",
+            "bos",
+            5,
+            None,
+            &RawSuggesterOptions::default(),
+        ));
         let texts: Vec<_> = completions.iter().map(|c| c.text.clone()).collect();
         assert_eq!(texts, vec!["Boston", "boston"]);
         assert_eq!(completions[0].query_plus_text, "bos Boston");
         // Case-insensitive: "BOS" matches the same words.
-        let completions = ok(service.autocomplete("items", "sg", "BOS", 5, None));
+        let completions = ok(service.autocomplete(
+            "items",
+            "sg",
+            "BOS",
+            5,
+            None,
+            &RawSuggesterOptions::default(),
+        ));
         assert_eq!(completions.len(), 2);
         // No match.
-        assert!(ok(service.autocomplete("items", "sg", "zzz", 5, None)).is_empty());
+        assert!(ok(service.autocomplete(
+            "items",
+            "sg",
+            "zzz",
+            5,
+            None,
+            &RawSuggesterOptions::default()
+        ))
+        .is_empty());
         // top limits the results.
-        let completions = ok(service.autocomplete("items", "sg", "bos", 1, None));
+        let completions = ok(service.autocomplete(
+            "items",
+            "sg",
+            "bos",
+            1,
+            None,
+            &RawSuggesterOptions::default(),
+        ));
         assert_eq!(completions.len(), 1);
     }
 
@@ -2541,7 +2951,14 @@ mod tests {
                 json!({"id": "3", "title": "Portland Lodge", "tags": ["wifi"]}),
             ],
         );
-        let suggestions = ok(service.suggest("items", "sg", "bos", 5, None));
+        let suggestions = ok(service.suggest(
+            "items",
+            "sg",
+            "bos",
+            5,
+            None,
+            &RawSuggesterOptions::default(),
+        ));
         assert_eq!(suggestions.len(), 2);
         // Documents come back in key order, with the matched word.
         assert_eq!(suggestions[0].document.key, "1");
@@ -2554,7 +2971,14 @@ mod tests {
             "Boston Harbor Hotel"
         );
         // top limits the results.
-        let suggestions = ok(service.suggest("items", "sg", "bos", 1, None));
+        let suggestions = ok(service.suggest(
+            "items",
+            "sg",
+            "bos",
+            1,
+            None,
+            &RawSuggesterOptions::default(),
+        ));
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].document.key, "1");
     }
@@ -2571,20 +2995,50 @@ mod tests {
             ],
         );
         // Without a filter, "bos" matches doc 1 (title) and doc 2 (tag).
-        assert_eq!(ok(service.suggest("items", "sg", "bos", 5, None)).len(), 2);
+        assert_eq!(
+            ok(service.suggest(
+                "items",
+                "sg",
+                "bos",
+                5,
+                None,
+                &RawSuggesterOptions::default()
+            ))
+            .len(),
+            2
+        );
         // A filter narrows the candidates: only the wifi-tagged doc (2) remains.
-        let suggestions =
-            ok(service.suggest("items", "sg", "bos", 5, Some("tags/any(t: t eq 'wifi')")));
+        let suggestions = ok(service.suggest(
+            "items",
+            "sg",
+            "bos",
+            5,
+            Some("tags/any(t: t eq 'wifi')"),
+            &RawSuggesterOptions::default(),
+        ));
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].document.key, "2");
         // Autocomplete narrows the same way: "bos" only completes from doc 2's
         // tag, not doc 1's title.
-        let completions =
-            ok(service.autocomplete("items", "sg", "bos", 5, Some("tags/any(t: t eq 'wifi')")));
+        let completions = ok(service.autocomplete(
+            "items",
+            "sg",
+            "bos",
+            5,
+            Some("tags/any(t: t eq 'wifi')"),
+            &RawSuggesterOptions::default(),
+        ));
         let texts: Vec<_> = completions.iter().map(|c| c.text.clone()).collect();
         assert_eq!(texts, vec!["boston"]);
         // An invalid filter is rejected.
-        let api_error = err(service.suggest("items", "sg", "bos", 5, Some("tags/any(t:")));
+        let api_error = err(service.suggest(
+            "items",
+            "sg",
+            "bos",
+            5,
+            Some("tags/any(t:"),
+            &RawSuggesterOptions::default(),
+        ));
         assert_eq!(api_error.code.as_str(), "InvalidQuery");
     }
 
@@ -2593,18 +3047,289 @@ mod tests {
         let service = service();
         ok(service.create_index(&suggester_index_body()));
         // Missing index.
-        let api_error = err(service.autocomplete("missing", "sg", "bos", 5, None));
+        let api_error = err(service.autocomplete(
+            "missing",
+            "sg",
+            "bos",
+            5,
+            None,
+            &RawSuggesterOptions::default(),
+        ));
         assert_eq!(api_error.status, axum::http::StatusCode::NOT_FOUND);
         // Unknown suggester.
-        let api_error = err(service.autocomplete("items", "nope", "bos", 5, None));
+        let api_error = err(service.autocomplete(
+            "items",
+            "nope",
+            "bos",
+            5,
+            None,
+            &RawSuggesterOptions::default(),
+        ));
         assert_eq!(api_error.code.as_str(), "InvalidQuery");
-        let api_error = err(service.suggest("items", "nope", "bos", 5, None));
+        let api_error = err(service.suggest(
+            "items",
+            "nope",
+            "bos",
+            5,
+            None,
+            &RawSuggesterOptions::default(),
+        ));
         assert_eq!(api_error.code.as_str(), "InvalidQuery");
         // Empty search text.
-        let api_error = err(service.autocomplete("items", "sg", "   ", 5, None));
+        let api_error = err(service.autocomplete(
+            "items",
+            "sg",
+            "   ",
+            5,
+            None,
+            &RawSuggesterOptions::default(),
+        ));
         assert_eq!(api_error.code.as_str(), "InvalidQuery");
-        let api_error = err(service.suggest("items", "sg", "", 5, None));
+        let api_error =
+            err(service.suggest("items", "sg", "", 5, None, &RawSuggesterOptions::default()));
         assert_eq!(api_error.code.as_str(), "InvalidQuery");
+    }
+
+    fn raw_suggester_options(body: &Value) -> RawSuggesterOptions {
+        let obj = body.as_object().cloned().unwrap_or_default();
+        let owned = |key: &str| obj.get(key).cloned();
+        let string_opt = |key: &str| owned(key).and_then(|v| v.as_str().map(str::to_owned));
+        RawSuggesterOptions {
+            search_fields: owned("searchFields"),
+            select: owned("select"),
+            orderby: owned("orderby"),
+            fuzzy: owned("fuzzy"),
+            autocomplete_mode: string_opt("autocompleteMode"),
+            highlight_pre_tag: string_opt("highlightPreTag"),
+            highlight_post_tag: string_opt("highlightPostTag"),
+            minimum_coverage: owned("minimumCoverage"),
+        }
+    }
+
+    fn suggester_docs() -> SearchService {
+        let service = service();
+        ok(service.create_index(&json!({
+            "name": "items",
+            "fields": [
+                {"name": "id", "type": "Edm.String", "key": true, "filterable": true, "sortable": true},
+                {"name": "title", "type": "Edm.String", "searchable": true, "filterable": true},
+                {"name": "tags", "type": "Edm.Collection(Edm.String)", "searchable": true, "filterable": true, "facetable": true},
+                {"name": "price", "type": "Edm.Double", "filterable": true, "sortable": true}
+            ],
+            "suggesters": [
+                {"name": "sg", "searchFields": ["title", "tags"]}
+            ]
+        })));
+        upload(
+            &service,
+            vec![
+                json!({"id": "1", "title": "Boston Harbor Hotel", "tags": ["spa"], "price": 300.0}),
+                json!({"id": "2", "title": "Seattle Downtown", "tags": ["boston", "wifi"], "price": 100.0}),
+                json!({"id": "3", "title": "Portland Lodge", "tags": ["wifi"], "price": 200.0}),
+            ],
+        );
+        service
+    }
+
+    #[test]
+    fn suggest_search_fields_restricts_matching() {
+        let service = suggester_docs();
+        // "bos" matches doc 1 via title and doc 2 via tags; restricting to
+        // title keeps only doc 1.
+        let raw = raw_suggester_options(&json!({"searchFields": ["title"]}));
+        let suggestions = ok(service.suggest("items", "sg", "bos", 5, None, &raw));
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].document.key, "1");
+        // Unknown, non-searchable, and non-suggester fields are rejected.
+        for body in [
+            json!({"searchFields": ["missing"]}),
+            json!({"searchFields": ["id"]}),
+            json!({"searchFields": ["price"]}),
+        ] {
+            let raw = raw_suggester_options(&body);
+            let api_error = err(service.suggest("items", "sg", "bos", 5, None, &raw));
+            assert_eq!(api_error.code.as_str(), "InvalidQuery");
+        }
+        // Autocomplete restricts the same way.
+        let raw = raw_suggester_options(&json!({"searchFields": ["tags"]}));
+        let completions = ok(service.autocomplete("items", "sg", "bos", 5, None, &raw));
+        let texts: Vec<_> = completions.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(texts, vec!["boston"]);
+    }
+
+    #[test]
+    fn suggest_select_projects_documents() {
+        let service = suggester_docs();
+        let raw = raw_suggester_options(&json!({"select": ["title"]}));
+        let suggestions = ok(service.suggest("items", "sg", "bos", 5, None, &raw));
+        assert_eq!(suggestions.len(), 2);
+        // Key plus selected fields, plus @search.text (applied by the API
+        // layer); other fields are omitted.
+        assert!(suggestions[0].document.fields.contains_key("id"));
+        assert!(suggestions[0].document.fields.contains_key("title"));
+        assert!(!suggestions[0].document.fields.contains_key("tags"));
+        assert_eq!(suggestions[0].text, "Boston");
+        // Unknown select fields are rejected.
+        let raw = raw_suggester_options(&json!({"select": ["missing"]}));
+        let api_error = err(service.suggest("items", "sg", "bos", 5, None, &raw));
+        assert_eq!(api_error.code.as_str(), "InvalidQuery");
+    }
+
+    #[test]
+    fn suggest_and_autocomplete_orderby_reorders_results() {
+        // Price is filterable but not sortable in the fixture body; rebuild
+        // with a sortable price field.
+        let service = service();
+        ok(service.create_index(&json!({
+            "name": "items",
+            "fields": [
+                {"name": "id", "type": "Edm.String", "key": true},
+                {"name": "title", "type": "Edm.String", "searchable": true},
+                {"name": "price", "type": "Edm.Double", "sortable": true}
+            ],
+            "suggesters": [{"name": "sg", "searchFields": ["title"]}]
+        })));
+        upload(
+            &service,
+            vec![
+                json!({"id": "1", "title": "Boston One", "price": 300.0}),
+                json!({"id": "2", "title": "Boston Two", "price": 100.0}),
+            ],
+        );
+        // Key order by default.
+        let suggestions = ok(service.suggest(
+            "items",
+            "sg",
+            "bos",
+            5,
+            None,
+            &RawSuggesterOptions::default(),
+        ));
+        assert_eq!(suggestions[0].document.key, "1");
+        // orderby price asc flips the order.
+        let raw = raw_suggester_options(&json!({"orderby": "price asc"}));
+        let suggestions = ok(service.suggest("items", "sg", "bos", 5, None, &raw));
+        assert_eq!(suggestions[0].document.key, "2");
+        assert_eq!(suggestions[1].document.key, "1");
+        // Autocomplete follows the candidate order too. Needle "o" matches
+        // every word, so the completion order exposes the candidate order:
+        // key order is doc 1 ("Boston One") first, price-asc is doc 2 first.
+        let raw = raw_suggester_options(&json!({"orderby": "price asc"}));
+        let completions = ok(service.autocomplete("items", "sg", "o", 5, None, &raw));
+        let texts: Vec<_> = completions.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(texts, vec!["Boston", "Two", "One"]);
+        let completions =
+            ok(service.autocomplete("items", "sg", "o", 5, None, &RawSuggesterOptions::default()));
+        let texts: Vec<_> = completions.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(texts, vec!["Boston", "One", "Two"]);
+        // @search.score is unavailable on these routes; unknown and
+        // non-sortable fields are rejected like the search route.
+        for body in [
+            json!({"orderby": "@search.score"}),
+            json!({"orderby": "missing"}),
+            json!({"orderby": "title"}),
+        ] {
+            let raw = raw_suggester_options(&body);
+            let api_error = err(service.suggest("items", "sg", "bos", 5, None, &raw));
+            assert_eq!(api_error.code.as_str(), "InvalidQuery");
+        }
+    }
+
+    #[test]
+    fn autocomplete_modes_complete_multi_term_input() {
+        let service = service();
+        ok(service.create_index(&suggester_index_body()));
+        upload(
+            &service,
+            vec![
+                json!({"id": "1", "title": "New York Hotel", "tags": ["suite"]}),
+                json!({"id": "2", "title": "York Peppermint", "tags": ["candy"]}),
+                json!({"id": "3", "title": "Newark Airport", "tags": ["newark"]}),
+            ],
+        );
+        // oneTerm (default): only the last term is completed.
+        let completions = ok(service.autocomplete(
+            "items",
+            "sg",
+            "new y",
+            5,
+            None,
+            &RawSuggesterOptions::default(),
+        ));
+        let texts: Vec<_> = completions.iter().map(|c| c.text.clone()).collect();
+        assert!(
+            texts.contains(&"York".to_owned()),
+            "oneTerm texts: {texts:?}"
+        );
+        // twoTerms: matching consecutive word pairs are suggested as phrases.
+        let raw = raw_suggester_options(&json!({"autocompleteMode": "twoTerms"}));
+        let completions = ok(service.autocomplete("items", "sg", "new y", 5, None, &raw));
+        let texts: Vec<_> = completions.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(texts, vec!["New York"]);
+        assert_eq!(completions[0].query_plus_text, "New York");
+        // oneTermWithContext: the preceding terms must appear in the document.
+        let raw = raw_suggester_options(&json!({"autocompleteMode": "oneTermWithContext"}));
+        let completions = ok(service.autocomplete("items", "sg", "york pep", 5, None, &raw));
+        let texts: Vec<_> = completions.iter().map(|c| c.text.clone()).collect();
+        assert_eq!(texts, vec!["Peppermint"]);
+        // Unknown modes are rejected.
+        let raw = raw_suggester_options(&json!({"autocompleteMode": "threeTerms"}));
+        let api_error = err(service.autocomplete("items", "sg", "new y", 5, None, &raw));
+        assert_eq!(api_error.code.as_str(), "InvalidQuery");
+    }
+
+    #[test]
+    fn suggest_and_autocomplete_fuzzy_matches_typos() {
+        let service = suggester_docs();
+        // "bostn" (one deletion away from "boston") matches nothing exactly.
+        assert!(ok(service.suggest(
+            "items",
+            "sg",
+            "bostn",
+            5,
+            None,
+            &RawSuggesterOptions::default()
+        ))
+        .is_empty());
+        let raw = raw_suggester_options(&json!({"fuzzy": true}));
+        let suggestions = ok(service.suggest("items", "sg", "bostn", 5, None, &raw));
+        assert_eq!(suggestions.len(), 2);
+        let completions = ok(service.autocomplete("items", "sg", "bostn", 5, None, &raw));
+        assert_eq!(completions.len(), 2);
+        // A non-boolean fuzzy flag is rejected.
+        let raw = raw_suggester_options(&json!({"fuzzy": "yes"}));
+        let api_error = err(service.suggest("items", "sg", "bos", 5, None, &raw));
+        assert_eq!(api_error.code.as_str(), "InvalidQuery");
+    }
+
+    #[test]
+    fn suggest_highlight_tags_wrap_matched_text() {
+        let service = suggester_docs();
+        // No tags: plain matched word (current behaviour).
+        let suggestions = ok(service.suggest(
+            "items",
+            "sg",
+            "bos",
+            5,
+            None,
+            &RawSuggesterOptions::default(),
+        ));
+        assert_eq!(suggestions[0].text, "Boston");
+        // Both tags: the matched portion of @search.text is wrapped.
+        let raw =
+            raw_suggester_options(&json!({"highlightPreTag": "<b>", "highlightPostTag": "</b>"}));
+        let suggestions = ok(service.suggest("items", "sg", "bos", 5, None, &raw));
+        assert_eq!(suggestions[0].text, "<b>Bos</b>ton");
+        // A lone tag disables highlighting (matching Azure).
+        let raw = raw_suggester_options(&json!({"highlightPreTag": "<b>"}));
+        let suggestions = ok(service.suggest("items", "sg", "bos", 5, None, &raw));
+        assert_eq!(suggestions[0].text, "Boston");
+        // minimumCoverage is accepted but inert.
+        let raw = raw_suggester_options(&json!({"minimumCoverage": 50.0}));
+        let suggestions = ok(service.suggest("items", "sg", "bos", 5, None, &raw));
+        assert_eq!(suggestions.len(), 2);
+        let completions = ok(service.autocomplete("items", "sg", "bos", 5, None, &raw));
+        assert_eq!(completions.len(), 2);
     }
 
     #[test]

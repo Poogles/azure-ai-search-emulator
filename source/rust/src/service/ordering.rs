@@ -84,17 +84,24 @@ fn compare_scored(
     a.0.key.cmp(&b.0.key)
 }
 
-/// Compares two documents on `field` by a comparable sort key. A missing
-/// value sorts first in ascending order and last in descending order (the
-/// `Option` key orders `None` below `Some`, and `descending` reverses it),
-/// matching Azure's null ordering.
+/// Compares two documents on `field` by a comparable sort key (nested paths
+/// such as `Address/Geo/Lat` resolve through complex types; the first
+/// resolved value orders the document). A missing value sorts first in
+/// ascending order and last in descending order (the `Option` key orders
+/// `None` below `Some`, and `descending` reverses it), matching Azure's null
+/// ordering.
 fn compare_field(a: &Document, b: &Document, field: &str, descending: bool) -> std::cmp::Ordering {
-    let ordering = sort_key(a.fields.get(field)).cmp(&sort_key(b.fields.get(field)));
+    let ordering = sort_key(first_resolved(a, field)).cmp(&sort_key(first_resolved(b, field)));
     if descending {
         ordering.reverse()
     } else {
         ordering
     }
+}
+
+/// The first value a field path resolves to in a document, if any.
+fn first_resolved<'a>(document: &'a Document, field: &str) -> Option<&'a Value> {
+    document.resolve_path(field).into_iter().next()
 }
 
 /// A comparable key for a document field value. The `Option` wrapper puts

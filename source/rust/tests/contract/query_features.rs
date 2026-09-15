@@ -389,6 +389,67 @@ async fn index_referencing_missing_synonym_map_returns_400() {
     assert_eq!(body["error"]["code"], "InvalidIndex");
 }
 
+#[tokio::test]
+async fn field_level_synonym_maps_expand_search_terms() {
+    let app = app();
+    let uri = format!("/synonymmaps?api-version={API_VERSION}");
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            &uri,
+            Some(API_KEY),
+            Some(json!({"name": "m", "format": "solr", "synonyms": "WA, Washington"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // SDK wire format: per-field `synonymMaps` (from `synonym_map_names`).
+    let mut definition = index_definition("items");
+    if let Some(fields) = definition.get_mut("fields").and_then(Value::as_array_mut) {
+        for field in fields.iter_mut() {
+            if field.get("name").and_then(Value::as_str) == Some("title") {
+                field["synonymMaps"] = json!(["m"]);
+            }
+        }
+    }
+    let (status, _) = create_custom_index(&app, definition).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        upload_request(
+            "items",
+            json!([
+                {"@search.action": "upload", "document": {"id": "1", "title": "hotels in Washington"}},
+                {"@search.action": "upload", "document": {"id": "2", "title": "flights to Boston"}}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = call(app, search_request("items", json!({"search": "wa"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&body), vec!["1"]);
+}
+
+#[tokio::test]
+async fn field_level_synonym_map_missing_returns_400() {
+    let app = app();
+    let mut definition = index_definition("items");
+    if let Some(fields) = definition.get_mut("fields").and_then(Value::as_array_mut) {
+        for field in fields.iter_mut() {
+            if field.get("name").and_then(Value::as_str) == Some("title") {
+                field["synonymMaps"] = json!(["missing"]);
+            }
+        }
+    }
+    let (status, body) = create_custom_index(&app, definition).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "InvalidIndex");
+}
+
 // ---------------------------------------------------------------------------
 // Sentence-window highlights
 // ---------------------------------------------------------------------------

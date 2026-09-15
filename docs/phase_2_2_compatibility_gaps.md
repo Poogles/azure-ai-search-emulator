@@ -104,7 +104,7 @@ All operate on `Edm.String` field values:
 
 ### 3. Suggest and autocomplete option support
 
-**Current state:** `select`, `searchFields`, `orderby`, fuzzy matching, highlight tags, `autocompleteMode`, and `minimumCoverage` are accepted but inert on the suggest/autocomplete routes.
+**Current state:** Implemented — `searchFields`, `select` (suggest), `orderby`, `autocompleteMode` (`oneTerm`/`twoTerms`/`oneTermWithContext`), `fuzzy`, and highlight tags are parsed, validated, and applied on the suggest/autocomplete routes; `minimumCoverage` is accepted but inert (unit + contract + Python/C# SDK tests green).
 
 **Target:** Implement the options that affect result content and ordering.
 
@@ -130,20 +130,21 @@ All operate on `Edm.String` field values:
 
 #### 3d. `autocompleteMode`
 
-- `twoTermAnd` (default): both terms of a two-word prefix must match (AND).
-- `twoTermOr`: either term may match (OR).
-- `twoTermAndStopWord`: like `twoTermAnd` but stopword terms are dropped before matching.
-- `twoTermOrStopWord`: like `twoTermOr` but stopword terms are dropped before matching.
-- Applies only when the search text contains two or more whitespace-separated terms.
-- Single-term searches are unaffected by `autocompleteMode`.
+Implemented against the SDK wire format (`autocompleteMode`: `oneTerm` / `twoTerms` / `oneTermWithContext`; the `mode` SDK parameter). Note: the `twoTermAnd` / `twoTermOr` / stopword values drafted here do not exist in the Azure SDK wire format and were not implemented.
+
+- `oneTerm` (default): only the last whitespace-separated term is completed (`queryPlusText` replaces the last input term with the completion; single-term input keeps the `"<input> <completion>"` shape).
+- `twoTerms`: matching consecutive two-word index phrases are suggested (`"new y"` → `"New York"`; `queryPlusText` is the completed phrase with any earlier input terms prepended).
+- `oneTermWithContext`: like `oneTerm`, but every preceding term must appear (case-insensitive infix) in the candidate document.
+- Applies only when the search text contains two or more whitespace-separated terms; single-term input behaves as `oneTerm` in every mode.
+- Unknown values → `400 InvalidQuery`.
 
 #### 3e. Fuzzy matching
 
-- `fuzzy: true` (or `fuzzyMinEditDistance: N`): enable edit-distance matching on suggest/autocomplete terms.
-- Default edit distance: 2 (matching Azure's default for suggest).
-- Maximum edit distance: 2 (same as search fuzzy).
-- Fuzzy matching applies to the prefix/infix match: a field word matches if its edit distance to the search term is ≤ the configured distance.
-- Fuzzy terms are lowercased only (no stemming), matching the search fuzzy behaviour.
+Implemented against the SDK wire format (`fuzzy` boolean from `useFuzzyMatching`; there is no `fuzzyMinEditDistance` in the SDK wire format).
+
+- `fuzzy: true`: enable 1-edit (Levenshtein ≤ 1) typo-tolerant matching in addition to the infix match, on both routes.
+- `fuzzy: false` / absent: exact infix matching only (current behaviour).
+- Non-boolean values → `400 InvalidQuery`.
 
 #### 3f. `minimumCoverage`
 
@@ -460,7 +461,9 @@ source/rust/src/
 - [x] Index referencing a non-existent synonym map → `400 InvalidIndex`.
 - [x] Synonym expansion does not affect filter/orderby/facets/select.
 - [x] Contract tests: synonym-expanded search returns correct results.
-- [ ] Python SDK test: create map + index, search with synonym term.
+- [x] Python SDK test: create map + index, search with synonym term.
+- [x] C# SDK test: mirror of the Python synonym-expansion scenario.
+- [x] Per-field `synonymMaps` (SDK wire format) unioned with index-level array.
 
 ### Filter extensions
 
@@ -471,30 +474,35 @@ source/rust/src/
 - [x] Type mismatch rejection (date function on non-date, string function on non-string).
 - [x] Invalid regex → `400 InvalidQuery`.
 - [x] Contract tests: each function, combined expressions, error cases.
-- [ ] Python SDK test: filter with date/string functions, `ismatch`, lambda subfield.
+- [x] Python SDK test: filter with date/string functions, `ismatch`, lambda subfield.
+- [x] C# SDK test: mirror of the Python filter-functions scenario.
 
 ### Suggest/autocomplete
 
-- [ ] `searchFields` restricts matching to listed fields.
-- [ ] `select` limits returned fields in suggest results.
-- [ ] `orderby` re-orders results by sortable field.
-- [ ] `autocompleteMode`: `twoTermAnd`, `twoTermOr`, `twoTermAndStopWord`, `twoTermOrStopWord`.
-- [ ] Fuzzy matching: `fuzzy=true` / `fuzzyMinEditDistance=N` (max 2).
-- [ ] Highlight tags on `@search.text`.
-- [ ] `minimumCoverage` remains inert (documented).
-- [ ] Contract tests: each option, combined options, error cases.
-- [ ] Python SDK test: suggest/autocomplete with new options.
+- [x] `searchFields` restricts matching to listed fields.
+- [x] `select` limits returned fields in suggest results.
+- [x] `orderby` re-orders results by sortable field.
+- [x] `autocompleteMode`: `oneTerm`, `twoTerms`, `oneTermWithContext` (SDK wire format; the `twoTerm*` values drafted earlier do not exist in the SDK).
+- [x] Fuzzy matching: `fuzzy=true` (1-edit tolerance; no `fuzzyMinEditDistance` in the SDK wire format).
+- [x] Highlight tags on `@search.text`.
+- [x] `minimumCoverage` remains inert (documented).
+- [x] Contract tests: each option, combined options, error cases.
+- [x] Python SDK test: suggest/autocomplete with new options.
+- [x] C# SDK test: mirror of the Python suggest/autocomplete scenario.
 
 ### Schema extensions
 
-- [ ] Nested complex types: schema validation (3+ levels), document validation, filter paths, full-text indexing.
-- [ ] `Edm.Int8`, `Edm.Int16`: accepted, range-validated, filterable, sortable.
-- [ ] `Edm.Time`: accepted, lexicographic comparison, filterable, sortable.
-- [ ] `Edm.Duration`: accepted, `eq`/`ne` only, filterable.
-- [ ] `Edm.Binary`: accepted, `eq`/`ne` only, filterable; `Collection(Edm.Binary)` accepted.
-- [ ] Nested `select` paths: `A/B/C`, collection-of-complex subfield projection.
-- [ ] Contract tests: nested schema creation, document upload, filter, select.
-- [ ] Python SDK test: nested complex type index, additional Edm types, nested select.
+**Current state:** Implemented — complex types nest to any depth (schema, document, filter, orderby/facet, full-text, lambda, and select paths all recurse); `Edm.Int8`/`Edm.SByte`, `Edm.Int16`, `Edm.Time`, `Edm.Duration`, `Edm.Binary` (+ `Collection(Edm.Binary)` and narrow-int collections) are accepted with range/format validation and typed filter support; nested `select` paths project sub-objects (unit + contract + Python/C# SDK tests green).
+
+- [x] Nested complex types: schema validation (3+ levels), document validation, filter paths, full-text indexing.
+- [x] `Edm.Int8`, `Edm.Int16`: accepted, range-validated, filterable, sortable.
+- [x] `Edm.Time`: accepted, lexicographic comparison, filterable, sortable.
+- [x] `Edm.Duration`: accepted, `eq`/`ne` only, filterable.
+- [x] `Edm.Binary`: accepted, `eq`/`ne` only, filterable; `Collection(Edm.Binary)` accepted.
+- [x] Nested `select` paths: `A/B/C`, collection-of-complex subfield projection.
+- [x] Contract tests: nested schema creation, document upload, filter, select.
+- [x] Python SDK test: nested complex type index, additional Edm types, nested select.
+- [x] C# SDK test: mirror of the Python schema-extensions scenarios.
 
 ### Full-text indexing of non-string fields
 

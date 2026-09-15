@@ -26,20 +26,28 @@ const SUPPORTED_FIELD_TYPES: &[FieldType] = &[
     FieldType::String,
     FieldType::Int32,
     FieldType::Int64,
+    FieldType::Int8,
+    FieldType::Int16,
     FieldType::Single,
     FieldType::Double,
     FieldType::Boolean,
     FieldType::DateTimeOffset,
+    FieldType::Time,
+    FieldType::Duration,
+    FieldType::Binary,
     FieldType::Guid,
     FieldType::GeographyPoint,
     FieldType::CollectionString,
     FieldType::CollectionInt32,
     FieldType::CollectionInt64,
+    FieldType::CollectionInt8,
+    FieldType::CollectionInt16,
     FieldType::CollectionSingle,
     FieldType::CollectionDouble,
     FieldType::CollectionHalf,
     FieldType::CollectionBoolean,
     FieldType::CollectionDateTimeOffset,
+    FieldType::CollectionBinary,
     FieldType::CollectionGuid,
 ];
 
@@ -97,6 +105,13 @@ pub(crate) fn validate_schema(
                     .map(FieldType::as_str)
                     .collect::<Vec<_>>()
                     .join(", ")
+            )));
+        }
+        if field.sortable && field.field_type.is_equality_only() {
+            return Err(ApiError::invalid_index(format!(
+                "Field {:?} has type {:?}, which supports only eq/ne comparisons and cannot be sortable.",
+                field.name,
+                field.field_type.as_str()
             )));
         }
     }
@@ -262,33 +277,75 @@ pub(crate) fn validate_subfields(field: &FieldDefinition) -> Result<(), ApiError
             field.name
         )));
     }
+    validate_subfields_at(&field.subfields, &field.name)
+}
+
+/// Recursively validates the subfields of a (possibly nested) complex type:
+/// each level's names are unique, subfields may be scalar,
+/// collection-of-scalar, or further complex types (to any depth), and no
+/// subfield may be a key or a vector field. Complex-typed subfields cannot
+/// themselves be searchable, sortable, or facetable (set those attributes on
+/// their scalar subfields instead). `path` is the `/`-joined path to the
+/// complex field holding `subfields`, for error messages.
+fn validate_subfields_at(subfields: &[FieldDefinition], path: &str) -> Result<(), ApiError> {
     let mut seen = std::collections::BTreeSet::new();
-    for subfield in &field.subfields {
+    for subfield in subfields {
         ensure_unique(&mut seen, subfield.name.as_str(), || {
             format!(
-                "Duplicate subfield name {:?} in complex type field {:?}.",
-                subfield.name, field.name
+                "Duplicate subfield name {:?} in complex type field {path:?}.",
+                subfield.name
             )
         })?;
         if subfield.is_key {
             return Err(ApiError::invalid_index(format!(
-                "Subfield {:?} of complex type field {:?} cannot be a key.",
-                subfield.name, field.name
+                "Subfield {:?} of complex type field {path:?} cannot be a key.",
+                subfield.name
             )));
         }
         if subfield.has_dimensions_property() || subfield.vector_search_profile.is_some() {
             return Err(ApiError::invalid_index(format!(
-                "Subfield {:?} of complex type field {:?} cannot be a vector field.",
-                subfield.name, field.name
+                "Subfield {:?} of complex type field {path:?} cannot be a vector field.",
+                subfield.name
             )));
+        }
+        if subfield.is_complex_type() {
+            if subfield.searchable || subfield.sortable || subfield.facetable {
+                return Err(ApiError::invalid_index(format!(
+                    "Subfield {:?} of complex type field {path:?} is a complex type and cannot be \
+                     searchable, sortable, or facetable; set those attributes on its subfields instead.",
+                    subfield.name
+                )));
+            }
+            if subfield.subfields.is_empty() {
+                return Err(ApiError::invalid_index(format!(
+                    "Complex type subfield {:?} of complex type field {path:?} must define a \
+                     non-empty \"fields\" array of subfields.",
+                    subfield.name
+                )));
+            }
+            let nested_path = format!("{path}/{}", subfield.name);
+            validate_subfields_at(&subfield.subfields, &nested_path)?;
+            continue;
         }
         if !SUPPORTED_FIELD_TYPES.contains(&subfield.field_type) {
             return Err(ApiError::invalid_index(format!(
-                "Unsupported subfield type {:?} for subfield {:?} of complex type field {:?}. \
-                     Subfields must be scalar or collection-of-scalar types.",
+                "Unsupported subfield type {:?} for subfield {:?} of complex type field {path:?}. \
+                 Supported types: {}.",
                 subfield.field_type.as_str(),
                 subfield.name,
-                field.name
+                SUPPORTED_FIELD_TYPES
+                    .iter()
+                    .map(FieldType::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        if subfield.sortable && subfield.field_type.is_equality_only() {
+            return Err(ApiError::invalid_index(format!(
+                "Subfield {:?} of complex type field {path:?} has type {:?}, which supports only \
+                 eq/ne comparisons and cannot be sortable.",
+                subfield.name,
+                subfield.field_type.as_str()
             )));
         }
     }
@@ -340,9 +397,9 @@ pub(crate) fn check_field_type(field: &FieldDefinition, value: &Value) -> Result
     let ok = if let Some(inner) = field_type.inner_type() {
         value
             .as_array()
-            .is_some_and(|items| items.iter().all(|item| type_ok(&inner, item)))
+            .is_some_and(|items| items.iter().all(|item| scalar_type_ok(&inner, item)))
     } else {
-        type_ok(field_type, value)
+        scalar_type_ok(field_type, value)
     };
     if ok {
         Ok(())
@@ -350,6 +407,26 @@ pub(crate) fn check_field_type(field: &FieldDefinition, value: &Value) -> Result
         let hint = if matches!(field_type, FieldType::GeographyPoint) {
             " Expected a GeoJSON point object \
              {\"type\": \"Point\", \"coordinates\": [lon, lat]} or a string."
+        } else if matches!(
+            field_type.inner_type().as_ref().unwrap_or(field_type),
+            FieldType::Int8 | FieldType::Int16
+        ) {
+            " Expected an integer in range."
+        } else if matches!(
+            field_type.inner_type().as_ref().unwrap_or(field_type),
+            FieldType::Time
+        ) {
+            " Expected a time-of-day string \"HH:MM:SS\" (fractional seconds allowed)."
+        } else if matches!(
+            field_type.inner_type().as_ref().unwrap_or(field_type),
+            FieldType::Duration
+        ) {
+            " Expected an ISO 8601 duration string (e.g. \"P1DT2H\")."
+        } else if matches!(
+            field_type.inner_type().as_ref().unwrap_or(field_type),
+            FieldType::Binary
+        ) {
+            " Expected a base64-encoded string."
         } else {
             ""
         };
@@ -493,17 +570,227 @@ pub(crate) fn is_geography_point(value: &Value) -> bool {
         })
 }
 
-/// Whether a value is compatible with a scalar `Edm.*` field type. The single
-/// scalar type check: used directly for scalar fields and per-element for
-/// `Edm.Collection(...)` fields. Unknown types pass (schema validation has
-/// already rejected unsupported types).
-pub(crate) fn type_ok(inner: &FieldType, value: &Value) -> bool {
+/// Whether a value is compatible with a scalar `Edm.*` type, including the
+/// range and format rules for the narrow integer, time, duration, and binary
+/// types: `Edm.Int8` accepts integers in -128–127, `Edm.Int16` in
+/// -32768–32767, `Edm.Time` accepts zero-padded `"HH:MM:SS"` strings
+/// (optional fractional seconds), `Edm.Duration` accepts ISO 8601 duration
+/// strings, and `Edm.Binary` accepts base64-encoded strings.
+pub(crate) fn scalar_type_ok(inner: &FieldType, value: &Value) -> bool {
     match inner {
         FieldType::String | FieldType::DateTimeOffset | FieldType::Guid => value.is_string(),
         FieldType::GeographyPoint => is_geography_point(value),
         FieldType::Int32 | FieldType::Int64 => value.is_i64() || value.is_u64(),
+        FieldType::Int8 => int_in_range(value, -128, 127),
+        FieldType::Int16 => int_in_range(value, -32_768, 32_767),
+        FieldType::Time => value.as_str().is_some_and(is_time_string),
+        FieldType::Duration => value.as_str().is_some_and(is_duration_string),
+        FieldType::Binary => value.as_str().is_some_and(is_base64_string),
         FieldType::Single | FieldType::Double => value.is_number(),
         FieldType::Boolean => value.is_boolean(),
         _ => true,
+    }
+}
+
+/// Whether a JSON value is an integer in the inclusive range `[min, max]`.
+fn int_in_range(value: &Value, min: i64, max: i64) -> bool {
+    if let Some(n) = value.as_i64() {
+        (min..=max).contains(&n)
+    } else if let Some(n) = value.as_u64() {
+        i64::try_from(n).is_ok_and(|n| (min..=max).contains(&n))
+    } else {
+        false
+    }
+}
+
+/// Whether a string is a time of day in `"HH:MM:SS"` form with an optional
+/// fractional-seconds suffix (`"10:30:45"`, `"10:30:45.123"`). Hours are
+/// 00–23, minutes and seconds 00–59. Zero-padded fixed width keeps
+/// lexicographic comparison chronological.
+pub(crate) fn is_time_string(text: &str) -> bool {
+    let (time, fraction) = match text.split_once('.') {
+        Some((time, fraction)) => (time, Some(fraction)),
+        None => (text, None),
+    };
+    if let Some(fraction) = fraction {
+        if fraction.is_empty()
+            || fraction.len() > 9
+            || !fraction.bytes().all(|b| b.is_ascii_digit())
+        {
+            return false;
+        }
+    }
+    let mut parts = time.split(':');
+    let (Some(hour), Some(minute), Some(second), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    hour.len() == 2
+        && minute.len() == 2
+        && second.len() == 2
+        && hour.parse::<u32>().is_ok_and(|h| h <= 23)
+        && minute.parse::<u32>().is_ok_and(|m| m <= 59)
+        && second.parse::<u32>().is_ok_and(|s| s <= 59)
+}
+
+/// Whether a string is an ISO 8601 duration (`"P1Y2M3DT4H5M6S"`,
+/// `"PT30S"`, `"P1W"`): a leading `P` with date and/or time components. At
+/// least one component is required; time components follow a `T` separator.
+pub(crate) fn is_duration_string(text: &str) -> bool {
+    let rest = text.strip_prefix('P').unwrap_or("");
+    if rest.is_empty() {
+        return false;
+    }
+    let (date_part, time_part) = match rest.split_once('T') {
+        Some((date, time)) => (date, Some(time)),
+        None => (rest, None),
+    };
+    // A bare `T` separator with no time components is invalid, as is a
+    // second `T`.
+    if time_part.is_some_and(|time| time.is_empty() || time.contains('T')) {
+        return false;
+    }
+    let mut has_component = false;
+    for (part, markers) in [(date_part, "YMWD"), (time_part.unwrap_or(""), "HMS")] {
+        let mut current = part;
+        for marker in markers.chars() {
+            // Each component is `<number><marker>`; at most one of each.
+            // Seconds additionally allow fractional values (`PT0.5S`).
+            let Some((number, after)) = current.split_once(marker) else {
+                continue;
+            };
+            let number_ok = if marker == 'S' {
+                is_duration_seconds(number)
+            } else {
+                !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
+            };
+            if !number_ok {
+                return false;
+            }
+            has_component = true;
+            current = after;
+        }
+        if !current.is_empty() {
+            return false;
+        }
+    }
+    // Week (`W`) cannot be combined with other components.
+    if date_part.contains('W') {
+        let digits = date_part.strip_suffix('W').unwrap_or("");
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        return time_part.is_none() && has_component;
+    }
+    has_component
+}
+
+/// Whether a duration seconds component is valid: digits with an optional
+/// single fractional part (`"6"`, `"0.5"`).
+fn is_duration_seconds(number: &str) -> bool {
+    match number.split_once('.') {
+        Some((whole, fraction)) => {
+            !whole.is_empty()
+                && !fraction.is_empty()
+                && whole.bytes().all(|b| b.is_ascii_digit())
+                && fraction.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()),
+    }
+}
+
+/// Whether a string is base64-decodable (standard or URL-safe alphabet).
+fn is_base64_string(text: &str) -> bool {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(text))
+        .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn time_strings_require_zero_padded_clock_form() {
+        for valid in [
+            "00:00:00",
+            "10:30:45",
+            "23:59:59",
+            "10:30:45.123",
+            "01:02:03.000000001",
+        ] {
+            assert!(is_time_string(valid), "expected valid: {valid:?}");
+        }
+        for invalid in [
+            "",
+            "10:30",
+            "10:30:45:00",
+            "24:00:00",
+            "10:60:00",
+            "10:30:60",
+            "1:02:03",
+            "10:30:45.",
+            "10:30:45.1234567890",
+            "10:30:45Z",
+            "not a time",
+        ] {
+            assert!(!is_time_string(invalid), "expected invalid: {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn duration_strings_require_iso_8601_form() {
+        for valid in [
+            "P1D",
+            "P1Y2M3DT4H5M6S",
+            "PT30S",
+            "PT0.5S",
+            "P1W",
+            "P2M",
+            "PT1H",
+        ] {
+            assert!(is_duration_string(valid), "expected valid: {valid:?}");
+        }
+        for invalid in [
+            "", "P", "PT", "1D", "P1X", "P1Y2Y", "PT1S1H", "P1W2D", "P1WT2H", "T1H", "P1DT",
+        ] {
+            assert!(
+                !is_duration_string(invalid),
+                "expected invalid: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_integers_enforce_range() {
+        assert!(scalar_type_ok(&FieldType::Int8, &json!(127)));
+        assert!(scalar_type_ok(&FieldType::Int8, &json!(-128)));
+        assert!(!scalar_type_ok(&FieldType::Int8, &json!(128)));
+        assert!(!scalar_type_ok(&FieldType::Int8, &json!(-129)));
+        assert!(!scalar_type_ok(&FieldType::Int8, &json!(1.5)));
+        assert!(!scalar_type_ok(&FieldType::Int8, &json!("5")));
+        assert!(scalar_type_ok(&FieldType::Int16, &json!(32_767)));
+        assert!(scalar_type_ok(&FieldType::Int16, &json!(-32_768)));
+        assert!(!scalar_type_ok(&FieldType::Int16, &json!(32_768)));
+        assert!(!scalar_type_ok(&FieldType::Int16, &json!(-32_769)));
+    }
+
+    #[test]
+    fn time_duration_binary_accept_formatted_strings() {
+        assert!(scalar_type_ok(&FieldType::Time, &json!("10:30:45")));
+        assert!(!scalar_type_ok(&FieldType::Time, &json!("10:30")));
+        assert!(!scalar_type_ok(&FieldType::Time, &json!(103_045)));
+        assert!(scalar_type_ok(&FieldType::Duration, &json!("P1DT2H")));
+        assert!(!scalar_type_ok(&FieldType::Duration, &json!("tomorrow")));
+        assert!(scalar_type_ok(&FieldType::Binary, &json!("aGVsbG8=")));
+        assert!(!scalar_type_ok(
+            &FieldType::Binary,
+            &json!("*** not base64 ***")
+        ));
+        assert!(!scalar_type_ok(&FieldType::Binary, &json!(42)));
     }
 }

@@ -21,6 +21,16 @@ pub enum FieldType {
     DateTimeOffset,
     Guid,
     GeographyPoint,
+    /// `Edm.Int8` (REST spelling; the SDKs send `Edm.SByte`).
+    Int8,
+    /// `Edm.Int16`.
+    Int16,
+    /// `Edm.Time` (time of day, `"HH:MM:SS[.fraction]"`).
+    Time,
+    /// `Edm.Duration` (ISO 8601 duration, `"P1DT2H"`).
+    Duration,
+    /// `Edm.Binary` (base64 string).
+    Binary,
     ComplexType,
     Half,
     CollectionString,
@@ -32,6 +42,9 @@ pub enum FieldType {
     CollectionBoolean,
     CollectionDateTimeOffset,
     CollectionGuid,
+    CollectionInt8,
+    CollectionInt16,
+    CollectionBinary,
     CollectionComplexType,
     /// An unrecognized type, kept verbatim for echo in error messages.
     Unknown(String),
@@ -54,11 +67,19 @@ impl FieldType {
             T::DateTimeOffset => Cow::Borrowed("Edm.DateTimeOffset"),
             T::Guid => Cow::Borrowed("Edm.Guid"),
             T::GeographyPoint => Cow::Borrowed("Edm.GeographyPoint"),
+            T::Int8 => Cow::Borrowed("Edm.Int8"),
+            T::Int16 => Cow::Borrowed("Edm.Int16"),
+            T::Time => Cow::Borrowed("Edm.Time"),
+            T::Duration => Cow::Borrowed("Edm.Duration"),
+            T::Binary => Cow::Borrowed("Edm.Binary"),
             T::ComplexType => Cow::Borrowed("Edm.ComplexType"),
             T::Half => Cow::Borrowed("Edm.Half"),
             T::CollectionString => Cow::Borrowed("Edm.Collection(Edm.String)"),
             T::CollectionInt32 => Cow::Borrowed("Edm.Collection(Edm.Int32)"),
             T::CollectionInt64 => Cow::Borrowed("Edm.Collection(Edm.Int64)"),
+            T::CollectionInt8 => Cow::Borrowed("Edm.Collection(Edm.Int8)"),
+            T::CollectionInt16 => Cow::Borrowed("Edm.Collection(Edm.Int16)"),
+            T::CollectionBinary => Cow::Borrowed("Edm.Collection(Edm.Binary)"),
             T::CollectionSingle => Cow::Borrowed("Edm.Collection(Edm.Single)"),
             T::CollectionDouble => Cow::Borrowed("Edm.Collection(Edm.Double)"),
             T::CollectionHalf => Cow::Borrowed("Edm.Collection(Edm.Half)"),
@@ -84,11 +105,20 @@ impl FieldType {
             "Edm.DateTimeOffset" => T::DateTimeOffset,
             "Edm.Guid" => T::Guid,
             "Edm.GeographyPoint" => T::GeographyPoint,
+            // The SDKs serialize Int8 as `Edm.SByte`; accept both spellings.
+            "Edm.Int8" | "Edm.SByte" => T::Int8,
+            "Edm.Int16" => T::Int16,
+            "Edm.Time" => T::Time,
+            "Edm.Duration" => T::Duration,
+            "Edm.Binary" => T::Binary,
             "Edm.ComplexType" => T::ComplexType,
             "Edm.Half" => T::Half,
             "Edm.Collection(Edm.String)" => T::CollectionString,
             "Edm.Collection(Edm.Int32)" => T::CollectionInt32,
             "Edm.Collection(Edm.Int64)" => T::CollectionInt64,
+            "Edm.Collection(Edm.Int8)" | "Edm.Collection(Edm.SByte)" => T::CollectionInt8,
+            "Edm.Collection(Edm.Int16)" => T::CollectionInt16,
+            "Edm.Collection(Edm.Binary)" => T::CollectionBinary,
             "Edm.Collection(Edm.Single)" => T::CollectionSingle,
             "Edm.Collection(Edm.Double)" => T::CollectionDouble,
             "Edm.Collection(Edm.Half)" => T::CollectionHalf,
@@ -114,6 +144,9 @@ impl FieldType {
             T::CollectionBoolean => Some(T::Boolean),
             T::CollectionDateTimeOffset => Some(T::DateTimeOffset),
             T::CollectionGuid => Some(T::Guid),
+            T::CollectionInt8 => Some(T::Int8),
+            T::CollectionInt16 => Some(T::Int16),
+            T::CollectionBinary => Some(T::Binary),
             T::CollectionComplexType => Some(T::ComplexType),
             _ => None,
         }
@@ -134,6 +167,9 @@ impl FieldType {
                 | T::CollectionBoolean
                 | T::CollectionDateTimeOffset
                 | T::CollectionGuid
+                | T::CollectionInt8
+                | T::CollectionInt16
+                | T::CollectionBinary
                 | T::CollectionComplexType
         )
     }
@@ -145,6 +181,15 @@ impl FieldType {
             self,
             FieldType::ComplexType | FieldType::CollectionComplexType
         )
+    }
+
+    /// Whether this type supports only `eq`/`ne` filters (ordering
+    /// comparisons are ambiguous): `Edm.Duration` and `Edm.Binary` (scalar
+    /// or collection forms).
+    #[must_use]
+    pub fn is_equality_only(&self) -> bool {
+        use FieldType as T;
+        matches!(self, T::Duration | T::Binary | T::CollectionBinary)
     }
 
     /// Whether this type can back a vector field.
@@ -191,6 +236,11 @@ pub struct FieldDefinition {
     /// The field's declared analyzer name (`analyzer` property); `None` means
     /// the index default (the emulator's English analyzer).
     pub analyzer: Option<String>,
+    /// Synonym maps associated with this field (`synonymMaps` property, as
+    /// sent by the SDKs via `synonym_map_names` / `SynonymMapNames`). Only
+    /// these maps plus the index-level `synonymMaps` are applied to full-text
+    /// search on this index.
+    pub synonym_maps: Vec<String>,
     /// The raw JSON field definition, preserved for echo in responses.
     pub raw: Value,
 }
@@ -239,6 +289,19 @@ impl FieldDefinition {
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
         let analyzer = get_opt_string(obj, "analyzer");
+        let synonym_maps = obj
+            .get("synonymMaps")
+            .or_else(|| obj.get("synonym_map_names"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(FieldDefinition {
             name: name.to_owned(),
             field_type: FieldType::from_normalized(&normalize_field_type(field_type)),
@@ -252,6 +315,7 @@ impl FieldDefinition {
             retrievable: get_bool(obj, "retrievable", true),
             subfields,
             analyzer,
+            synonym_maps,
             raw,
         })
     }
@@ -321,6 +385,16 @@ fn get_opt_string(obj: &Map<String, Value>, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
+}
+
+/// Collects per-field `synonymMaps` (including nested complex subfields)
+/// into `out`. The SDK wire format attaches synonym maps to searchable
+/// fields; the emulator unions them with the index-level array.
+fn collect_field_synonym_maps(field: &FieldDefinition, out: &mut Vec<String>) {
+    out.extend(field.synonym_maps.iter().cloned());
+    for subfield in &field.subfields {
+        collect_field_synonym_maps(subfield, out);
+    }
 }
 
 /// A suggester: a named set of searchable fields that the autocomplete and
@@ -434,7 +508,7 @@ impl IndexDefinition {
             .get("vectorSearch")
             .or_else(|| obj.get("vector_search"))
             .cloned();
-        let synonym_maps = obj
+        let mut synonym_maps: Vec<String> = obj
             .get("synonymMaps")
             .and_then(Value::as_array)
             .map(|items| {
@@ -446,6 +520,15 @@ impl IndexDefinition {
                     .collect()
             })
             .unwrap_or_default();
+        // Per-field `synonymMaps` (the SDK wire format: `synonym_map_names` /
+        // `SynonymMapNames` serialize as `synonymMaps` on the field) are
+        // unioned with the index-level array so both shapes associate maps
+        // with the index. Nested complex subfields are included.
+        for field in &fields {
+            collect_field_synonym_maps(field, &mut synonym_maps);
+        }
+        synonym_maps.sort();
+        synonym_maps.dedup();
         Ok(IndexDefinition {
             name: name.to_owned(),
             fields,

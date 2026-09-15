@@ -526,6 +526,7 @@ mod tests {
                 vector_search_profile: None,
                 subfields: Vec::new(),
                 analyzer: None,
+                synonym_maps: Vec::new(),
                 raw: Value::Null,
             },
             FieldDefinition {
@@ -541,6 +542,7 @@ mod tests {
                 vector_search_profile: None,
                 subfields: Vec::new(),
                 analyzer: None,
+                synonym_maps: Vec::new(),
                 raw: Value::Null,
             },
             FieldDefinition {
@@ -556,6 +558,7 @@ mod tests {
                 vector_search_profile: None,
                 subfields: Vec::new(),
                 analyzer: None,
+                synonym_maps: Vec::new(),
                 raw: Value::Null,
             },
             FieldDefinition {
@@ -571,6 +574,7 @@ mod tests {
                 vector_search_profile: None,
                 subfields: Vec::new(),
                 analyzer: None,
+                synonym_maps: Vec::new(),
                 raw: Value::Null,
             },
             FieldDefinition {
@@ -586,6 +590,7 @@ mod tests {
                 vector_search_profile: None,
                 subfields: Vec::new(),
                 analyzer: None,
+                synonym_maps: Vec::new(),
                 raw: Value::Null,
             },
         ]
@@ -1035,6 +1040,7 @@ mod tests {
             vector_search_profile: None,
             subfields: Vec::new(),
             analyzer: analyzer.map(str::to_owned),
+            synonym_maps: Vec::new(),
             raw: Value::Null,
         }
     }
@@ -1053,6 +1059,7 @@ mod tests {
             vector_search_profile: None,
             subfields: Vec::new(),
             analyzer: None,
+            synonym_maps: Vec::new(),
             raw: Value::Null,
         }
     }

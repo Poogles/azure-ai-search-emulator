@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 use crate::error::{ApiError, ErrorCode};
 use crate::filter::{self, FilterExpr};
 use crate::query::SearchMode;
-use crate::storage::IndexDefinition;
+use crate::storage::{IndexDefinition, Suggester};
 
 use super::types::{Facet, OrderBy, SearchField, VectorFilterMode, VectorQuery};
 use super::validation::{finite_f32, parse_finite_f32_array, FiniteF32ArrayError};
@@ -112,7 +112,7 @@ pub(crate) fn parse_orderby(
             });
             continue;
         }
-        let field_def = definition.field(field).ok_or_else(|| {
+        let field_def = definition.field_path(field).ok_or_else(|| {
             ApiError::invalid_query(format!("orderby references unknown field {field:?}."))
         })?;
         if !field_def.sortable {
@@ -131,9 +131,10 @@ pub(crate) fn parse_orderby(
     Ok((clauses, parts.join(", ")))
 }
 
-/// Parses a `select` value: comma-separated field names (or a JSON array),
-/// each of which must exist in the schema. The special `*` selects every
-/// field, exactly like omitting `select`.
+/// Parses a `select` value: comma-separated field names or paths (or a JSON
+/// array), each of which must resolve in the schema (nested complex-type
+/// paths such as `Address/City` are supported). The special `*` selects
+/// every field, exactly like omitting `select`.
 pub(crate) fn parse_select(
     value: &Value,
     definition: &IndexDefinition,
@@ -144,7 +145,7 @@ pub(crate) fn parse_select(
     }
     let mut fields = Vec::new();
     for part in items {
-        if definition.field(&part).is_none() {
+        if definition.field_path(&part).is_none() {
             return Err(ApiError::invalid_query(format!(
                 "select references unknown field {part:?}."
             )));
@@ -263,7 +264,7 @@ pub(crate) fn parse_facet_entry(
             limit: None,
         });
     } else {
-        let field_def = definition.field(name).ok_or_else(|| {
+        let field_def = definition.field_path(name).ok_or_else(|| {
             ApiError::invalid_query(format!("facets references unknown field {name:?}."))
         })?;
         if !field_def.facetable {
@@ -647,6 +648,88 @@ pub(crate) fn parse_search_fields(
         return Err(ApiError::invalid_query("searchFields is empty."));
     }
     Ok(fields)
+}
+
+/// Parses `searchFields` for the suggest/autocomplete routes: each entry must
+/// be a searchable field of the index (weights are not supported here; a
+/// `field^N` entry is rejected) and must belong to the suggester's configured
+/// fields. Returns `None` when absent (all of the suggester's fields apply).
+pub(crate) fn parse_suggester_search_fields(
+    value: Option<&Value>,
+    definition: &IndexDefinition,
+    suggester: &Suggester,
+) -> Result<Option<Vec<String>>, ApiError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let mut fields = Vec::new();
+    for part in string_items(value, "searchFields")? {
+        if part.contains('^') {
+            return Err(ApiError::invalid_query(format!(
+                "Invalid searchFields entry {part:?} on suggest/autocomplete; \
+                 weights ('field^N') are only supported on the search route."
+            )));
+        }
+        let field_def = definition.field_path(&part).ok_or_else(|| {
+            ApiError::invalid_query(format!("searchFields references unknown field {part:?}."))
+        })?;
+        if !field_def.searchable {
+            return Err(ApiError::invalid_query(format!(
+                "Field {part:?} is not searchable; only searchable fields can be used in searchFields."
+            )));
+        }
+        if !suggester.search_fields.iter().any(|f| f == &part) {
+            return Err(ApiError::invalid_query(format!(
+                "Field {part:?} is not part of the suggester; searchFields must be \
+                 a subset of the suggester's search fields."
+            )));
+        }
+        fields.push(part);
+    }
+    if fields.is_empty() {
+        return Err(ApiError::invalid_query("searchFields is empty."));
+    }
+    Ok(Some(fields))
+}
+
+/// Parses `orderby` for the suggest/autocomplete routes: same validation as
+/// the search route (fields must exist and be `sortable`), except the
+/// pseudo-field `@search.score` is rejected (these routes compute no score).
+pub(crate) fn parse_suggester_orderby(
+    value: Option<&Value>,
+    definition: &IndexDefinition,
+) -> Result<Vec<OrderBy>, ApiError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let (clauses, _) = parse_orderby(value, definition)?;
+    if clauses.iter().any(|c| c.field == "@search.score") {
+        return Err(ApiError::invalid_query(
+            "orderby references \"@search.score\", which is not available on \
+             the suggest/autocomplete routes.",
+        ));
+    }
+    Ok(clauses)
+}
+
+/// Parses the `fuzzy` flag for the suggest/autocomplete routes: a boolean
+/// enabling 1-edit typo-tolerant matching. Absent means exact matching.
+pub(crate) fn parse_suggester_fuzzy(value: Option<&Value>) -> Result<bool, ApiError> {
+    match value {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(flag)) => Ok(*flag),
+        Some(_) => Err(ApiError::invalid_query("fuzzy must be a boolean.")),
+    }
+}
+
+/// Validates `minimumCoverage` on the suggest/autocomplete routes: it must be
+/// a number when present, and is otherwise ignored (prefix/infix matching is
+/// not coverage-based; see `docs/known_differences.md`).
+pub(crate) fn validate_suggester_minimum_coverage(value: Option<&Value>) -> Result<(), ApiError> {
+    match value {
+        None | Some(Value::Null | Value::Number(_)) => Ok(()),
+        Some(_) => Err(ApiError::invalid_query("minimumCoverage must be a number.")),
+    }
 }
 
 /// Parses the `highlight` / `highlightPreTag` / `highlightPostTag` options.

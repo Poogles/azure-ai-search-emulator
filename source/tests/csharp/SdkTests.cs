@@ -382,6 +382,197 @@ public class SdkTests : EmulatorTestBase
     }
 
     [Fact]
+    public async Task NestedComplexTypes()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(new SearchIndex(IndexName)
+        {
+            Fields =
+            {
+                new SearchField("id", SearchFieldDataType.String) { IsKey = true, IsFilterable = true },
+                new SearchField("address", SearchFieldDataType.Complex)
+                {
+                    Fields =
+                    {
+                        new SearchableField("city") { IsFilterable = true },
+                        new SearchField("geo", SearchFieldDataType.Complex)
+                        {
+                            Fields =
+                            {
+                                new SearchableField("label") { IsFilterable = true },
+                                new SimpleField("lat", SearchFieldDataType.Double)
+                                {
+                                    IsFilterable = true, IsSortable = true,
+                                },
+                            },
+                        },
+                        new SearchField("stays", SearchFieldDataType.Collection(SearchFieldDataType.Complex))
+                        {
+                            Fields =
+                            {
+                                new SearchField("type", SearchFieldDataType.String) { IsFilterable = true },
+                                new SearchField("room", SearchFieldDataType.Complex)
+                                {
+                                    Fields =
+                                    {
+                                        new SimpleField("floor", SearchFieldDataType.Int32) { IsFilterable = true },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        });
+        var results = await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument
+            {
+                ["id"] = "1",
+                ["address"] = new Dictionary<string, object>
+                {
+                    ["city"] = "Miami",
+                    ["geo"] = new Dictionary<string, object> { ["lat"] = 25.7, ["label"] = "beachfront" },
+                    ["stays"] = new[]
+                    {
+                        new Dictionary<string, object>
+                        {
+                            ["type"] = "suite",
+                            ["room"] = new Dictionary<string, object> { ["floor"] = 3 },
+                        },
+                        new Dictionary<string, object>
+                        {
+                            ["type"] = "standard",
+                            ["room"] = new Dictionary<string, object> { ["floor"] = 1 },
+                        },
+                    },
+                },
+            },
+            new SearchDocument
+            {
+                ["id"] = "2",
+                ["address"] = new Dictionary<string, object>
+                {
+                    ["city"] = "Seattle",
+                    ["geo"] = new Dictionary<string, object> { ["lat"] = 47.6, ["label"] = "downtown" },
+                    ["stays"] = new[]
+                    {
+                        new Dictionary<string, object>
+                        {
+                            ["type"] = "standard",
+                            ["room"] = new Dictionary<string, object> { ["floor"] = 2 },
+                        },
+                    },
+                },
+            },
+        });
+        Assert.All(results.Value.Results, r => Assert.True(r.Succeeded));
+
+        async Task<string[]> IdsForAsync(string filter) =>
+            (await RunSearch<SearchDocument>(searchClient, new SearchOptions { Filter = filter }, "*"))
+            .Select(d => (string)d["id"]).OrderBy(id => id).ToArray();
+
+        Assert.Equal(new[] { "1" }, await IdsForAsync("address/geo/label eq 'beachfront'"));
+        Assert.Equal(new[] { "2" }, await IdsForAsync("address/geo/lat gt 40"));
+        Assert.Equal(new[] { "1" }, await IdsForAsync("address/stays/room/floor gt 2"));
+
+        var fullText = await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "beachfront");
+        Assert.Equal(new[] { "1" }, fullText.Select(d => (string)d["id"]));
+
+        Assert.Equal(new[] { "1" },
+            await IdsForAsync("address/stays/any(s: s/room/floor gt 2)"));
+
+        var projected = await RunSearch<SearchDocument>(
+            searchClient,
+            new SearchOptions { Filter = "id eq '1'", Select = { "id", "address/geo/label" } }, "*");
+        Assert.Single(projected);
+        var address = Assert.IsType<SearchDocument>(projected[0]["address"]);
+        var geo = Assert.IsType<SearchDocument>(address["geo"]);
+        Assert.Equal("beachfront", (string)geo["label"]);
+        Assert.False(address.ContainsKey("city"));
+
+        var ordered = await RunSearch<SearchDocument>(
+            searchClient, new SearchOptions { OrderBy = { "address/geo/lat desc" } }, "*");
+        Assert.Equal(new[] { "2", "1" }, ordered.Select(d => (string)d["id"]));
+    }
+
+    [Fact]
+    public async Task AdditionalEdmTypes()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(new SearchIndex(IndexName)
+        {
+            Fields =
+            {
+                new SearchField("id", SearchFieldDataType.String) { IsKey = true },
+                new SimpleField("level", SearchFieldDataType.SByte)
+                {
+                    IsFilterable = true, IsSortable = true,
+                },
+                new SimpleField("code", SearchFieldDataType.Int16)
+                {
+                    IsFilterable = true, IsSortable = true,
+                },
+                new SimpleField("at", new SearchFieldDataType("Edm.Time"))
+                {
+                    IsFilterable = true, IsSortable = true,
+                },
+                new SimpleField("dur", new SearchFieldDataType("Edm.Duration")) { IsFilterable = true },
+                new SimpleField("blob", new SearchFieldDataType("Edm.Binary")) { IsFilterable = true },
+            },
+        });
+        var results = await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument
+            {
+                ["id"] = "1", ["level"] = 100, ["code"] = 1000,
+                ["at"] = "08:00:00", ["dur"] = "P1D", ["blob"] = "aGVsbG8=",
+            },
+            new SearchDocument
+            {
+                ["id"] = "2", ["level"] = -5, ["code"] = 2000,
+                ["at"] = "18:30:00", ["dur"] = "PT2H", ["blob"] = "d29ybGQ=",
+            },
+            new SearchDocument
+            {
+                ["id"] = "bad-level", ["level"] = 1000, ["code"] = 1,
+                ["at"] = "08:00:00", ["dur"] = "P1D", ["blob"] = "aGk=",
+            },
+            new SearchDocument
+            {
+                ["id"] = "bad-time", ["level"] = 1, ["code"] = 1,
+                ["at"] = "25:00:00", ["dur"] = "P1D", ["blob"] = "aGk=",
+            },
+        });
+        Assert.True(results.Value.Results[0].Succeeded);
+        Assert.True(results.Value.Results[1].Succeeded);
+        Assert.False(results.Value.Results[2].Succeeded);
+        Assert.False(results.Value.Results[3].Succeeded);
+
+        async Task<string[]> IdsForAsync(string filter) =>
+            (await RunSearch<SearchDocument>(searchClient, new SearchOptions { Filter = filter }, "*"))
+            .Select(d => (string)d["id"]).OrderBy(id => id).ToArray();
+
+        Assert.Equal(new[] { "1" }, await IdsForAsync("level gt 0"));
+        Assert.Equal(new[] { "1" }, await IdsForAsync("code lt 1500"));
+        Assert.Equal(new[] { "2" }, await IdsForAsync("at gt '12:00:00'"));
+        Assert.Equal(new[] { "1" }, await IdsForAsync("dur eq 'P1D'"));
+        Assert.Equal(new[] { "1" }, await IdsForAsync("blob eq 'aGVsbG8='"));
+        var ordered = await RunSearch<SearchDocument>(
+            searchClient, new SearchOptions { OrderBy = { "at desc" } }, "*");
+        Assert.Equal(new[] { "2", "1" }, ordered.Select(d => (string)d["id"]));
+
+        var badDur = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            RunSearch<SearchDocument>(searchClient, new SearchOptions { Filter = "dur gt 'P1D'" }, "*"));
+        Assert.Equal(400, badDur.Status);
+        var badBlob = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            RunSearch<SearchDocument>(searchClient, new SearchOptions { Filter = "blob gt 'aGVsbG8='" }, "*"));
+        Assert.Equal(400, badBlob.Status);
+    }
+
+    [Fact]
     public async Task CountDocuments()
     {
         var searchClient = await PricedDocsAsync();
@@ -731,6 +922,82 @@ public class SdkTests : EmulatorTestBase
     }
 
     [Fact]
+    public async Task SuggestAndAutocompleteOptions()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(new SearchIndex(IndexName)
+        {
+            Fields =
+            {
+                new SearchField("id", SearchFieldDataType.String) { IsKey = true },
+                new SearchableField("title"),
+                new SearchableField("category"),
+                new SimpleField("price", SearchFieldDataType.Double) { IsSortable = true },
+            },
+            Suggesters = { new SearchSuggester("sg", new[] { "title", "category" }) },
+        });
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = "Boston Harbor Hotel", ["category"] = "hotel", ["price"] = 300.0 },
+            new SearchDocument { ["id"] = "2", ["title"] = "Seattle Downtown", ["category"] = "boston getaway", ["price"] = 100.0 },
+            new SearchDocument { ["id"] = "3", ["title"] = "New York Hotel", ["category"] = "hotel", ["price"] = 150.0 },
+            new SearchDocument { ["id"] = "4", ["title"] = "York Peppermint", ["category"] = "candy", ["price"] = 50.0 },
+        });
+
+        // searchFields restricts matching to the listed suggester fields.
+        var titleOnly = (await searchClient.SuggestAsync<SearchDocument>(
+            "bos", "sg", new SuggestOptions { SearchFields = { "title" } })).Value;
+        Assert.Equal(new[] { "1" }, titleOnly.Results.Select(d => (string)d.Document["id"]));
+        var categoryOnly = (await searchClient.AutocompleteAsync(
+            "bos", "sg", new AutocompleteOptions { SearchFields = { "category" } })).Value;
+        Assert.Equal(new[] { "boston" }, categoryOnly.Results.Select(c => c.Text));
+
+        // select projects the suggested documents (key and text stay).
+        var projected = (await searchClient.SuggestAsync<SearchDocument>(
+            "bos", "sg", new SuggestOptions { Select = { "title" } })).Value;
+        Assert.Equal(new[] { "1", "2" }, projected.Results.Select(d => (string)d.Document["id"]));
+        Assert.Equal("Boston Harbor Hotel", (string)projected.Results[0].Document["title"]);
+        Assert.False(projected.Results[0].Document.ContainsKey("category"));
+        Assert.Equal("Boston", projected.Results[0].Text);
+
+        // orderBy reorders suggestions (default is key order).
+        var ordered = (await searchClient.SuggestAsync<SearchDocument>(
+            "bos", "sg", new SuggestOptions { OrderBy = { "price asc" } })).Value;
+        Assert.Equal(new[] { "2", "1" }, ordered.Results.Select(d => (string)d.Document["id"]));
+
+        // Fuzzy matching tolerates a single-character typo on both routes.
+        var exact = (await searchClient.SuggestAsync<SearchDocument>("bostn", "sg", new SuggestOptions())).Value;
+        Assert.Empty(exact.Results);
+        var fuzzySuggestions = (await searchClient.SuggestAsync<SearchDocument>(
+            "bostn", "sg", new SuggestOptions { UseFuzzyMatching = true })).Value;
+        Assert.Equal(new[] { "1", "2" }, fuzzySuggestions.Results.Select(d => (string)d.Document["id"]));
+        var fuzzyCompletions = (await searchClient.AutocompleteAsync(
+            "bostn", "sg", new AutocompleteOptions { UseFuzzyMatching = true })).Value;
+        Assert.Equal(new[] { "Boston", "boston" }, fuzzyCompletions.Results.Select(c => c.Text));
+
+        // Highlight tags wrap the matched portion of the suggestion text.
+        var highlighted = (await searchClient.SuggestAsync<SearchDocument>(
+            "bos", "sg", new SuggestOptions { HighlightPreTag = "<b>", HighlightPostTag = "</b>" })).Value;
+        Assert.Equal("<b>Bos</b>ton", highlighted.Results[0].Text);
+
+        // minimumCoverage is accepted but inert.
+        var covered = (await searchClient.SuggestAsync<SearchDocument>(
+            "bos", "sg", new SuggestOptions { MinimumCoverage = 50.0 })).Value;
+        Assert.Equal(new[] { "1", "2" }, covered.Results.Select(d => (string)d.Document["id"]));
+
+        // Autocomplete modes for multi-term input.
+        var oneTerm = (await searchClient.AutocompleteAsync("new y", "sg", new AutocompleteOptions())).Value;
+        Assert.Contains("York", oneTerm.Results.Select(c => c.Text));
+        var twoTerms = (await searchClient.AutocompleteAsync(
+            "new y", "sg", new AutocompleteOptions { Mode = AutocompleteMode.TwoTerms })).Value;
+        Assert.Equal(new[] { "New York" }, twoTerms.Results.Select(c => c.Text));
+        var withContext = (await searchClient.AutocompleteAsync(
+            "york pep", "sg", new AutocompleteOptions { Mode = AutocompleteMode.OneTermWithContext })).Value;
+        Assert.Equal(new[] { "Peppermint" }, withContext.Results.Select(c => c.Text));
+    }
+
+    [Fact]
     public async Task SynonymMapCrud()
     {
         var indexClient = IndexClient();
@@ -745,6 +1012,48 @@ public class SdkTests : EmulatorTestBase
         await indexClient.DeleteSynonymMapAsync("sm", CancellationToken.None);
         var ex = await Assert.ThrowsAsync<RequestFailedException>(() => indexClient.GetSynonymMapAsync("sm"));
         Assert.Equal(404, ex.Status);
+    }
+
+    [Fact]
+    public async Task SynonymMapSearchExpansion()
+    {
+        var indexClient = IndexClient();
+        await indexClient.CreateSynonymMapAsync(new SynonymMap("sm", new[] { "wa, washington" }));
+        await indexClient.CreateSynonymMapAsync(new SynonymMap("sm2", new[] { "boston => beantown" }));
+        var index = new SearchIndex("syn-idx")
+        {
+            Fields =
+            {
+                new SimpleField("id", SearchFieldDataType.String) { IsKey = true },
+                new SearchableField("title") { SynonymMapNames = { "sm", "sm2" } },
+            },
+        };
+        await indexClient.CreateIndexAsync(index);
+        var searchClient = SearchClient("syn-idx");
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = "hotels in Washington" },
+            new SearchDocument { ["id"] = "2", ["title"] = "staying in Beantown tonight" },
+            new SearchDocument { ["id"] = "3", ["title"] = "flights to Boston" },
+        });
+
+        Assert.Equal(new[] { "1" },
+            (await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "wa"))
+            .Select(d => d["id"].ToString()).OrderBy(id => id));
+        Assert.Equal(new[] { "1" },
+            (await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "washington"))
+            .Select(d => d["id"].ToString()).OrderBy(id => id));
+        Assert.Equal(new[] { "2", "3" },
+            (await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "boston"))
+            .Select(d => d["id"].ToString()).OrderBy(id => id));
+        Assert.Equal(new[] { "2" },
+            (await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "beantown"))
+            .Select(d => d["id"].ToString()).OrderBy(id => id));
+        // Fuzzy terms are not synonym-expanded.
+        Assert.Empty(await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "wa~"));
+        // Maps not referenced by the index are inert.
+        await indexClient.CreateSynonymMapAsync(new SynonymMap("other", new[] { "other, washington" }));
+        Assert.Empty(await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "other"));
     }
 
     [Fact]
@@ -1027,6 +1336,94 @@ public class SdkTests : EmulatorTestBase
         found = await RunSearch<SearchDocument>(
             searchClient, new SearchOptions { Filter = "title in ('cheap red', 'other')" }, "*");
         Assert.Equal(new[] { "1" }, found.Select(d => (string)d["id"]));
+    }
+
+    [Fact]
+    public async Task SearchFilterDateStringIsMatchLambda()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(new SearchIndex(IndexName)
+        {
+            Fields =
+            {
+                new SearchField("id", SearchFieldDataType.String) { IsKey = true },
+                new SearchableField("title") { IsFilterable = true },
+                new SimpleField("published", SearchFieldDataType.DateTimeOffset) { IsFilterable = true },
+                new SearchField("rooms", SearchFieldDataType.Collection(SearchFieldDataType.Complex))
+                {
+                    Fields =
+                    {
+                        new SearchField("type", SearchFieldDataType.String) { IsFilterable = true },
+                        new SearchField("rate", SearchFieldDataType.Double) { IsFilterable = true },
+                    },
+                },
+            },
+        });
+        var results = await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument
+            {
+                ["id"] = "1",
+                ["title"] = "Azure Search",
+                ["published"] = "2024-03-15T10:30:45Z",
+                ["rooms"] = new[]
+                {
+                    new Dictionary<string, object> { ["type"] = "standard", ["rate"] = 50.0 },
+                    new Dictionary<string, object> { ["type"] = "suite", ["rate"] = 150.0 },
+                },
+            },
+            new SearchDocument
+            {
+                ["id"] = "2",
+                ["title"] = "hello world",
+                ["published"] = "2023-07-04T08:00:00Z",
+                ["rooms"] = new[]
+                {
+                    new Dictionary<string, object> { ["type"] = "standard", ["rate"] = 60.0 },
+                },
+            },
+            new SearchDocument
+            {
+                ["id"] = "3",
+                ["title"] = "  padded  ",
+                ["published"] = "2024-03-15T22:15:00Z",
+                ["rooms"] = new[]
+                {
+                    new Dictionary<string, object> { ["type"] = "loft", ["rate"] = 200.0 },
+                },
+            },
+        });
+        Assert.All(results.Value.Results, r => Assert.True(r.Succeeded));
+
+        async Task<string[]> IdsForAsync(string filter) =>
+            (await RunSearch<SearchDocument>(searchClient, new SearchOptions { Filter = filter }, "*"))
+            .Select(d => (string)d["id"]).OrderBy(id => id).ToArray();
+
+        Assert.Equal(new[] { "1", "3" }, await IdsForAsync("year(published) eq 2024"));
+        Assert.Equal(new[] { "1", "3" }, await IdsForAsync("month(published) eq 3"));
+        Assert.Equal(new[] { "2" }, await IdsForAsync("day(published) eq 4"));
+        Assert.Equal(new[] { "1" }, await IdsForAsync("hour(published) eq 10"));
+        Assert.Equal(new[] { "1", "3" },
+            await IdsForAsync("date(published) eq utcdatetime('2024-03-15T00:00:00Z')"));
+        Assert.Equal(new[] { "1", "2", "3" }, await IdsForAsync("published lt now()"));
+
+        Assert.Equal(new[] { "2" }, await IdsForAsync("length(title) eq 11"));
+        Assert.Equal(new[] { "2" }, await IdsForAsync("indexof(title, 'world') eq 6"));
+        Assert.Equal(new[] { "2" }, await IdsForAsync("substring(title, 0, 5) eq 'hello'"));
+        Assert.Equal(new[] { "1" }, await IdsForAsync("tolower(title) eq 'azure search'"));
+        Assert.Equal(new[] { "2" }, await IdsForAsync("toupper(title) eq 'HELLO WORLD'"));
+        Assert.Equal(new[] { "3" }, await IdsForAsync("trim(title) eq 'padded'"));
+
+        Assert.Equal(new[] { "1" }, await IdsForAsync("search.ismatch('azure.*', title)"));
+        Assert.Equal(new[] { "2" }, await IdsForAsync("search.ismatch('^HELLO', title)"));
+        var ex = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            searchClient.SearchAsync<SearchDocument>("*",
+                new SearchOptions { Filter = "search.ismatch('[', title)" }));
+        Assert.Equal(400, ex.Status);
+
+        Assert.Equal(new[] { "1" }, await IdsForAsync("rooms/any(r: r/type eq 'suite')"));
+        Assert.Equal(new[] { "1", "3" }, await IdsForAsync("rooms/any(r: r/rate gt 100)"));
     }
 
     [Fact]

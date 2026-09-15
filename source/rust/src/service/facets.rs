@@ -25,14 +25,18 @@ pub(crate) fn compute_facets(scored: &[(Document, f32)], facets: &[Facet]) -> Va
         let mut counts: std::collections::BTreeMap<String, (FacetValue, u64)> =
             std::collections::BTreeMap::new();
         for (document, _) in scored {
-            let Some(value) = document.fields.get(&facet.field) else {
-                continue;
-            };
-            let values = if value.is_array() {
-                value.as_array().cloned().unwrap_or_default()
-            } else {
-                vec![value.clone()]
-            };
+            // Nested paths (`Address/State`) resolve through complex types;
+            // a resolved array contributes each element (arrays nested
+            // deeper stay whole values, matching the filter path semantics).
+            let resolved = document.resolve_path(&facet.field);
+            let mut values = Vec::new();
+            for value in resolved {
+                if let Some(items) = value.as_array() {
+                    values.extend(items.iter().cloned());
+                } else {
+                    values.push(value.clone());
+                }
+            }
             for value in values {
                 if value.is_null() {
                     continue;
