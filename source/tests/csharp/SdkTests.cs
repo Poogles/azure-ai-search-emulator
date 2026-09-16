@@ -1643,4 +1643,69 @@ public class SdkTests : EmulatorTestBase
         var doc = (await searchClient.GetDocumentAsync<SearchDocument>("1")).Value;
         Assert.Equal("replaced", (string)doc["title"]);
     }
+
+    [Fact]
+    public async Task SearchNonStringFields()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(new SearchIndex(IndexName)
+        {
+            Fields =
+            {
+                new SearchField("id", SearchFieldDataType.String) { IsKey = true },
+                new SearchableField("title"),
+                new SearchField("price", SearchFieldDataType.Double) { IsSearchable = true, IsFilterable = true },
+                new SearchField("active", SearchFieldDataType.Boolean) { IsSearchable = true, IsFilterable = true },
+                new SearchField("created", SearchFieldDataType.DateTimeOffset) { IsSearchable = true },
+                new SearchField("guid", SearchFieldDataType.Guid) { IsSearchable = true },
+                new SearchField("scores", SearchFieldDataType.Collection(SearchFieldDataType.Int32)) { IsSearchable = true },
+            },
+        });
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument
+            {
+                ["id"] = "1",
+                ["title"] = "cheap",
+                ["price"] = 100.0,
+                ["active"] = true,
+                ["created"] = "2024-01-15T10:30:00Z",
+                ["guid"] = "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                ["scores"] = new[] { 10, 20, 30 },
+            },
+            new SearchDocument
+            {
+                ["id"] = "2",
+                ["title"] = "mid",
+                ["price"] = 200.0,
+                ["active"] = false,
+                ["created"] = "2025-06-20T14:45:00Z",
+                ["guid"] = "f1e2d3c4-b5a6-7890-1234-567890abcdef",
+                ["scores"] = new[] { 40, 50 },
+            },
+        });
+
+        // Numeric: "200" appears only in document 2's price.
+        var found = await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "200");
+        Assert.Equal(new[] { "2" }, found.Select(d => (string)d["id"]));
+        // Boolean: "true" matches doc 1, "false" matches doc 2.
+        found = await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "true");
+        Assert.Equal(new[] { "1" }, found.Select(d => (string)d["id"]));
+        found = await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "false");
+        Assert.Equal(new[] { "2" }, found.Select(d => (string)d["id"]));
+        // DateTimeOffset: "2024" matches doc 1, "2025" matches doc 2.
+        found = await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "2024");
+        Assert.Equal(new[] { "1" }, found.Select(d => (string)d["id"]));
+        found = await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "2025");
+        Assert.Equal(new[] { "2" }, found.Select(d => (string)d["id"]));
+        // Guid: a unique fragment matches the right document.
+        found = await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "a1b2c3d4");
+        Assert.Equal(new[] { "1" }, found.Select(d => (string)d["id"]));
+        // Collection(Edm.Int32): each element is indexed individually.
+        found = await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "10");
+        Assert.Equal(new[] { "1" }, found.Select(d => (string)d["id"]));
+        found = await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "50");
+        Assert.Equal(new[] { "2" }, found.Select(d => (string)d["id"]));
+    }
 }

@@ -1479,3 +1479,87 @@ def test_alias_conflicts_with_index_name(
             )
         )
     assert exc_info.value.status_code == 409
+
+
+def test_search_non_string_fields(
+    index_client: SearchIndexClient, search_client: SearchClient
+) -> None:
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchField(name="title", type=SearchFieldDataType.String, searchable=True),
+                SearchField(
+                    name="price",
+                    type=SearchFieldDataType.Double,
+                    searchable=True,
+                    filterable=True,
+                ),
+                SearchField(
+                    name="active",
+                    type=SearchFieldDataType.Boolean,
+                    searchable=True,
+                    filterable=True,
+                ),
+                SearchField(
+                    name="created",
+                    type=SearchFieldDataType.DateTimeOffset,
+                    searchable=True,
+                ),
+                SearchField(
+                    name="guid",
+                    type=SearchFieldDataType.Guid,
+                    searchable=True,
+                ),
+                SearchField(
+                    name="scores",
+                    type=SearchFieldDataType.Collection(SearchFieldDataType.Int32),
+                    searchable=True,
+                ),
+            ],
+        )
+    )
+    search_client.upload_documents(
+        documents=[
+            {
+                "id": "1",
+                "title": "cheap",
+                "price": 100.0,
+                "active": True,
+                "created": "2024-01-15T10:30:00Z",
+                "guid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                "scores": [10, 20, 30],
+            },
+            {
+                "id": "2",
+                "title": "mid",
+                "price": 200.0,
+                "active": False,
+                "created": "2025-06-20T14:45:00Z",
+                "guid": "f1e2d3c4-b5a6-7890-1234-567890abcdef",
+                "scores": [40, 50],
+            },
+        ]
+    )
+    # Numeric: "200" appears only in document 2's price.
+    found = list(search_client.search(search_text="200"))
+    assert [doc["id"] for doc in found] == ["2"]
+    # Boolean: "true" matches doc 1, "false" matches doc 2.
+    found = list(search_client.search(search_text="true"))
+    assert [doc["id"] for doc in found] == ["1"]
+    found = list(search_client.search(search_text="false"))
+    assert [doc["id"] for doc in found] == ["2"]
+    # DateTimeOffset: "2024" matches doc 1, "2025" matches doc 2.
+    found = list(search_client.search(search_text="2024"))
+    assert [doc["id"] for doc in found] == ["1"]
+    found = list(search_client.search(search_text="2025"))
+    assert [doc["id"] for doc in found] == ["2"]
+    # Guid: a unique fragment matches the right document.
+    found = list(search_client.search(search_text="a1b2c3d4"))
+    assert [doc["id"] for doc in found] == ["1"]
+    # Collection(Edm.Int32): each element is indexed individually.
+    found = list(search_client.search(search_text="10"))
+    assert [doc["id"] for doc in found] == ["1"]
+    found = list(search_client.search(search_text="50"))
+    assert [doc["id"] for doc in found] == ["2"]

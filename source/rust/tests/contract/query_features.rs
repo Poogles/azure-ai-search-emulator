@@ -299,6 +299,111 @@ async fn numeric_values_are_full_text_searchable() {
     assert_eq!(ids(&body), vec!["2"]);
 }
 
+#[tokio::test]
+async fn non_string_field_types_are_full_text_searchable() {
+    let app = app();
+    let (status, _) = create_custom_index(
+        &app,
+        json!({
+            "name": "items",
+            "fields": [
+                {"name": "id", "type": "Edm.String", "key": true},
+                {"name": "flag", "type": "Edm.Boolean", "searchable": true},
+                {"name": "created", "type": "Edm.DateTimeOffset", "searchable": true},
+                {"name": "guid", "type": "Edm.Guid", "searchable": true},
+                {"name": "count", "type": "Edm.Int32", "searchable": true},
+                {"name": "scores", "type": "Edm.Collection(Edm.Int32)", "searchable": true}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        upload_request(
+            "items",
+            json!([
+                {"@search.action": "upload", "document": {
+                    "id": "1", "flag": true, "created": "2024-01-15T10:30:00Z",
+                    "guid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                    "count": 42, "scores": [10, 20, 30]
+                }},
+                {"@search.action": "upload", "document": {
+                    "id": "2", "flag": false, "created": "2025-06-20T14:45:00Z",
+                    "guid": "f1e2d3c4-b5a6-7890-1234-567890abcdef",
+                    "count": 99, "scores": [40, 50]
+                }}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Boolean: "true" matches doc 1, "false" matches doc 2.
+    let (status, body) = call(
+        app.clone(),
+        search_request("items", json!({"search": "true"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&body), vec!["1"]);
+    let (status, body) = call(
+        app.clone(),
+        search_request("items", json!({"search": "false"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&body), vec!["2"]);
+    // DateTimeOffset: "2024" matches doc 1, "2025" matches doc 2.
+    let (status, body) = call(
+        app.clone(),
+        search_request("items", json!({"search": "2024"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&body), vec!["1"]);
+    let (status, body) = call(
+        app.clone(),
+        search_request("items", json!({"search": "2025"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&body), vec!["2"]);
+    // Guid: a unique fragment matches the right document.
+    let (status, body) = call(
+        app.clone(),
+        search_request("items", json!({"search": "a1b2c3d4"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&body), vec!["1"]);
+    // Int32: "42" matches doc 1, "99" matches doc 2.
+    let (status, body) = call(
+        app.clone(),
+        search_request("items", json!({"search": "42"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&body), vec!["1"]);
+    let (status, body) = call(
+        app.clone(),
+        search_request("items", json!({"search": "99"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&body), vec!["2"]);
+    // Collection(Edm.Int32): each element is indexed individually.
+    let (status, body) = call(
+        app.clone(),
+        search_request("items", json!({"search": "10"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&body), vec!["1"]);
+    let (status, body) = call(app, search_request("items", json!({"search": "50"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&body), vec!["2"]);
+}
+
 // ---------------------------------------------------------------------------
 // Synonym search
 // ---------------------------------------------------------------------------

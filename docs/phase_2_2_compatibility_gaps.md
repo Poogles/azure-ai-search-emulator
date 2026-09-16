@@ -207,7 +207,7 @@ Implemented against the SDK wire format (`fuzzy` boolean from `useFuzzyMatching`
 
 ### 5. Full-text indexing of non-string fields
 
-**Current state:** Only `searchable: true` string fields are full-text indexed. Searching for a value that appears only in a numeric or boolean field matches nothing.
+**Current state:** Implemented — `searchable: true` non-string fields (numeric, boolean, `DateTimeOffset`, `Guid`) are indexed with their canonical string representation; collection elements are indexed individually.
 
 **Target:** Index the string representation of numeric and boolean field values for full-text matching.
 
@@ -506,12 +506,15 @@ source/rust/src/
 
 ### Full-text indexing of non-string fields
 
-- [ ] `Edm.Int32`/`Int64`/`Single`/`Double`/`Boolean`/`DateTimeOffset`/`Guid` values indexed as strings.
-- [ ] Collection elements indexed individually.
-- [ ] Search term matches the string representation.
-- [ ] Does not affect filter behaviour (typed comparison unchanged).
-- [ ] Contract tests: search for numeric/boolean value in a non-string field.
-- [ ] Python SDK test: upload doc with numeric field, search for the number as text.
+**Current state:** Implemented — `Edm.Int32`/`Int64`/`Single`/`Double`/`Boolean`/`DateTimeOffset`/`Guid` fields marked `searchable: true` are indexed with their canonical string representation; collection elements are indexed individually; the analyzer is applied to the string representation (unit + contract + Python/C# SDK tests green).
+
+- [x] `Edm.Int32`/`Int64`/`Single`/`Double`/`Boolean`/`DateTimeOffset`/`Guid` values indexed as strings.
+- [x] Collection elements indexed individually.
+- [x] Search term matches the string representation.
+- [x] Does not affect filter behaviour (typed comparison unchanged).
+- [x] Contract tests: search for numeric/boolean value in a non-string field.
+- [x] Python SDK test: upload doc with numeric field, search for the number as text.
+- [x] C# SDK test: mirror of the Python non-string field search scenario.
 
 ### Service statistics
 

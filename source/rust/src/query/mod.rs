@@ -709,6 +709,122 @@ mod tests {
         assert!(keys(&engine, "3").is_empty());
     }
 
+    fn searchable_field(name: &str, field_type: FieldType) -> FieldDefinition {
+        FieldDefinition {
+            name: name.to_owned(),
+            field_type,
+            is_key: false,
+            searchable: true,
+            filterable: false,
+            sortable: false,
+            facetable: false,
+            retrievable: true,
+            vector_dimensions: None,
+            vector_search_profile: None,
+            subfields: Vec::new(),
+            analyzer: None,
+            synonym_maps: Vec::new(),
+            raw: Value::Null,
+        }
+    }
+
+    #[test]
+    fn non_string_fields_are_full_text_indexed() {
+        let fields = vec![
+            FieldDefinition {
+                name: "id".to_owned(),
+                field_type: FieldType::String,
+                is_key: true,
+                searchable: false,
+                filterable: false,
+                sortable: false,
+                facetable: false,
+                retrievable: true,
+                vector_dimensions: None,
+                vector_search_profile: None,
+                subfields: Vec::new(),
+                analyzer: None,
+                synonym_maps: Vec::new(),
+                raw: Value::Null,
+            },
+            searchable_field("flag", FieldType::Boolean),
+            searchable_field("created", FieldType::DateTimeOffset),
+            searchable_field("guid", FieldType::Guid),
+            searchable_field("small", FieldType::Int32),
+            searchable_field("big", FieldType::Int64),
+            searchable_field("scores", FieldType::CollectionInt32),
+        ];
+        let engine = SearchEngine::new();
+        engine
+            .create_index("items", &fields)
+            .unwrap_or_else(|e| panic!("create_index failed: {e}"));
+        let mut fields1 = Map::new();
+        fields1.insert("id".to_owned(), Value::String("1".to_owned()));
+        fields1.insert("flag".to_owned(), Value::Bool(true));
+        fields1.insert(
+            "created".to_owned(),
+            Value::String("2024-01-15T10:30:00Z".to_owned()),
+        );
+        fields1.insert(
+            "guid".to_owned(),
+            Value::String("a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_owned()),
+        );
+        fields1.insert("small".to_owned(), Value::from(42));
+        fields1.insert("big".to_owned(), Value::from(9_999_999_999_i64));
+        fields1.insert(
+            "scores".to_owned(),
+            Value::Array(vec![Value::from(10), Value::from(20), Value::from(30)]),
+        );
+        let mut fields2 = Map::new();
+        fields2.insert("id".to_owned(), Value::String("2".to_owned()));
+        fields2.insert("flag".to_owned(), Value::Bool(false));
+        fields2.insert(
+            "created".to_owned(),
+            Value::String("2025-06-20T14:45:00Z".to_owned()),
+        );
+        fields2.insert(
+            "guid".to_owned(),
+            Value::String("f1e2d3c4-b5a6-7890-1234-567890abcdef".to_owned()),
+        );
+        fields2.insert("small".to_owned(), Value::from(99));
+        fields2.insert("big".to_owned(), Value::from(12_345_678_901_234_i64));
+        fields2.insert(
+            "scores".to_owned(),
+            Value::Array(vec![Value::from(40), Value::from(50)]),
+        );
+        let docs = vec![
+            Document {
+                key: "1".to_owned(),
+                fields: fields1,
+            },
+            Document {
+                key: "2".to_owned(),
+                fields: fields2,
+            },
+        ];
+        engine
+            .index_documents("items", &docs)
+            .unwrap_or_else(|e| panic!("index_documents failed: {e}"));
+        // Boolean: "true" matches doc 1, "false" matches doc 2.
+        assert_eq!(keys(&engine, "true"), vec!["1"]);
+        assert_eq!(keys(&engine, "false"), vec!["2"]);
+        // DateTimeOffset: the ISO 8601 string is tokenized; "2024" matches doc 1.
+        assert_eq!(keys(&engine, "2024"), vec!["1"]);
+        assert_eq!(keys(&engine, "2025"), vec!["2"]);
+        // Guid: the string representation is indexed; a unique fragment matches.
+        assert_eq!(keys(&engine, "a1b2c3d4"), vec!["1"]);
+        assert_eq!(keys(&engine, "f1e2d3c4"), vec!["2"]);
+        // Int32: "42" matches doc 1, "99" matches doc 2.
+        assert_eq!(keys(&engine, "42"), vec!["1"]);
+        assert_eq!(keys(&engine, "99"), vec!["2"]);
+        // Int64: large values are indexed as their string form.
+        assert_eq!(keys(&engine, "9999999999"), vec!["1"]);
+        assert_eq!(keys(&engine, "12345678901234"), vec!["2"]);
+        // Collection(Edm.Int32): each element is indexed individually.
+        assert_eq!(keys(&engine, "10"), vec!["1"]);
+        assert_eq!(keys(&engine, "50"), vec!["2"]);
+    }
+
     #[test]
     fn upsert_replaces_existing_key() {
         let engine = engine_with_docs();

@@ -70,11 +70,6 @@ Differences fall into two categories:
 - String comparisons and string functions are ordinal and case-sensitive; Azure can be configured otherwise. Type mismatches and missing fields never match.
 - **Rationale:** explicit rejection beats silently wrong result sets; test filters stay within the supported set.
 
-### Searchable field coverage
-
-- Only `searchable: true` **string** fields are full-text indexed. A search term that appears only in a numeric, boolean, or collection field matches nothing. Azure indexes and matches across more field types.
-- **Rationale:** string full-text search is the behaviour exercised by our applications; numeric matching belongs to filtering, which is implemented separately.
-
 ### Facets, ordering, projection
 
 - Facet counts are exact (computed over the in-memory result set); Azure returns approximate counts at scale.

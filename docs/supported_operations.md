@@ -235,12 +235,11 @@ When more results exist beyond the returned page, the response includes `@odata.
 
 ### Search semantics
 
-- Token-based full-text match across `searchable: true` **string** fields (all of them, or the `searchFields` subset), using an English analyzer (lowercasing, punctuation splitting, English stopword removal, English stemming) approximating Azure's basic English analyzer.
+- Token-based full-text match across `searchable: true` fields (all of them, or the `searchFields` subset), using an English analyzer (lowercasing, punctuation splitting, English stopword removal, English stemming) approximating Azure's basic English analyzer. Non-string fields (numeric, boolean, `DateTimeOffset`, `Guid`) are indexed with their canonical string representation.
 - `*` or an empty term matches all documents.
 - A multi-term search combines required clauses with OR (`searchMode=any`, the default when omitted, matching Azure) or AND (`searchMode=all`).
 - Simple-query boolean operators: `+term` (required, the default), `-term` (excluded), `"quoted phrases"` (adjacent tokens), and fuzzy terms (`term~` for the default edit distance 2 like Azure, `term~N` for an explicit distance 0-2; larger distances rejected). Fuzzy terms are lowercased only (no stemming, stopword removal, or punctuation splitting), matching Azure. An exclusion-only query matches all documents except the excluded ones. A non-fuzzy clause that analyzes to no tokens (e.g. a stopword-only term) matches nothing.
 - `searchFields` weights (`field^N`, finite positive `N`) scale the field's BM25 contribution to `@search.score`; unknown/non-searchable fields and invalid weights are rejected with `400 InvalidQuery`.
-- Non-string fields are not full-text indexed; searching for a value that only appears in a numeric/boolean field matches nothing.
 - Results are ordered by BM25 score descending with the key field as tie-breaker (deterministic). `@search.score` is the BM25 relevance score (higher = more relevant); exact values differ from Azure's internal scoring, so assertions must check ordering, not equality. See `docs/known_differences.md`.
 - When `vectorQueries` is present (and no `orderby`), results are ordered by vector score descending with the key field as tie-breaker. `@search.score` is the similarity score for the query's metric: cosine similarity for `cosine`, the raw inner product for `dotProduct`, `1/(1+l2)` for `euclidean`. Hybrid (vector + full-text) results are the union of both sides, scored by the best (highest) score. `top`/`skip`/`count` apply to the merged set.
 - Newly indexed documents are immediately searchable (synchronous commit + reader reload per batch).
