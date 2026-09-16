@@ -221,7 +221,7 @@ Implemented against the SDK wire format (`fuzzy` boolean from `useFuzzyMatching`
 
 ### 6. Service statistics
 
-**Current state:** `GET /servicestats` returns a static response with zero counters.
+**Current state:** Implemented — `GET /servicestats` returns real counts of indexes, documents, synonym maps, aliases, knowledge bases, and knowledge sources, plus approximate storage usage in KB and static limits (contract tests green).
 
 **Target:** Return actual counts.
 
@@ -236,7 +236,7 @@ Implemented against the SDK wire format (`fuzzy` boolean from `useFuzzyMatching`
 
 ### 7. Alias resolution on management routes
 
-**Current state:** `PUT /indexes('name')` and `DELETE /indexes('name')` do not resolve aliases. An alias name in the path → `404 ResourceNotFound`.
+**Current state:** Implemented — `GET`/`PUT`/`DELETE /indexes('aliasName')` resolve the alias to its target index (the alias itself is not modified); `POST /indexes` (create) is unaffected; a missing alias target returns `404 ResourceNotFound` (contract tests green).
 
 **Target:** Resolve aliases on index management routes, matching Azure.
 
@@ -518,18 +518,22 @@ source/rust/src/
 
 ### Service statistics
 
-- [ ] `documentCount`, `indexCount`, `synonymMapCount`, `aliasCount` reflect actual state.
-- [ ] `storageUsageInKB` is non-zero after document upload.
-- [ ] Contract test: stats before and after operations.
+**Current state:** Implemented — `GET /servicestats` returns real counts of indexes, documents, synonym maps, aliases, knowledge bases, and knowledge sources, plus approximate storage usage in KB and static limits (contract tests green).
+
+- [x] `documentCount`, `indexCount`, `synonymMapCount`, `aliasCount` reflect actual state.
+- [x] `storageUsageInKB` is non-zero after document upload.
+- [x] Contract test: stats before and after operations.
 
 ### Alias resolution on management routes
 
-- [ ] `GET /indexes('aliasName')` returns the target index definition.
-- [ ] `PUT /indexes('aliasName')` updates the target index.
-- [ ] `DELETE /indexes('aliasName')` deletes the target index.
-- [ ] `POST /indexes` (create) is unaffected.
-- [ ] Alias target missing → `404 ResourceNotFound`.
-- [ ] Contract tests: CRUD through alias name.
+**Current state:** Implemented — `GET`/`PUT`/`DELETE /indexes('aliasName')` resolve the alias to its target index (the alias itself is not modified); `POST /indexes` (create) is unaffected; a missing alias target returns `404 ResourceNotFound` (contract tests green).
+
+- [x] `GET /indexes('aliasName')` returns the target index definition.
+- [x] `PUT /indexes('aliasName')` updates the target index.
+- [x] `DELETE /indexes('aliasName')` deletes the target index.
+- [x] `POST /indexes` (create) is unaffected.
+- [x] Alias target missing → `404 ResourceNotFound`.
+- [x] Contract tests: CRUD through alias name.
 
 ### Highlighting
 

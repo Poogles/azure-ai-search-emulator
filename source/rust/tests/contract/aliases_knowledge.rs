@@ -204,22 +204,18 @@ async fn alias_and_index_names_share_a_namespace() {
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"]["code"], "AliasAlreadyExists");
 
-    // An index cannot take the name of an existing alias (POST or PUT).
+    // An index cannot take the name of an existing alias via POST (create).
+    // PUT through an alias resolves to the target index (see the alias
+    // management-route tests below).
     let (status, _) = call(app.clone(), create_alias_request("alias1", "items")).await;
     assert_eq!(status, StatusCode::CREATED);
     let (status, body) = call(
-        app.clone(),
+        app,
         post_index_request("alias1", Some(API_KEY), Some(API_VERSION)),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"]["code"], "IndexAlreadyExists");
-    let (status, _) = call(
-        app,
-        put_index_request("alias1", Some(API_KEY), Some(API_VERSION)),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT);
 }
 
 #[tokio::test]
@@ -737,4 +733,115 @@ async fn alias_resolves_for_search_and_document_routes() {
     let (status, body) = call(app, search_request("dangling", json!({"search": "*"}))).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"]["code"], "ResourceNotFound");
+}
+
+// ---------------------------------------------------------------------------
+// Alias resolution on index management routes
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_index_via_alias_returns_target_definition() {
+    let app = app();
+    let (status, _) = create_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(app.clone(), create_alias_request("alias1", "items")).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // GET /indexes('alias1') returns the target index's definition (real name).
+    let uri = format!("/indexes('alias1')?api-version={API_VERSION}");
+    let (status, body) = call(app, request("GET", &uri, Some(API_KEY), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["name"], "items");
+}
+
+#[tokio::test]
+async fn put_index_via_alias_updates_target_index() {
+    let app = app();
+    let (status, _) = create_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(app.clone(), create_alias_request("alias1", "items")).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // PUT /indexes('alias1') updates the target index (items), not the alias.
+    // The body's name is the alias name; the emulator resolves it to the target.
+    let uri = format!("/indexes('alias1')?api-version={API_VERSION}");
+    let body = json!({
+        "name": "alias1",
+        "fields": [
+            {"name": "id", "type": "Edm.String", "key": true},
+            {"name": "title", "type": "Edm.String", "searchable": true},
+            {"name": "price", "type": "Edm.Double", "filterable": true, "sortable": true},
+            {"name": "new_field", "type": "Edm.String", "searchable": true}
+        ]
+    });
+    let (status, response) =
+        call(app.clone(), request("PUT", &uri, Some(API_KEY), Some(body))).await;
+    assert_eq!(status, StatusCode::CREATED);
+    // The echoed definition carries the target index's real name.
+    assert_eq!(response["name"], "items");
+
+    // The target index now has the new field.
+    let uri = format!("/indexes('items')?api-version={API_VERSION}");
+    let (status, body) = call(app, request("GET", &uri, Some(API_KEY), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let field_names: Vec<&str> = body["fields"]
+        .as_array()
+        .map(|fields| fields.iter().filter_map(|f| f["name"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(field_names.contains(&"new_field"));
+}
+
+#[tokio::test]
+async fn delete_index_via_alias_deletes_target_index() {
+    let app = app();
+    let (status, _) = create_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(app.clone(), create_alias_request("alias1", "items")).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // DELETE /indexes('alias1') deletes the target index (items).
+    let uri = format!("/indexes('alias1')?api-version={API_VERSION}");
+    let (status, _) = call(app.clone(), request("DELETE", &uri, Some(API_KEY), None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // The target index is gone.
+    let uri = format!("/indexes('items')?api-version={API_VERSION}");
+    let (status, body) = call(app.clone(), request("GET", &uri, Some(API_KEY), None)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "ResourceNotFound");
+
+    // The alias still exists (it was not deleted).
+    let (status, body) = call(app, alias_request("GET", "alias1", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["name"], "alias1");
+}
+
+#[tokio::test]
+async fn delete_index_via_dangling_alias_returns_404() {
+    let app = app();
+    // Create an alias pointing at a missing index.
+    let (status, _) = call(app.clone(), create_alias_request("dangling", "missing")).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // DELETE /indexes('dangling') → 404 (the target index does not exist).
+    let uri = format!("/indexes('dangling')?api-version={API_VERSION}");
+    let (status, body) = call(app, request("DELETE", &uri, Some(API_KEY), None)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "ResourceNotFound");
+}
+
+#[tokio::test]
+async fn post_index_create_is_unaffected_by_alias_resolution() {
+    let app = app();
+    // Create an alias named "newindex" pointing at "items".
+    let (status, _) = create_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(app.clone(), create_alias_request("newindex", "items")).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // POST /indexes with name "newindex" should fail (alias collision),
+    // not create an index through the alias.
+    let (status, body) = create_index(&app, "newindex").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "IndexAlreadyExists");
 }

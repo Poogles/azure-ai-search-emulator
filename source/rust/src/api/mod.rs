@@ -158,6 +158,19 @@ async fn create_or_update_index(
             format!("Index name in path ({name:?}) does not match index name in body."),
         ));
     }
+    // Resolve alias: when the path name is an alias, update the target index
+    // (the alias itself is not modified). The body's `name` is overridden with
+    // the resolved target so the echoed definition carries the real index name.
+    let resolved = state.service.resolve_index_name(&name);
+    let definition = if resolved == name {
+        definition
+    } else {
+        let mut definition = definition;
+        if let Some(obj) = definition.as_object_mut() {
+            obj.insert("name".to_owned(), Value::String(resolved));
+        }
+        definition
+    };
     let echoed = state.service.create_or_update_index(&definition)?;
     Ok((StatusCode::CREATED, Json(echoed)))
 }
@@ -464,18 +477,11 @@ async fn analyze_text(
     Ok(Json(json!({ "tokens": token_values })))
 }
 
-/// `GET /servicestats` — Service Statistics. Returns a static response with
-/// zero counters and default limits.
-async fn service_stats() -> Json<Value> {
-    Json(json!({
-        "counters": {
-            "knowledgeBaseCounter": {"usage": 0},
-            "knowledgeSourceCounter": {"usage": 0}
-        },
-        "limits": {
-            "maxVectorIndexSizePerIndexInBytes": 1_073_741_824
-        }
-    }))
+/// `GET /servicestats` — Service Statistics. Returns real counts of indexes,
+/// documents, synonym maps, aliases, knowledge bases, and knowledge sources,
+/// plus approximate storage usage and static limits.
+async fn service_stats(State(state): State<AppState>) -> Json<Value> {
+    Json(state.service.service_stats())
 }
 
 fn search_response(

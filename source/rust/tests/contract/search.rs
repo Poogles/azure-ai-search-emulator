@@ -478,17 +478,82 @@ async fn invalid_fuzzy_distance_returns_400() {
 }
 
 #[tokio::test]
-async fn service_stats_returns_static_response() {
+async fn service_stats_returns_zero_counters_when_empty() {
     let app = app();
     let uri = format!("/servicestats?api-version={API_VERSION}");
     let (status, body) = call(app, request("GET", &uri, Some(API_KEY), None)).await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["counters"]["indexCounter"]["usage"], 0);
+    assert_eq!(body["counters"]["documentCounter"]["usage"], 0);
+    assert_eq!(body["counters"]["storageCounter"]["usage"], 0);
+    assert_eq!(body["counters"]["synonymMapCounter"]["usage"], 0);
+    assert_eq!(body["counters"]["aliasCounter"]["usage"], 0);
     assert_eq!(body["counters"]["knowledgeBaseCounter"]["usage"], 0);
     assert_eq!(body["counters"]["knowledgeSourceCounter"]["usage"], 0);
     assert_eq!(
         body["limits"]["maxVectorIndexSizePerIndexInBytes"],
         1_073_741_824
     );
+}
+
+#[tokio::test]
+async fn service_stats_reflects_actual_state() {
+    let app = app();
+    // Create an index and upload documents (enough to exceed 1 KB).
+    let (status, _) = create_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let docs: Vec<serde_json::Value> = (0..50)
+        .map(|i| {
+            json!({"@search.action": "upload", "document": {
+                "id": i.to_string(),
+                "title": format!("document number {} with some content to increase the storage size", i)
+            }})
+        })
+        .collect();
+    let (status, _) = call(app.clone(), upload_request("items", json!(docs))).await;
+    assert_eq!(status, StatusCode::OK);
+    // Create a second index.
+    let (status, _) = create_index(&app, "other").await;
+    assert_eq!(status, StatusCode::CREATED);
+    // Create a synonym map.
+    let uri = format!("/synonymmaps?api-version={API_VERSION}");
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            &uri,
+            Some(API_KEY),
+            Some(json!({"name": "map1", "format": "solr", "synonyms": "a, b"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    // Create an alias.
+    let uri = format!("/aliases?api-version={API_VERSION}");
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            &uri,
+            Some(API_KEY),
+            Some(json!({"name": "alias1", "indexes": ["items"]})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let uri = format!("/servicestats?api-version={API_VERSION}");
+    let (status, body) = call(app, request("GET", &uri, Some(API_KEY), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["counters"]["indexCounter"]["usage"], 2);
+    assert_eq!(body["counters"]["documentCounter"]["usage"], 50);
+    assert!(body["counters"]["storageCounter"]["usage"]
+        .as_u64()
+        .is_some_and(|v| v > 0));
+    assert_eq!(body["counters"]["synonymMapCounter"]["usage"], 1);
+    assert_eq!(body["counters"]["aliasCounter"]["usage"], 1);
+    assert_eq!(body["counters"]["knowledgeBaseCounter"]["usage"], 0);
+    assert_eq!(body["counters"]["knowledgeSourceCounter"]["usage"], 0);
 }
 
 #[tokio::test]

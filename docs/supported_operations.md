@@ -99,7 +99,7 @@ Validation (rejected with `400 InvalidSynonymMap`): missing/empty `name`, `forma
 
 ## Index aliases
 
-Service-level resource (not scoped to an index). Aliases are stored and echoed **and resolve on the data plane**: search, document upload/lookup/count, suggest, autocomplete, and analyze-text accept an alias name anywhere an index name is accepted (operating on the alias target: the first entry of its `indexes` array). Index management routes do not resolve aliases (see `docs/known_differences.md`).
+Service-level resource (not scoped to an index). Aliases are stored and echoed **and resolve on both the data plane and the management plane**: search, document upload/lookup/count, suggest, autocomplete, and analyze-text accept an alias name anywhere an index name is accepted (operating on the alias target: the first entry of its `indexes` array). Index management routes (`GET`/`PUT`/`DELETE /indexes('name')`) also resolve aliases: `GET` returns the target index's definition, `PUT` updates the target index, and `DELETE` deletes the target index (the alias itself is not modified). `POST /indexes` (create) does not resolve aliases.
 
 | Operation | SDK method | HTTP request | Success | Errors | Status |
 |-----------|-----------|--------------|---------|--------|--------|
@@ -211,7 +211,7 @@ Route: `POST /indexes('{name}')/docs/search.post.search?api-version=...`.
 | Suggest | `SearchClient.suggest(search_text=..., suggester_name=..., filter=...)` (`/docs/search.post.suggest`) | Supported (prefix/infix match against the suggester's fields; optional `filter` narrows candidates; returns documents + `@search.text`) |
 | Autocomplete | `SearchClient.autocomplete(search_text=..., suggester_name=..., filter=...)` (`/docs/search.post.autocomplete`) | Supported (prefix/infix match against the suggester's fields; optional `filter` narrows candidates; returns `text` + `queryPlusText`) |
 | Analyze text | `SearchIndexClient.analyze_text(...)` (`/search.analyze`) | Supported (English analyzer; `keyword`/`whitespace` tokenize as documented; `analyzer`/`field` validated) |
-| Service statistics | `SearchIndexClient.get_service_statistics()` (`/servicestats`) | Supported (static response: zero counters, default limits) |
+| Service statistics | `SearchIndexClient.get_service_statistics()` (`/servicestats`) | Supported (real counts: index/document/synonym-map/alias/knowledge-base/knowledge-source counters, approximate storage usage in KB, static limits) |
 | Query type | `queryType=` (`simple`/`full`) | Supported (`simple` is the default; `full` is Lucene syntax: `AND`/`OR`/`NOT`, `field:term`, `term~N`, `term*`, ranges, `^N` boosts; other values rejected with `400 InvalidQuery`) |
 
 The full list of search options rejected with `400 UnsupportedQuery`: `scoringProfile`, `scoringParameters`, `scoringStatistics`, `minimumCoverage`, `answers`, `captions`, `semantic`, `semanticConfiguration`, `semanticQuery`, `semanticErrorHandling`, `semanticMaxWaitInMilliseconds`, `debug`.

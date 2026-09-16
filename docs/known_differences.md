@@ -106,8 +106,7 @@ Differences fall into two categories:
 
 ### Index aliases
 
-- Aliases are stored, echoed, and managed (create/update/get/list/delete), and **resolve on the data plane**: search, document upload/lookup/count, suggest, autocomplete, and analyze-text accept an alias name anywhere an index name is accepted, operating on the alias target (the first entry of its `indexes` array). An alias pointing at a missing index behaves like the missing index (`404 ResourceNotFound`).
-- Index management routes (`PUT`/`DELETE /indexes('name')`) do not resolve aliases.
+- Aliases are stored, echoed, and managed (create/update/get/list/delete), and **resolve on both the data plane and the management plane**: search, document upload/lookup/count, suggest, autocomplete, and analyze-text accept an alias name anywhere an index name is accepted, operating on the alias target (the first entry of its `indexes` array). Index management routes (`GET`/`PUT`/`DELETE /indexes('name')`) also resolve aliases: `GET` returns the target index's definition, `PUT` updates the target index, and `DELETE` deletes the target index (the alias itself is not modified). An alias pointing at a missing index behaves like the missing index (`404 ResourceNotFound`).
 - Index and alias names share one namespace: creating an index named like an existing alias (or an alias named like an existing index) is `409`, since the alias would otherwise shadow the index on the data plane.
 - Etags are opaque counter strings, not Azure's hex entity tags.
 - **Rationale:** resolution is a name substitution before dispatch, so alias-backed tests exercise the same code paths as direct index tests.

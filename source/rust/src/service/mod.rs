@@ -244,15 +244,17 @@ impl SearchService {
             .collect()
     }
 
-    /// Deletes an index by name.
+    /// Deletes an index by name. When `name` is an alias, the target index
+    /// is deleted (the alias itself is not modified).
     ///
     /// # Errors
     ///
-    /// Returns an [`ApiError`] if the index does not exist.
+    /// Returns an [`ApiError`] if the index (or alias target) does not exist.
     pub fn delete_index(&self, name: &str) -> Result<(), ApiError> {
-        if self.storage.delete_index(name) {
-            self.engine.delete_index(name);
-            self.vectors.delete_index(name);
+        let resolved = self.resolve_index_name(name);
+        if self.storage.delete_index(&resolved) {
+            self.engine.delete_index(&resolved);
+            self.vectors.delete_index(&resolved);
             Ok(())
         } else {
             Err(ApiError::not_found(format!(
@@ -1608,6 +1610,50 @@ impl SearchService {
         }
     }
 
+    /// Returns the service statistics: real counts of indexes, documents,
+    /// synonym maps, aliases, knowledge bases, and knowledge sources, plus
+    /// approximate storage usage and static limits.
+    #[must_use]
+    pub fn service_stats(&self) -> Value {
+        let index_names = self.storage.list_index_names();
+        let index_count = index_names.len();
+
+        let mut document_count = 0u64;
+        let mut storage_bytes = 0u64;
+        for name in &index_names {
+            if let Ok(docs) = self.storage.get_documents(name) {
+                document_count += u64::try_from(docs.len()).unwrap_or(u64::MAX);
+                for doc in &docs {
+                    storage_bytes = storage_bytes.saturating_add(
+                        serde_json::to_vec(&doc.to_value())
+                            .map_or(0, |v| u64::try_from(v.len()).unwrap_or(0)),
+                    );
+                }
+            }
+        }
+
+        let synonym_map_count = self.synonym_maps.list().len();
+        let alias_count = self.named_store(ResourceKind::Alias).list().len();
+        let knowledge_base_count = self.named_store(ResourceKind::KnowledgeBase).list().len();
+        let knowledge_source_count = self.named_store(ResourceKind::KnowledgeSource).list().len();
+        let storage_kb = storage_bytes / 1024;
+
+        serde_json::json!({
+            "counters": {
+                "indexCounter": {"usage": index_count, "limit": 100},
+                "documentCounter": {"usage": document_count, "limit": 10_000_000},
+                "storageCounter": {"usage": storage_kb, "limit": 10_240},
+                "synonymMapCounter": {"usage": synonym_map_count, "limit": 100},
+                "aliasCounter": {"usage": alias_count, "limit": 100},
+                "knowledgeBaseCounter": {"usage": knowledge_base_count, "limit": 100},
+                "knowledgeSourceCounter": {"usage": knowledge_source_count, "limit": 100}
+            },
+            "limits": {
+                "maxVectorIndexSizePerIndexInBytes": 1_073_741_824
+            }
+        })
+    }
+
     /// Looks up the index definition, cloning it out of storage. The clone is
     /// intentional: definitions are small schemas (not documents), and an
     /// owned value keeps the storage/engine/vector boundaries lifetime-free.
@@ -1623,9 +1669,11 @@ impl SearchService {
     /// Resolves an index name through the alias table: when `name` is an
     /// alias, returns its target index (the first entry of the alias's
     /// `indexes` array); otherwise returns `name` unchanged. Data-plane
-    /// routes (search, documents, suggest, autocomplete, analyze) accept an
-    /// alias name anywhere an index name is accepted.
-    fn resolve_index_name(&self, name: &str) -> String {
+    /// routes (search, documents, suggest, autocomplete, analyze) and
+    /// management routes (get/update/delete index) accept an alias name
+    /// anywhere an index name is accepted.
+    #[must_use]
+    pub fn resolve_index_name(&self, name: &str) -> String {
         let Ok(alias) = self.get_named_resource(ResourceKind::Alias, name) else {
             return name.to_owned();
         };
