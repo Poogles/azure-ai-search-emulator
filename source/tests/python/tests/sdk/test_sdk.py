@@ -1,6 +1,9 @@
 """SDK compatibility tests: every supported operation through the official SDK."""
 
 import json
+import urllib.error
+import urllib.request
+from typing import Any
 
 import pytest
 from azure.core.credentials import AzureKeyCredential
@@ -1742,3 +1745,86 @@ def test_search_non_string_fields(
     assert [doc["id"] for doc in found] == ["1"]
     found = list(search_client.search(search_text="50"))
     assert [doc["id"] for doc in found] == ["2"]
+
+
+def _raw_post(url: str, payload: dict[str, Any]) -> tuple[int, Any]:
+    """Issue a JSON POST and return (status, parsed body) without raising on 4xx/5xx."""
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"api-key": API_KEY, "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode())
+
+
+def test_search_minimum_coverage_gates_results(
+    index_client: SearchIndexClient, search_client: SearchClient
+) -> None:
+    """`minimumCoverage` gates inclusion for `searchMode=any` multi-term queries."""
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchableField(name="title", type=SearchFieldDataType.String),
+            ],
+        )
+    )
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "alpha beta gamma"},
+            {"id": "2", "title": "alpha delta"},
+            {"id": "3", "title": "beta epsilon"},
+        ]
+    )
+    # 3 query terms; threshold = ceil(0.5 * 3) = 2 → only the doc matching all 3.
+    found = list(
+        search_client.search(
+            search_text="alpha beta gamma", search_mode="any", minimum_coverage=0.5
+        )
+    )
+    assert [doc["id"] for doc in found] == ["1"]
+    # threshold = ceil(0.2 * 3) = 1 → every doc matching at least one term.
+    found = list(
+        search_client.search(
+            search_text="alpha beta gamma", search_mode="any", minimum_coverage=0.2
+        )
+    )
+    assert {doc["id"] for doc in found} == {"1", "2", "3"}
+
+
+def test_search_debug_option(clean_emulator: str, index_client: SearchIndexClient) -> None:
+    """`debug` (the SDK's `QueryDebugMode` string) adds `@search.debug`.
+
+    Exercised over raw HTTP because the pinned SDK does not model the additive
+    `@search.debug` response property. The SDK sends `debug` as a string in the
+    request body; any mode other than `disabled` enables the diagnostics object.
+    """
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchableField(name="title", type=SearchFieldDataType.String),
+            ],
+        )
+    )
+    url = (
+        f"{clean_emulator}/indexes('{INDEX_NAME}')/docs/search.post.search"
+        f"?api-version={API_VERSION}"
+    )
+    status, body = _raw_post(url, {"search": "alpha", "debug": "vector"})
+    assert status == 200
+    assert isinstance(body.get("@search.debug"), dict)
+    assert "query" in body["@search.debug"]
+    assert "execution" in body["@search.debug"]
+
+    # `disabled` (the SDK's off value) omits the object.
+    status, body = _raw_post(url, {"search": "alpha", "debug": "disabled"})
+    assert status == 200
+    assert "@search.debug" not in body

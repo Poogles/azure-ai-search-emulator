@@ -1,0 +1,18 @@
+{
+  "method": "POST",
+  "url": "http://<endpoint>/indexes?api-version=2024-07-01",
+  "headers": {
+    "Content-Type": "application/json",
+    "Content-Length": "451",
+    "Accept": "application/json;odata.metadata=minimal",
+    "User-Agent": "<user-agent>",
+    "api-key": "fixture-key"
+  },
+  "request_body": "{\"name\": \"fixture-phase22-index\", \"fields\": [{\"name\": \"id\", \"type\": \"Edm.String\", \"key\": true}, {\"name\": \"title\", \"type\": \"Edm.String\", \"key\": false, \"searchable\": true, \"filterable\": false, \"facetable\": false, \"sortable\": false, \"synonymMaps\": [\"fixture-sm\"], \"retrievable\": true}, {\"name\": \"published\", \"type\": \"Edm.DateTimeOffset\", \"key\": false, \"searchable\": false, \"filterable\": true, \"facetable\": false, \"sortable\": false, \"retrievable\": true}]}",
+  "status_code": 201,
+  "response_headers": {
+    "content-type": "application/json",
+    "content-length": "409"
+  },
+  "response_body": "{\"fields\":[{\"key\":true,\"name\":\"id\",\"type\":\"Edm.String\"},{\"facetable\":false,\"filterable\":false,\"key\":false,\"name\":\"title\",\"retrievable\":true,\"searchable\":true,\"sortable\":false,\"synonymMaps\":[\"fixture-sm\"],\"type\":\"Edm.String\"},{\"facetable\":false,\"filterable\":true,\"key\":false,\"name\":\"published\",\"retrievable\":true,\"searchable\":false,\"sortable\":false,\"type\":\"Edm.DateTimeOffset\"}],\"name\":\"fixture-phase22-index\"}"
+}

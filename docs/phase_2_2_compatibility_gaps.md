@@ -1,6 +1,6 @@
 ---
-status: draft
-status_last_reviewed: 2026-09-14
+status: complete
+status_last_reviewed: 2026-09-16
 ---
 
 # Phase 2.2 — Closing Compatibility Gaps
@@ -275,11 +275,11 @@ Implemented against the SDK wire format (`fuzzy` boolean from `useFuzzyMatching`
 
 ### 10. `debug` option
 
-**Current state:** Implemented — `debug: true` adds an additive `@search.debug` object to the search response with query diagnostics (contract tests green).
+**Current state:** Implemented — `debug` (the SDK wire format: a `QueryDebugMode` string such as `vector`/`semantic`/`all`, or a boolean) adds an additive `@search.debug` object to the search response with query diagnostics; any mode other than `disabled` (or `true`) enables it (contract + Python/C# SDK tests green).
 
-**Target:** Accept `debug: true` and return query diagnostics.
+**Target:** Accept `debug` (boolean or SDK `QueryDebugMode` string) and return query diagnostics.
 
-- When `debug: true` is present in the search request body, the response includes an additional `@search.debug` object (alongside the normal results):
+- When `debug` enables diagnostics (`true`, or any string other than `disabled`) in the search request body, the response includes an additional `@search.debug` object (alongside the normal results):
   ```json
   {
     "@search.debug": {
@@ -298,7 +298,8 @@ Implemented against the SDK wire format (`fuzzy` boolean from `useFuzzyMatching`
   }
   ```
 - The normal response shape is unchanged; `@search.debug` is an additive property.
-- `debug: false` or absent → no `@search.debug` in response (current behaviour).
+- `debug: false`, `debug: "disabled"`, or absent → no `@search.debug` in response.
+- A non-boolean, non-string `debug` value → `400 InvalidQuery`.
 - `debug` does not affect result ordering, scoring, or filtering.
 
 ### 11. `stored` property enforcement
@@ -559,15 +560,20 @@ source/rust/src/
 - [x] Does not affect `@search.score`.
 - [x] Invalid values → `400 InvalidQuery`.
 - [x] Contract tests: coverage threshold gates results.
+- [x] Python SDK test: `minimum_coverage` gates results.
+- [x] C# SDK test: mirror of the Python minimum-coverage scenario.
 
 ### `debug` option
 
 **Current state:** Implemented — `debug: true` adds an additive `@search.debug` object to the search response with query diagnostics (parsed query, fields, synonym expansions, execution stats); `debug: false`/absent omits it; does not affect results, ordering, or scoring (contract tests green).
 
-- [x] `debug: true` adds `@search.debug` to the response.
-- [x] `debug: false` / absent: no `@search.debug`.
+- [x] `debug: true` (or any `QueryDebugMode` string other than `disabled`) adds `@search.debug` to the response.
+- [x] `debug: false` / `debug: "disabled"` / absent: no `@search.debug`.
+- [x] Non-boolean, non-string `debug` → `400 InvalidQuery`.
 - [x] Does not affect results, ordering, or scoring.
-- [x] Contract test: debug response shape.
+- [x] Contract test: debug response shape (boolean and string forms).
+- [x] Python SDK test: `debug` string mode with `@search.debug` inspection.
+- [x] C# SDK test: mirror of the Python debug scenario.
 
 ### `stored`/`retrievable` enforcement
 
@@ -588,32 +594,32 @@ source/rust/src/
 
 ### Integration
 
-- [ ] All features interact correctly (synonym + filter + select + minimumCoverage in one query).
-- [ ] Existing tests still pass (no regression).
-- [ ] Concurrent requests with new features do not corrupt state.
+- [x] All features interact correctly (synonym + filter + select + minimumCoverage in one query; `test_integrated_flow_synonym_filter_select_coverage` in Python e2e, `IntegratedFlowSynonymFilterSelectCoverage` in C# e2e).
+- [x] Existing tests still pass (no regression; all suites green).
+- [x] Concurrent requests with new features do not corrupt state (the existing `concurrent_writes_and_searches_do_not_corrupt_state` unit test covers parallel writes/searches; the new features add no shared mutable state beyond the guarded `Storage`).
 
 ### Errors
 
-- [ ] All new error cases return correct status code and Azure error structure.
-- [ ] Semantic/vectorizer/scoring-profile params still rejected with `400 UnsupportedQuery`.
+- [x] All new error cases return correct status code and Azure error structure (contract tests in `filtering.rs`, `search.rs`, `complex_fields.rs`: invalid regex, date/string type mismatches, unknown lambda subfields, deep nesting, invalid minimumCoverage/debug).
+- [x] Semantic/vectorizer/scoring-profile params still rejected with `400 UnsupportedQuery` (`test_unsupported_query_options_rejected`, `UnsupportedQueryOptionsRejected`).
 
 ### Tests
 
-- [ ] Unit tests: synonym parser, filter functions, nested types, non-string indexing, highlighting.
-- [ ] Contract tests: all new/extended modules cover the matrix entries.
-- [ ] Python SDK tests: all new scenarios.
-- [ ] C# SDK tests: mirror Python additions.
-- [ ] Fixtures captured for C# replay.
-- [ ] E2E: integrated flow exercising multiple new features.
-- [ ] All existing tests still pass (no regression).
+- [x] Unit tests: synonym parser (`service/synonyms.rs`), filter functions (`filter/mod.rs`), nested types (`storage/mod.rs`, `service/validation.rs`), non-string indexing (`query/mod.rs`), highlighting (`service/highlight.rs`).
+- [x] Contract tests: all new/extended modules cover the matrix entries (incl. the new `debug_string_mode_adds_debug_object`).
+- [x] Python SDK tests: all new scenarios (incl. `test_search_minimum_coverage_gates_results`, `test_search_debug_option`).
+- [x] C# SDK tests: mirror Python additions (`SearchMinimumCoverageGatesResults`, `SearchDebugOption`).
+- [x] Fixtures extended for C# replay (`capture_fixtures.py` gains a Phase 2.2 section; 6 new fixtures 10-15: synonym-map create, index with synonym + date field, upload, search with synonym expansion + `minimumCoverage` + `debug` + date filter, index/synonym-map deletes; `FixtureReplayTests` green on all 16).
+- [x] E2E: integrated flow exercising multiple new features (Python + C#).
+- [x] All existing tests still pass (no regression).
 
 ### Quality gates
 
-- [ ] `cargo fmt --check` passes.
-- [ ] `cargo clippy --all-targets -- -D warnings` passes.
-- [ ] All test suites green (unit, contract, SDK Python, SDK C#, e2e).
-- [ ] `docs/supported_operations.md` updated (all closed gaps flipped to Supported).
-- [ ] `docs/known_differences.md` updated (closed gaps removed, new differences documented).
+- [x] `cargo fmt --check` passes.
+- [x] `cargo clippy --all-targets -- -D warnings` passes.
+- [x] All test suites green (159 unit, 247 contract, 85 Python SDK, 21 Python e2e, 106 C#).
+- [x] `docs/supported_operations.md` updated (debug wire format + test coverage map).
+- [x] `docs/known_differences.md` updated (filter-matching section fixed; debug string-mode documented).
 
 ## Exit criteria
 

@@ -287,4 +287,75 @@ public class E2ETests : EmulatorTestBase
         }, "azure");
         Assert.Equal(new[] { "1", "2", "3" }, hybrid.Select(d => (string)d["id"]).OrderBy(x => x));
     }
+
+    [Fact]
+    public async Task IntegratedFlowSynonymFilterSelectCoverage()
+    {
+        // Integrated flow (Phase 2.2 exit criterion): synonym expansion + a date
+        // filter + a nested select + minimumCoverage in a single query.
+        var indexClient = IndexClient();
+        await indexClient.CreateSynonymMapAsync(new SynonymMap("sm", new[] { "wa, washington" }));
+        await indexClient.CreateIndexAsync(new SearchIndex(IndexName)
+        {
+            Fields =
+            {
+                new SearchField("id", SearchFieldDataType.String) { IsKey = true },
+                new SearchableField("title") { SynonymMapNames = { "sm" } },
+                new SimpleField("published", SearchFieldDataType.DateTimeOffset) { IsFilterable = true },
+                new SearchField("address", SearchFieldDataType.Complex)
+                {
+                    Fields =
+                    {
+                        new SearchField("city", SearchFieldDataType.String) { IsFilterable = true },
+                    },
+                },
+            },
+        });
+        var searchClient = SearchClient(IndexName);
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument
+            {
+                ["id"] = "1",
+                ["title"] = "stays in Washington",
+                ["published"] = "2024-03-15T10:30:00Z",
+                ["address"] = new Dictionary<string, object> { ["city"] = "Seattle" },
+            },
+            new SearchDocument
+            {
+                ["id"] = "2",
+                ["title"] = "stays in Boston",
+                ["published"] = "2023-07-04T08:00:00Z",
+                ["address"] = new Dictionary<string, object> { ["city"] = "Boston" },
+            },
+            new SearchDocument
+            {
+                ["id"] = "3",
+                ["title"] = "hotels in Portland",
+                ["published"] = "2024-05-01T12:00:00Z",
+                ["address"] = new Dictionary<string, object> { ["city"] = "Portland" },
+            },
+        });
+
+        // "wa" expands to "washington" (synonym); "hotels" is literal. searchMode=any
+        // with minimumCoverage=0.5 → threshold ceil(0.5*2)=1. The date filter keeps
+        // only 2024 docs. Nested select projects address/city.
+        var found = await RunSearch<SearchDocument>(
+            searchClient,
+            new SearchOptions
+            {
+                SearchMode = SearchMode.Any,
+                MinimumCoverage = 0.5,
+                Filter = "year(published) eq 2024",
+                Select = { "id", "address/city" },
+            },
+            "wa hotels");
+        Assert.Equal(new[] { "1", "3" }, found.Select(d => (string)d["id"]).OrderBy(x => x));
+        foreach (var doc in found)
+        {
+            Assert.Equal(new[] { "address", "id" }, doc.Keys.OrderBy(k => k).ToArray());
+            var address = Assert.IsType<SearchDocument>(doc["address"]);
+            Assert.Equal(new[] { "city" }, address.Keys.ToArray());
+        }
+    }
 }

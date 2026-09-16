@@ -1892,4 +1892,67 @@ public class SdkTests : EmulatorTestBase
         found = await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "50");
         Assert.Equal(new[] { "2" }, found.Select(d => (string)d["id"]));
     }
+
+    [Fact]
+    public async Task SearchMinimumCoverageGatesResults()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(new SearchIndex(IndexName)
+        {
+            Fields =
+            {
+                new SearchField("id", SearchFieldDataType.String) { IsKey = true },
+                new SearchableField("title"),
+            },
+        });
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = "alpha beta gamma" },
+            new SearchDocument { ["id"] = "2", ["title"] = "alpha delta" },
+            new SearchDocument { ["id"] = "3", ["title"] = "beta epsilon" },
+        });
+
+        // 3 query terms; threshold = ceil(0.5 * 3) = 2 → only the doc matching all 3.
+        var found = await RunSearch<SearchDocument>(
+            searchClient,
+            new SearchOptions { SearchMode = SearchMode.Any, MinimumCoverage = 0.5 },
+            "alpha beta gamma");
+        Assert.Equal(new[] { "1" }, found.Select(d => (string)d["id"]));
+        // threshold = ceil(0.2 * 3) = 1 → every doc matching at least one term.
+        found = await RunSearch<SearchDocument>(
+            searchClient,
+            new SearchOptions { SearchMode = SearchMode.Any, MinimumCoverage = 0.2 },
+            "alpha beta gamma");
+        Assert.Equal(new[] { "1", "2", "3" }, found.Select(d => (string)d["id"]).OrderBy(x => x));
+    }
+
+    [Fact]
+    public async Task SearchDebugOption()
+    {
+        var indexClient = IndexClient();
+        await indexClient.CreateIndexAsync(new SearchIndex(IndexName)
+        {
+            Fields =
+            {
+                new SearchField("id", SearchFieldDataType.String) { IsKey = true },
+                new SearchableField("title"),
+            },
+        });
+        // The SDK sends `debug` as a `QueryDebugMode` string in the request body;
+        // any mode other than `disabled` enables the additive `@search.debug`
+        // object. Exercised over raw HTTP because the pinned SDK does not model
+        // the `@search.debug` response property.
+        var url = $"{BaseUrl}/indexes('{IndexName}')/docs/search.post.search?api-version={ApiVersion}";
+        var (status, body) = await RawPostAsync(url, """{"search": "alpha", "debug": "vector"}""");
+        Assert.Equal(200, status);
+        Assert.Contains("\"@search.debug\"", body);
+        Assert.Contains("\"query\"", body);
+        Assert.Contains("\"execution\"", body);
+
+        // `disabled` (the SDK's off value) omits the object.
+        var (statusDisabled, bodyDisabled) = await RawPostAsync(url, """{"search": "alpha", "debug": "disabled"}""");
+        Assert.Equal(200, statusDisabled);
+        Assert.DoesNotContain("@search.debug", bodyDisabled);
+    }
 }

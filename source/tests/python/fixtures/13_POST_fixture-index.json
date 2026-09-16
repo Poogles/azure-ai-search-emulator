@@ -1,0 +1,18 @@
+{
+  "method": "POST",
+  "url": "http://<endpoint>/indexes('fixture-phase22-index')/docs/search.post.search?api-version=2024-07-01",
+  "headers": {
+    "Content-Type": "application/json",
+    "Content-Length": "124",
+    "Accept": "application/json;odata.metadata=none",
+    "User-Agent": "<user-agent>",
+    "api-key": "fixture-key"
+  },
+  "request_body": "{\"search\": \"wa hotels\", \"filter\": \"year(published) eq 2024\", \"minimumCoverage\": 0.5, \"searchMode\": \"any\", \"debug\": \"vector\"}",
+  "status_code": 200,
+  "response_headers": {
+    "content-type": "application/json",
+    "content-length": "469"
+  },
+  "response_body": "{\"@odata.context\":\"/$metadata#documents\",\"@search.debug\":{\"execution\":{\"filterApplied\":true,\"matchedDocuments\":2,\"totalCandidates\":2,\"vectorQueries\":0},\"query\":{\"fields\":[],\"parsed\":\"wa hotels\",\"synonymExpansions\":{\"wa\":[\"washington\"]}}},\"value\":[{\"@search.score\":0.6931471824645996,\"id\":\"1\",\"published\":\"2024-03-15T10:30:00Z\",\"title\":\"stays in Washington\"},{\"@search.score\":0.6931471824645996,\"id\":\"2\",\"published\":\"2024-05-01T12:00:00Z\",\"title\":\"hotels in Portland\"}]}"
+}

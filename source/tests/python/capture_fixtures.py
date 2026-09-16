@@ -234,6 +234,73 @@ def main() -> None:
     )
     index_client.delete_index("fixture-vector-index")
 
+    # Phase 2.2 wire formats: synonym maps, minimumCoverage, debug, and filter
+    # functions — captured for C# replay.
+    from azure.search.documents.indexes.models import (
+        SearchableField,
+        SimpleField,
+        SynonymMap,
+    )
+
+    phase22_client = SearchClient(
+        endpoint=args.endpoint,
+        index_name="fixture-phase22-index",
+        credential=CREDENTIAL,
+        api_version=API_VERSION,
+        transport=transport,
+    )
+    index_client.create_synonym_map(
+        SynonymMap(name="fixture-sm", synonyms=["wa, washington"])
+    )
+    index_client.create_index(
+        SearchIndex(
+            name="fixture-phase22-index",
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchableField(
+                    name="title",
+                    type=SearchFieldDataType.String,
+                    synonym_map_names=["fixture-sm"],
+                ),
+                SimpleField(
+                    name="published",
+                    # Wire-format string: mypy infers the
+                    # `SearchFieldDataType.DateTimeOffset` member as a generic
+                    # `Enum` (Azure SDK custom metaclass), incompatible with
+                    # `SimpleField`'s `str | SearchFieldDataType` annotation.
+                    type="Edm.DateTimeOffset",
+                    filterable=True,
+                ),
+            ],
+        )
+    )
+    phase22_client.upload_documents(
+        documents=[
+            {
+                "id": "1",
+                "title": "stays in Washington",
+                "published": "2024-03-15T10:30:00Z",
+            },
+            {
+                "id": "2",
+                "title": "hotels in Portland",
+                "published": "2024-05-01T12:00:00Z",
+            },
+        ]
+    )
+    # Synonym expansion + date filter + minimumCoverage + debug in one request.
+    list(
+        phase22_client.search(
+            search_text="wa hotels",
+            search_mode="any",
+            minimum_coverage=0.5,
+            filter="year(published) eq 2024",
+            debug="vector",
+        )
+    )
+    index_client.delete_index("fixture-phase22-index")
+    index_client.delete_synonym_map("fixture-sm")
+
     transport.close()
 
     # Write sanitized fixtures

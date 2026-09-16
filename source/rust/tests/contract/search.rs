@@ -1190,6 +1190,49 @@ async fn debug_false_or_absent_omits_debug_object() {
 }
 
 #[tokio::test]
+async fn debug_string_mode_adds_debug_object() {
+    let app = coverage_app().await;
+    // The SDK wire format is a `QueryDebugMode` string; any mode other than
+    // `disabled` enables the `@search.debug` object.
+    for mode in [
+        "vector",
+        "semantic",
+        "all",
+        "queryRewrites",
+        "semantic|queryRewrites",
+    ] {
+        let (status, body) = call(
+            app.clone(),
+            search_request("items", json!({"search": "alpha", "debug": mode})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "debug {mode:?}: {body}");
+        assert!(
+            body["@search.debug"].is_object(),
+            "expected @search.debug for {mode:?}, got {body}"
+        );
+    }
+
+    // `disabled` (the SDK's off value) omits the object.
+    let (status, body) = call(
+        app.clone(),
+        search_request("items", json!({"search": "alpha", "debug": "disabled"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.get("@search.debug").is_none());
+
+    // A non-boolean, non-string value is rejected.
+    let (status, body) = call(
+        app,
+        search_request("items", json!({"search": "alpha", "debug": 42})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "InvalidQuery");
+}
+
+#[tokio::test]
 async fn debug_does_not_affect_results() {
     let app = coverage_app().await;
     let (status, body_no_debug) = call(

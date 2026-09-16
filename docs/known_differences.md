@@ -54,7 +54,7 @@ Differences fall into two categories:
 - `searchFields` weights (`field^N`, with a finite positive `N`) scale the field's BM25 contribution to `@search.score`.
 - `POST /search.analyze` uses the English analyzer, except `keyword` (the whole input as one verbatim token) and `whitespace` (whitespace split without lowercasing or stemming), which tokenize as Azure documents them. An explicit `analyzer` (`analyzerName` alias accepted) must be a known analyzer name and `field` (`fieldName` alias accepted) must exist in the index schema. Unknown analyzers/fields are rejected with `400 InvalidRequest`.
 - `minimumCoverage` gates inclusion for `searchMode=any` multi-term queries (a document must match at least `ceil(minimumCoverage × total_terms)` terms) but does not affect `@search.score`; Azure's ranking model may incorporate coverage into scoring.
-- `debug: true` adds an `@search.debug` object with emulator-internal query diagnostics (parsed query representation, in-scope fields, synonym expansions, execution stats); Azure's debug output uses its internal query plan format. The shape is emulator-defined.
+- `debug` (the SDK's `QueryDebugMode` string — `disabled`/`semantic`/`vector`/`queryRewrites`/`innerHits`/`all`, pipe-combinable — or a boolean) adds an `@search.debug` object with emulator-internal query diagnostics (parsed query representation, in-scope fields, synonym expansions, execution stats) for any mode other than `disabled`; Azure's debug output uses its internal query plan format and is mode-specific. The shape is emulator-defined and the same for every enabled mode.
 - **Rationale:** whole-token, case-insensitive matching covers the assertions our tests make; e2e assertions deliberately use whole-token search terms so they would also pass against Azure.
 
 ### Autocomplete and suggest
@@ -69,8 +69,9 @@ Differences fall into two categories:
 
 ### Filter matching
 
-- The documented operator set (`and`/`or`/`not`, parentheses, `eq`/`ne`/`gt`/`ge`/`lt`/`le`, `in` with a parenthesized value list, the string functions `startswith`/`endswith`/`contains`, `any`/`all` in both the space-separated and `field/any(var: body)` lambda forms); anything else (e.g. other string/date functions, `search.ismatch`) is rejected with `400 InvalidQuery` rather than approximated.
+- The documented operator set (`and`/`or`/`not`, parentheses, `eq`/`ne`/`gt`/`ge`/`lt`/`le`, `in` with a parenthesized value list, the string functions `startswith`/`endswith`/`contains`, the OData date functions `year`/`month`/`day`/`hour`/`minute`/`second`/`date`/`time`/`now`, the string value functions `length`/`indexof`/`substring`/`tolower`/`toupper`/`trim`, `search.ismatch` as a case-insensitive regex, and `any`/`all` in both the space-separated and `field/any(var: body)` lambda forms, with one level of subfield access through the lambda variable); anything else is rejected with `400 InvalidQuery` rather than approximated.
 - String comparisons and string functions are ordinal and case-sensitive; Azure can be configured otherwise. Type mismatches and missing fields never match.
+- `search.ismatch` uses the Rust `regex` crate (RE2 subset); exotic .NET regex constructs (lookahead, backreferences) are not supported and are rejected with `400 InvalidQuery`.
 - **Rationale:** explicit rejection beats silently wrong result sets; test filters stay within the supported set.
 
 ### Facets, ordering, projection

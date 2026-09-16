@@ -1,0 +1,18 @@
+{
+  "method": "POST",
+  "url": "http://<endpoint>/indexes('fixture-phase22-index')/docs/search.index?api-version=2024-07-01",
+  "headers": {
+    "Content-Type": "application/json",
+    "Content-Length": "230",
+    "Accept": "application/json;odata.metadata=none",
+    "User-Agent": "<user-agent>",
+    "api-key": "fixture-key"
+  },
+  "request_body": "{\"value\": [{\"@search.action\": \"upload\", \"id\": \"1\", \"title\": \"stays in Washington\", \"published\": \"2024-03-15T10:30:00Z\"}, {\"@search.action\": \"upload\", \"id\": \"2\", \"title\": \"hotels in Portland\", \"published\": \"2024-05-01T12:00:00Z\"}]}",
+  "status_code": 200,
+  "response_headers": {
+    "content-type": "application/json",
+    "content-length": "137"
+  },
+  "response_body": "{\"value\":[{\"errorMessage\":null,\"key\":\"1\",\"status\":true,\"statusCode\":201},{\"errorMessage\":null,\"key\":\"2\",\"status\":true,\"statusCode\":201}]}"
+}

@@ -384,6 +384,101 @@ def test_batch_last_action_wins(
     assert list(search_client.search(search_text="nine")) == []
 
 
+def test_integrated_flow_synonym_filter_select_coverage(
+    clean_emulator: str, index_client: SearchIndexClient
+) -> None:
+    """Integrated flow (Phase 2.2 exit criterion): synonym expansion + a date
+    filter + a nested ``select`` + ``minimumCoverage`` in a single query.
+
+    ``"wa"`` expands to ``"washington"`` via the synonym map, so document 1 is
+    matched only through the expansion (its title does not contain ``wa`` or
+    ``hotels`` verbatim as a match for the other term). ``searchMode=any`` with
+    ``minimumCoverage=0.5`` sets the threshold to ``ceil(0.5 * 2) = 1``; the
+    ``year(published) eq 2024`` filter drops the 2023 document; the nested
+    ``select`` projects ``address/city``.
+    """
+    from azure.search.documents.indexes.models import (
+        SearchableField,
+        SimpleField,
+        SynonymMap,
+    )
+
+    index_client.create_synonym_map(SynonymMap(name="sm", synonyms=["wa, washington"]))
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchableField(
+                    name="title",
+                    type=SearchFieldDataType.String,
+                    synonym_map_names=["sm"],
+                ),
+                SimpleField(
+                    name="published",
+                    # Wire-format string: mypy infers the
+                    # `SearchFieldDataType.DateTimeOffset` member as a generic
+                    # `Enum` (Azure SDK custom metaclass), incompatible with
+                    # `SimpleField`'s `str | SearchFieldDataType` annotation.
+                    type="Edm.DateTimeOffset",
+                    filterable=True,
+                ),
+                SearchField(
+                    name="address",
+                    type=SearchFieldDataType.ComplexType,
+                    fields=[
+                        SearchField(
+                            name="city", type=SearchFieldDataType.String, filterable=True
+                        )
+                    ],
+                ),
+            ],
+        )
+    )
+    search_client = SearchClient(
+        endpoint=clean_emulator, index_name=INDEX_NAME, credential=CREDENTIAL
+    )
+    search_client.upload_documents(
+        documents=[
+            {
+                "id": "1",
+                "title": "stays in Washington",
+                "published": "2024-03-15T10:30:00Z",
+                "address": {"city": "Seattle"},
+            },
+            {
+                "id": "2",
+                "title": "stays in Boston",
+                "published": "2023-07-04T08:00:00Z",
+                "address": {"city": "Boston"},
+            },
+            {
+                "id": "3",
+                "title": "hotels in Portland",
+                "published": "2024-05-01T12:00:00Z",
+                "address": {"city": "Portland"},
+            },
+        ]
+    )
+
+    found = list(
+        search_client.search(
+            search_text="wa hotels",
+            search_mode="any",
+            minimum_coverage=0.5,
+            filter="year(published) eq 2024",
+            select=["id", "address/city"],
+        )
+    )
+    assert {doc["id"] for doc in found} == {"1", "3"}
+    for doc in found:
+        # The SDK adds `@search.*` metadata to every document; the projected
+        # fields are exactly the key plus the nested ``address/city`` subfield.
+        fields = {key for key in doc if not key.startswith("@search.")}
+        assert fields == {"id", "address"}
+        assert set(doc["address"]) == {"city"}
+
+
 def test_facet_string_form_options(
     clean_emulator: str,
     index_client: SearchIndexClient,

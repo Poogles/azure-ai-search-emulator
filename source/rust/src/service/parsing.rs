@@ -812,3 +812,24 @@ pub(crate) fn parse_minimum_coverage(obj: &Map<String, Value>) -> Result<f64, Ap
         Some(_) => Err(ApiError::invalid_query("minimumCoverage must be a number.")),
     }
 }
+
+/// Parses the `debug` option. The SDK wire format is a string
+/// (`QueryDebugMode`: `disabled`, `semantic`, `vector`, `queryRewrites`,
+/// `innerHits`, `all`, or pipe-combinations such as `semantic|queryRewrites`);
+/// a boolean is also accepted. Debug is enabled for `true` or any string other
+/// than `disabled`.
+///
+/// # Errors
+///
+/// Returns an [`ApiError`] (`400 InvalidQuery`) for values that are neither a
+/// boolean nor a string.
+pub(crate) fn parse_debug(obj: &Map<String, Value>) -> Result<bool, ApiError> {
+    match obj.get("debug") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(enabled)) => Ok(*enabled),
+        Some(Value::String(mode)) => Ok(mode != "disabled"),
+        Some(_) => Err(ApiError::invalid_query(
+            "debug must be a boolean or a string.",
+        )),
+    }
+}

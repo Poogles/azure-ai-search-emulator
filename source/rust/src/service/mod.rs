@@ -40,9 +40,9 @@ use self::facets::compute_facets;
 use self::highlight::{field_words, page_highlights};
 use self::ordering::{order_scored, rrf_fuse_weighted};
 use self::parsing::{
-    parse_facets, parse_filter_option, parse_highlight_options, parse_minimum_coverage,
-    parse_orderby, parse_paging_options, parse_search_fields, parse_search_mode, parse_select,
-    parse_vector_options, UNSUPPORTED_SEARCH_OPTIONS,
+    parse_debug, parse_facets, parse_filter_option, parse_highlight_options,
+    parse_minimum_coverage, parse_orderby, parse_paging_options, parse_search_fields,
+    parse_search_mode, parse_select, parse_vector_options, UNSUPPORTED_SEARCH_OPTIONS,
 };
 use self::resources::{named_resource, ResourceStore};
 use self::synonyms::{parse_synonym_rules, validate_synonym_map, SynonymRule};
@@ -1022,7 +1022,7 @@ impl SearchService {
             parse_highlight_options(obj, &definition)?;
 
         let minimum_coverage = parse_minimum_coverage(obj)?;
-        let debug = obj.get("debug").and_then(Value::as_bool).unwrap_or(false);
+        let debug = parse_debug(obj)?;
 
         Ok(SearchQuery {
             search,

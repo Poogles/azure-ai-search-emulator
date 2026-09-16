@@ -1,0 +1,18 @@
+{
+  "method": "POST",
+  "url": "http://<endpoint>/synonymmaps?api-version=2024-07-01",
+  "headers": {
+    "Content-Type": "application/json",
+    "Content-Length": "70",
+    "Accept": "application/json;odata.metadata=minimal",
+    "User-Agent": "<user-agent>",
+    "api-key": "fixture-key"
+  },
+  "request_body": "{\"name\": \"fixture-sm\", \"synonyms\": \"wa, washington\", \"format\": \"solr\"}",
+  "status_code": 201,
+  "response_headers": {
+    "content-type": "application/json",
+    "content-length": "96"
+  },
+  "response_body": "{\"@odata.etag\":\"\\\"0x00000001\\\"\",\"format\":\"solr\",\"name\":\"fixture-sm\",\"synonyms\":\"wa, washington\"}"
+}
