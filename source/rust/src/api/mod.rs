@@ -506,6 +506,9 @@ fn search_response(
     if let Some(facets) = &outcome.facets {
         map.insert("@search.facets".to_owned(), facets.clone());
     }
+    if let Some(debug) = &outcome.debug_info {
+        map.insert("@search.debug".to_owned(), debug.clone());
+    }
     map.insert(
         "value".to_owned(),
         Value::Array(build_page_entries(query, outcome)),

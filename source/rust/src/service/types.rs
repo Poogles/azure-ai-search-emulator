@@ -120,6 +120,12 @@ pub struct SearchQuery {
     /// resolved).
     pub vector_queries: Vec<VectorQuery>,
     pub vector_filter_mode: VectorFilterMode,
+    /// The `minimumCoverage` threshold (0.0–1.0); gates inclusion for
+    /// `searchMode=any` multi-term queries.
+    pub minimum_coverage: f64,
+    /// Whether `debug: true` was requested (adds `@search.debug` to the
+    /// response).
+    pub debug: bool,
 }
 
 /// The raw request state bound into continuation tokens: the raw `filter`,
@@ -209,6 +215,9 @@ pub struct SearchOutcome {
     pub has_more: bool,
     /// The `skip` value for the next page.
     pub next_skip: u64,
+    /// The `@search.debug` object, present only when `debug: true` was
+    /// requested.
+    pub debug_info: Option<Value>,
 }
 
 /// A single autocomplete completion: the completed term and the query with

@@ -262,7 +262,7 @@ Implemented against the SDK wire format (`fuzzy` boolean from `useFuzzyMatching`
 
 ### 9. `minimumCoverage` (search route)
 
-**Current state:** Rejected with `400 UnsupportedQuery`.
+**Current state:** Implemented — `minimumCoverage` is accepted on the search route and gates inclusion for `searchMode=any` multi-term queries (contract tests green).
 
 **Target:** Accept and apply `minimumCoverage` on the search route.
 
@@ -275,7 +275,7 @@ Implemented against the SDK wire format (`fuzzy` boolean from `useFuzzyMatching`
 
 ### 10. `debug` option
 
-**Current state:** Rejected with `400 UnsupportedQuery`.
+**Current state:** Implemented — `debug: true` adds an additive `@search.debug` object to the search response with query diagnostics (contract tests green).
 
 **Target:** Accept `debug: true` and return query diagnostics.
 
@@ -551,19 +551,23 @@ source/rust/src/
 
 ### `minimumCoverage`
 
-- [ ] Accepted on the search route (no longer `400 UnsupportedQuery`).
-- [ ] Gates inclusion for `searchMode=any` multi-term queries.
-- [ ] No effect for `searchMode=all` or single-term queries.
-- [ ] Does not affect `@search.score`.
-- [ ] Invalid values → `400 InvalidQuery`.
-- [ ] Contract tests: coverage threshold gates results.
+**Current state:** Implemented — `minimumCoverage` is accepted on the search route and gates inclusion for `searchMode=any` multi-term queries (a document must match at least `ceil(minimumCoverage × total_terms)` terms); no effect for `searchMode=all` or single-term queries; does not affect `@search.score`; invalid values → `400 InvalidQuery` (contract tests green).
+
+- [x] Accepted on the search route (no longer `400 UnsupportedQuery`).
+- [x] Gates inclusion for `searchMode=any` multi-term queries.
+- [x] No effect for `searchMode=all` or single-term queries.
+- [x] Does not affect `@search.score`.
+- [x] Invalid values → `400 InvalidQuery`.
+- [x] Contract tests: coverage threshold gates results.
 
 ### `debug` option
 
-- [ ] `debug: true` adds `@search.debug` to the response.
-- [ ] `debug: false` / absent: no `@search.debug`.
-- [ ] Does not affect results, ordering, or scoring.
-- [ ] Contract test: debug response shape.
+**Current state:** Implemented — `debug: true` adds an additive `@search.debug` object to the search response with query diagnostics (parsed query, fields, synonym expansions, execution stats); `debug: false`/absent omits it; does not affect results, ordering, or scoring (contract tests green).
+
+- [x] `debug: true` adds `@search.debug` to the response.
+- [x] `debug: false` / absent: no `@search.debug`.
+- [x] Does not affect results, ordering, or scoring.
+- [x] Contract test: debug response shape.
 
 ### `stored`/`retrievable` enforcement
 

@@ -213,8 +213,10 @@ Route: `POST /indexes('{name}')/docs/search.post.search?api-version=...`.
 | Analyze text | `SearchIndexClient.analyze_text(...)` (`/search.analyze`) | Supported (English analyzer; `keyword`/`whitespace` tokenize as documented; `analyzer`/`field` validated) |
 | Service statistics | `SearchIndexClient.get_service_statistics()` (`/servicestats`) | Supported (real counts: index/document/synonym-map/alias/knowledge-base/knowledge-source counters, approximate storage usage in KB, static limits) |
 | Query type | `queryType=` (`simple`/`full`) | Supported (`simple` is the default; `full` is Lucene syntax: `AND`/`OR`/`NOT`, `field:term`, `term~N`, `term*`, ranges, `^N` boosts; other values rejected with `400 InvalidQuery`) |
+| Minimum coverage | `minimumCoverage=` (float 0.0–1.0) | Supported (gates inclusion for `searchMode=any` multi-term queries: a document must match at least `ceil(minimumCoverage × total_terms)` terms; no effect for `searchMode=all` or single-term queries; does not affect `@search.score`; values outside [0.0, 1.0] or non-numeric → `400 InvalidQuery`) |
+| Debug | `debug=` (boolean) | Supported (`debug: true` adds an additive `@search.debug` object to the response with query diagnostics (parsed query, fields, synonym expansions, execution stats); does not affect results, ordering, or scoring) |
 
-The full list of search options rejected with `400 UnsupportedQuery`: `scoringProfile`, `scoringParameters`, `scoringStatistics`, `minimumCoverage`, `answers`, `captions`, `semantic`, `semanticConfiguration`, `semanticQuery`, `semanticErrorHandling`, `semanticMaxWaitInMilliseconds`, `debug`.
+The full list of search options rejected with `400 UnsupportedQuery`: `scoringProfile`, `scoringParameters`, `scoringStatistics`, `answers`, `captions`, `semantic`, `semanticConfiguration`, `semanticQuery`, `semanticErrorHandling`, `semanticMaxWaitInMilliseconds`.
 
 Accepted but inert (silently ignored): `sessionId` (the emulator uses deterministic score + key tie-breaking, so session affinity is irrelevant) and the index-schema `stored` property (no separate stored/retrievable enforcement beyond `retrievable`). Per-query `weight` is applied: it scales that vector query's contribution to the hybrid RRF fusion.
 

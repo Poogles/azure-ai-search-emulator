@@ -980,3 +980,260 @@ async fn analyze_text_accepts_analyzer_and_field() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "InvalidRequest");
 }
+
+// ---------------------------------------------------------------------------
+// minimumCoverage
+// ---------------------------------------------------------------------------
+
+async fn coverage_app() -> axum::Router {
+    let app = app();
+    let (status, _) = create_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        upload_request(
+            "items",
+            json!([
+                {"@search.action": "upload", "document": {"id": "1", "title": "alpha beta gamma", "price": 1.0}},
+                {"@search.action": "upload", "document": {"id": "2", "title": "alpha delta", "price": 2.0}},
+                {"@search.action": "upload", "document": {"id": "3", "title": "beta epsilon", "price": 3.0}},
+                {"@search.action": "upload", "document": {"id": "4", "title": "unrelated", "price": 4.0}}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    app
+}
+
+#[tokio::test]
+async fn minimum_coverage_gates_any_mode_results() {
+    let app = coverage_app().await;
+    // searchMode=any, 3 terms: alpha, beta, gamma.
+    // Doc 1 matches all 3, doc 2 matches 1 (alpha), doc 3 matches 1 (beta).
+    // minimumCoverage=0.5 → threshold = ceil(0.5 * 3) = 2 → only doc 1.
+    let (status, body) = call(
+        app.clone(),
+        search_request(
+            "items",
+            json!({"search": "alpha beta gamma", "searchMode": "any", "minimumCoverage": 0.5}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&body), vec!["1"]);
+
+    // minimumCoverage=0.34 → threshold = ceil(0.34 * 3) = 2 → only doc 1.
+    let (status, body) = call(
+        app.clone(),
+        search_request(
+            "items",
+            json!({"search": "alpha beta gamma", "searchMode": "any", "minimumCoverage": 0.34}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&body), vec!["1"]);
+
+    // minimumCoverage=0.2 → threshold = ceil(0.2 * 3) = 1 → docs 1, 2, 3.
+    let (status, body) = call(
+        app,
+        search_request(
+            "items",
+            json!({"search": "alpha beta gamma", "searchMode": "any", "minimumCoverage": 0.2}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut matched = ids(&body);
+    matched.sort();
+    assert_eq!(matched, vec!["1", "2", "3"]);
+}
+
+#[tokio::test]
+async fn minimum_coverage_no_effect_for_all_mode() {
+    let app = coverage_app().await;
+    // searchMode=all requires all terms; minimumCoverage has no additional effect.
+    let (status, body) = call(
+        app,
+        search_request(
+            "items",
+            json!({"search": "alpha beta gamma", "searchMode": "all", "minimumCoverage": 0.9}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&body), vec!["1"]);
+}
+
+#[tokio::test]
+async fn minimum_coverage_no_effect_for_single_term() {
+    let app = coverage_app().await;
+    // Single-term query: minimumCoverage has no effect.
+    let (status, body) = call(
+        app,
+        search_request(
+            "items",
+            json!({"search": "alpha", "searchMode": "any", "minimumCoverage": 0.9}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut matched = ids(&body);
+    matched.sort();
+    assert_eq!(matched, vec!["1", "2"]);
+}
+
+#[tokio::test]
+async fn minimum_coverage_invalid_values_rejected() {
+    let app = coverage_app().await;
+    for value in [json!(-0.1), json!(1.5), json!("high"), json!(true)] {
+        let (status, body) = call(
+            app.clone(),
+            search_request(
+                "items",
+                json!({"search": "alpha beta", "minimumCoverage": value}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "minimumCoverage {value} accepted: {body}"
+        );
+        assert_eq!(body["error"]["code"], "InvalidQuery");
+    }
+}
+
+#[tokio::test]
+async fn minimum_coverage_does_not_affect_score() {
+    let app = coverage_app().await;
+    // Without minimumCoverage, doc 1 and doc 2 both match "alpha".
+    let (status, body) = call(
+        app.clone(),
+        search_request(
+            "items",
+            json!({"search": "alpha beta", "searchMode": "any"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let score_without = body["value"][0]["@search.score"].as_f64().unwrap_or(0.0);
+
+    // With minimumCoverage=0.5, threshold = ceil(0.5*2) = 1, same docs match.
+    let (status, body) = call(
+        app,
+        search_request(
+            "items",
+            json!({"search": "alpha beta", "searchMode": "any", "minimumCoverage": 0.5}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let score_with = body["value"][0]["@search.score"].as_f64().unwrap_or(0.0);
+    assert!(
+        (score_without - score_with).abs() < f64::EPSILON,
+        "minimumCoverage must not change scores: {score_without} vs {score_with}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// debug option
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn debug_true_adds_search_debug_object() {
+    let app = coverage_app().await;
+    let (status, body) = call(
+        app,
+        search_request(
+            "items",
+            json!({"search": "alpha beta", "searchMode": "any", "debug": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let debug = &body["@search.debug"];
+    assert!(
+        debug.is_object(),
+        "expected @search.debug object, got {debug}"
+    );
+    // Query section.
+    assert!(debug["query"]["parsed"].is_string());
+    assert!(debug["query"]["fields"].is_array());
+    assert!(debug["query"]["synonymExpansions"].is_object());
+    // Execution section.
+    assert_eq!(debug["execution"]["totalCandidates"], 4);
+    assert!(debug["execution"]["matchedDocuments"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(debug["execution"]["filterApplied"], false);
+    assert_eq!(debug["execution"]["vectorQueries"], 0);
+    // Normal results are still present.
+    assert!(body["value"].is_array());
+}
+
+#[tokio::test]
+async fn debug_false_or_absent_omits_debug_object() {
+    let app = coverage_app().await;
+    // debug: false
+    let (status, body) = call(
+        app.clone(),
+        search_request("items", json!({"search": "alpha", "debug": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.get("@search.debug").is_none());
+
+    // debug absent
+    let (status, body) = call(app, search_request("items", json!({"search": "alpha"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.get("@search.debug").is_none());
+}
+
+#[tokio::test]
+async fn debug_does_not_affect_results() {
+    let app = coverage_app().await;
+    let (status, body_no_debug) = call(
+        app.clone(),
+        search_request(
+            "items",
+            json!({"search": "alpha beta", "searchMode": "any"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body_debug) = call(
+        app,
+        search_request(
+            "items",
+            json!({"search": "alpha beta", "searchMode": "any", "debug": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let ids_no = ids(&body_no_debug);
+    let ids_debug = ids(&body_debug);
+    assert_eq!(ids_no, ids_debug, "debug must not change result set");
+}
+
+#[tokio::test]
+async fn debug_with_filter_and_synonyms_reports_correctly() {
+    let app = coverage_app().await;
+    let (status, body) = call(
+        app,
+        search_request(
+            "items",
+            json!({
+                "search": "alpha",
+                "filter": "price gt 1.0",
+                "debug": true
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["@search.debug"]["execution"]["filterApplied"], true);
+    // Doc 1 (price=1.0) is excluded by the filter; doc 2 (price=2.0) matches.
+    assert_eq!(body["@search.debug"]["execution"]["matchedDocuments"], 1);
+}

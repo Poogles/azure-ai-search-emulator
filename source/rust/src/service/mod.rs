@@ -24,11 +24,13 @@ pub use types::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::error::{ApiError, ErrorCode};
 use crate::filter::{self, FilterExpr};
-use crate::query::{parse_search_text, Clause, FullTextQuery, QueryError, QueryType, SearchEngine};
+use crate::query::{
+    parse_search_text, Clause, FullTextQuery, QueryError, QueryType, SearchEngine, SearchMode,
+};
 use crate::storage::{
     Document, FieldDefinition, IndexDefinition, Storage, StorageError, Suggester,
 };
@@ -38,8 +40,8 @@ use self::facets::compute_facets;
 use self::highlight::{field_words, page_highlights};
 use self::ordering::{order_scored, rrf_fuse_weighted};
 use self::parsing::{
-    parse_facets, parse_filter_option, parse_highlight_options, parse_orderby,
-    parse_paging_options, parse_search_fields, parse_search_mode, parse_select,
+    parse_facets, parse_filter_option, parse_highlight_options, parse_minimum_coverage,
+    parse_orderby, parse_paging_options, parse_search_fields, parse_search_mode, parse_select,
     parse_vector_options, UNSUPPORTED_SEARCH_OPTIONS,
 };
 use self::resources::{named_resource, ResourceStore};
@@ -900,6 +902,9 @@ impl SearchService {
         let (highlight_fields, highlight_pre_tag, highlight_post_tag) =
             parse_highlight_options(obj, &definition)?;
 
+        let minimum_coverage = parse_minimum_coverage(obj)?;
+        let debug = obj.get("debug").and_then(Value::as_bool).unwrap_or(false);
+
         Ok(SearchQuery {
             search,
             query_type,
@@ -923,6 +928,8 @@ impl SearchService {
             },
             vector_queries,
             vector_filter_mode,
+            minimum_coverage,
+            debug,
         })
     }
 
@@ -943,10 +950,21 @@ impl SearchService {
             full_text_scores,
             vector_lists,
         } = self.resolve_plan(&definition, query)?;
+        let total_candidates = documents.len();
         let (scored, total, facets) =
             Self::execute_plan(&orderby, documents, full_text_scores, &vector_lists, query);
         let (page, has_more, next_skip) = Self::paginate(scored, skip, query.top, total);
         let page = Self::project_page(page, query, &full_text, &definition);
+        let debug_info = if query.debug {
+            Some(Self::build_debug_info(
+                &full_text,
+                total_candidates,
+                total,
+                query,
+            ))
+        } else {
+            None
+        };
         Ok(SearchOutcome {
             total,
             documents: page.documents,
@@ -955,6 +973,79 @@ impl SearchService {
             facets,
             has_more,
             next_skip,
+            debug_info,
+        })
+    }
+
+    /// Builds the `@search.debug` object for a search response.
+    fn build_debug_info(
+        full_text: &FullTextQuery,
+        total_candidates: usize,
+        matched: u64,
+        query: &SearchQuery,
+    ) -> Value {
+        let parsed = if let Some(lucene) = &full_text.lucene {
+            format!("lucene: {lucene}")
+        } else {
+            let required: Vec<String> = full_text
+                .required
+                .iter()
+                .map(|c| match c {
+                    Clause::Term(t) => t.clone(),
+                    Clause::Phrase(p) => format!("\"{p}\""),
+                    Clause::FuzzyTerm { term, distance } => format!("{term}~{distance}"),
+                })
+                .collect();
+            let excluded: Vec<String> = full_text
+                .excluded
+                .iter()
+                .map(|c| match c {
+                    Clause::Term(t) => format!("-{t}"),
+                    Clause::Phrase(p) => format!("-\"{p}\""),
+                    Clause::FuzzyTerm { term, distance } => format!("-{term}~{distance}"),
+                })
+                .collect();
+            let mut parts = Vec::new();
+            if !required.is_empty() {
+                parts.push(required.join(" "));
+            }
+            if !excluded.is_empty() {
+                parts.push(excluded.join(" "));
+            }
+            if parts.is_empty() {
+                "*".to_owned()
+            } else {
+                parts.join(" ")
+            }
+        };
+        let fields = full_text.fields.clone().unwrap_or_default();
+        let synonym_expansions: Map<String, Value> = full_text
+            .synonyms
+            .iter()
+            .map(|(term, expansions)| {
+                (
+                    term.clone(),
+                    Value::Array(
+                        expansions
+                            .iter()
+                            .map(|e| Value::String(e.clone()))
+                            .collect(),
+                    ),
+                )
+            })
+            .collect();
+        json!({
+            "query": {
+                "parsed": parsed,
+                "fields": fields,
+                "synonymExpansions": synonym_expansions,
+            },
+            "execution": {
+                "totalCandidates": total_candidates,
+                "matchedDocuments": matched,
+                "filterApplied": query.filter.is_some(),
+                "vectorQueries": query.vector_queries.len(),
+            }
         })
     }
 
@@ -1003,7 +1094,13 @@ impl SearchService {
         // top-level filter always applies here. Scores are BM25 relevance
         // scores from the query engine.
         let full_text_scores = if full_text_active || !vector_active {
-            self.full_text_side_scores(&definition.name, &full_text, filter.as_ref(), &doc_fields)?
+            self.full_text_side_scores(
+                &definition.name,
+                &full_text,
+                filter.as_ref(),
+                &doc_fields,
+                query.minimum_coverage,
+            )?
         } else {
             BTreeMap::new()
         };
@@ -1249,7 +1346,7 @@ impl SearchService {
     }
 
     /// Full-text side of [`SearchService::search`]: matching keys with BM25
-    /// scores, with the top-level filter applied.
+    /// scores, with the top-level filter and `minimumCoverage` gate applied.
     ///
     /// # Errors
     ///
@@ -1260,6 +1357,7 @@ impl SearchService {
         full_text: &FullTextQuery,
         filter: Option<&FilterExpr>,
         doc_fields: &BTreeMap<&str, &Map<String, Value>>,
+        minimum_coverage: f64,
     ) -> Result<BTreeMap<String, f32>, ApiError> {
         let matched_scores = self
             .engine
@@ -1275,6 +1373,37 @@ impl SearchService {
             if passes {
                 scored.insert(key, score);
             }
+        }
+        if minimum_coverage > 0.0
+            && full_text.mode == SearchMode::Any
+            && full_text.required.len() > 1
+        {
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            let threshold = (minimum_coverage * full_text.required.len() as f64).ceil() as usize;
+            let mut match_counts: BTreeMap<String, usize> = BTreeMap::new();
+            for clause in &full_text.required {
+                let single = FullTextQuery {
+                    required: vec![clause.clone()],
+                    excluded: full_text.excluded.clone(),
+                    lucene: None,
+                    synonyms: full_text.synonyms.clone(),
+                    fields: full_text.fields.clone(),
+                    boosts: full_text.boosts.clone(),
+                    mode: SearchMode::Any,
+                };
+                let clause_scores = self
+                    .engine
+                    .search(index, &single)
+                    .map_err(|e| engine_error(index, e))?;
+                for key in clause_scores.keys() {
+                    *match_counts.entry(key.clone()).or_insert(0) += 1;
+                }
+            }
+            scored.retain(|key, _| match_counts.get(key).copied().unwrap_or(0) >= threshold);
         }
         Ok(scored)
     }

@@ -53,6 +53,8 @@ Differences fall into two categories:
 - Tokenization uses an English analyzer: lowercasing, punctuation splitting, English stopword removal, and English stemming — approximating Azure's basic English analyzer. `running` matches `run`; `the` is a stopword and matches nothing (a stopword-only query returns no documents).
 - `searchFields` weights (`field^N`, with a finite positive `N`) scale the field's BM25 contribution to `@search.score`.
 - `POST /search.analyze` uses the English analyzer, except `keyword` (the whole input as one verbatim token) and `whitespace` (whitespace split without lowercasing or stemming), which tokenize as Azure documents them. An explicit `analyzer` (`analyzerName` alias accepted) must be a known analyzer name and `field` (`fieldName` alias accepted) must exist in the index schema. Unknown analyzers/fields are rejected with `400 InvalidRequest`.
+- `minimumCoverage` gates inclusion for `searchMode=any` multi-term queries (a document must match at least `ceil(minimumCoverage × total_terms)` terms) but does not affect `@search.score`; Azure's ranking model may incorporate coverage into scoring.
+- `debug: true` adds an `@search.debug` object with emulator-internal query diagnostics (parsed query representation, in-scope fields, synonym expansions, execution stats); Azure's debug output uses its internal query plan format. The shape is emulator-defined.
 - **Rationale:** whole-token, case-insensitive matching covers the assertions our tests make; e2e assertions deliberately use whole-token search terms so they would also pass against Azure.
 
 ### Autocomplete and suggest

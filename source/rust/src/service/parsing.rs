@@ -780,7 +780,6 @@ pub(crate) const UNSUPPORTED_SEARCH_OPTIONS: &[&str] = &[
     "scoringProfile",
     "scoringParameters",
     "scoringStatistics",
-    "minimumCoverage",
     "answers",
     "captions",
     "semantic",
@@ -788,5 +787,28 @@ pub(crate) const UNSUPPORTED_SEARCH_OPTIONS: &[&str] = &[
     "semanticQuery",
     "semanticErrorHandling",
     "semanticMaxWaitInMilliseconds",
-    "debug",
 ];
+
+/// Parses the `minimumCoverage` option: a float in [0.0, 1.0] (default 0.0).
+///
+/// # Errors
+///
+/// Returns an [`ApiError`] (`400 InvalidQuery`) for non-numeric values or
+/// values outside [0.0, 1.0].
+pub(crate) fn parse_minimum_coverage(obj: &Map<String, Value>) -> Result<f64, ApiError> {
+    match obj.get("minimumCoverage") {
+        None | Some(Value::Null) => Ok(0.0),
+        Some(Value::Number(n)) => {
+            let v = n
+                .as_f64()
+                .ok_or_else(|| ApiError::invalid_query("minimumCoverage must be a number."))?;
+            if !(0.0..=1.0).contains(&v) {
+                return Err(ApiError::invalid_query(
+                    "minimumCoverage must be between 0.0 and 1.0.",
+                ));
+            }
+            Ok(v)
+        }
+        Some(_) => Err(ApiError::invalid_query("minimumCoverage must be a number.")),
+    }
+}

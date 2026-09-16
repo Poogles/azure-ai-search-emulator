@@ -122,3 +122,14 @@ pub async fn create_index(app: &axum::Router, name: &str) -> (StatusCode, Value)
     )
     .await
 }
+
+pub fn ids(body: &Value) -> Vec<String> {
+    body["value"]
+        .as_array()
+        .map(|docs| {
+            docs.iter()
+                .map(|d| d["id"].as_str().unwrap_or_default().to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
