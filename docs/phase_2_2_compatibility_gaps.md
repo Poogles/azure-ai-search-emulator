@@ -248,7 +248,7 @@ Implemented against the SDK wire format (`fuzzy` boolean from `useFuzzyMatching`
 
 ### 8. Highlighting: sentence-window fragments
 
-**Current state:** Highlights return the entire field value with matches wrapped in tags.
+**Current state:** Implemented — highlights return sentence-window excerpts: each sentence containing a match is one fragment (matched terms wrapped in tags), in order, up to 3 per field; sentences over 200 characters yield a ±100-character window around each match; short fields return their whole value (unit + contract + Python/C# SDK tests green).
 
 **Target:** Return sentence-window excerpts around matches, matching Azure's behaviour.
 
@@ -537,13 +537,17 @@ source/rust/src/
 
 ### Highlighting
 
-- [ ] Sentence-window fragments (not whole-value).
-- [ ] Max 3 fragments per field.
-- [ ] Pre/post tags wrap only the matched term.
-- [ ] Phrase queries: single fragment for the phrase.
-- [ ] Short fields: entire value is the fragment.
-- [ ] Fuzzy matches: no fragments (unchanged).
-- [ ] Contract tests: highlighting with sentence windows.
+- [x] Sentence-window fragments (not whole-value).
+- [x] Max 3 fragments per field.
+- [x] Pre/post tags wrap only the matched term.
+- [x] Phrase queries: single fragment for the phrase.
+- [x] Short fields: entire value is the fragment.
+- [x] Fuzzy matches: no fragments (unchanged).
+- [x] Long sentences (>200 chars): ±100-char window around each match.
+- [x] Unit tests: sentence extraction, window truncation, multiple matches, phrase queries, short fields.
+- [x] Contract tests: highlighting with sentence windows and long-sentence windows.
+- [x] Python SDK test: sentence-window and long-sentence-window highlights.
+- [x] C# SDK test: mirror of the Python highlighting scenarios.
 
 ### `minimumCoverage`
 

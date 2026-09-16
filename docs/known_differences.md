@@ -31,8 +31,9 @@ Differences fall into two categories:
 
 ### Highlighting
 
-- `highlight` (a searchable field or list of fields) returns an `@search.highlights` object per matched document: each requested field with a query-term match maps to its highlighted fragments (the whole field value with matches wrapped in `highlightPreTag`/`highlightPostTag`, default `<em>`/`</em>`). Only searchable fields may be highlighted; unknown or non-searchable fields are rejected with `400 InvalidQuery`.
-- Fragments are whole field values, not Azure's sentence-window excerpts; phrase queries highlight their individual terms. Test assertions should check for the wrapped term, not fragment boundaries.
+- `highlight` (a searchable field or list of fields) returns an `@search.highlights` object per matched document: each requested field with a query-term match maps to its highlighted fragments. Only searchable fields may be highlighted; unknown or non-searchable fields are rejected with `400 InvalidQuery`.
+- Fragments are sentence-window excerpts (matching Azure's approach): each sentence containing a match is one fragment (matched terms wrapped in `highlightPreTag`/`highlightPostTag`, default `<em>`/`</em>`), in order of appearance, up to 3 per field. A sentence longer than 200 characters instead yields a ±100-character window around each match. A short field (a single sentence under the limit) returns its whole value as the fragment.
+- Exact fragment boundaries are implementation-defined and may differ from Azure's; phrase queries wrap their individual terms within a single fragment. Test assertions should check for the wrapped term and fragment count, not exact fragment text.
 
 ### Vector search scoring and ranking (Phase 2.1)
 

@@ -600,3 +600,42 @@ async fn highlights_return_sentence_windows() {
         .unwrap_or_default()
         .contains("<em>azure</em>"));
 }
+
+#[tokio::test]
+async fn highlights_long_sentence_returns_window() {
+    let app = app();
+    let (status, _) = create_index(&app, "items").await;
+    assert_eq!(status, StatusCode::CREATED);
+    // A single sentence well over 200 characters with the match in the middle.
+    let filler = "word ".repeat(50).trim_end().to_owned();
+    let title = format!("{filler} azure {filler}");
+    let (status, _) = call(
+        app.clone(),
+        upload_request(
+            "items",
+            json!([
+                {"@search.action": "upload", "document": {
+                    "id": "1",
+                    "title": title,
+                    "price": 1.0
+                }}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = call(
+        app,
+        search_request("items", json!({"search": "azure", "highlight": "title"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let highlights = &body["value"][0]["@search.highlights"]["title"];
+    let fragments = highlights.as_array().cloned().unwrap_or_default();
+    assert_eq!(fragments.len(), 1);
+    let fragment = fragments[0].as_str().unwrap_or_default();
+    assert!(fragment.contains("<em>azure</em>"));
+    // The fragment is a bounded window, not the whole over-long title.
+    assert!(fragment.len() < title.len());
+}

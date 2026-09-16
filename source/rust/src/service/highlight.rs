@@ -79,6 +79,14 @@ fn highlight_raw_terms(query: &FullTextQuery) -> Vec<String> {
 /// approximating Azure's excerpt count.
 const MAX_HIGHLIGHT_FRAGMENTS: usize = 3;
 
+/// Sentences longer than this are not returned whole: a character window
+/// around each match is used instead (matching Azure's excerpt behaviour).
+const MAX_SENTENCE_LENGTH: usize = 200;
+
+/// Half-width, in characters, of the window extracted around a match in an
+/// over-long sentence.
+const FRAGMENT_WINDOW: usize = 100;
+
 /// Splits `text` into sentences: a sentence ends at a sentence terminator
 /// (`.`, `!`, `?`, or a newline) followed by whitespace or the end of the
 /// text. Text without terminators is a single sentence. The terminator stays
@@ -102,47 +110,70 @@ fn split_sentences(text: &str) -> Vec<&str> {
     sentences
 }
 
-/// Wraps the words of `text` whose analyzed form (under `analyzer`) is in
-/// `terms` with the highlight tags, preserving the original text (including
-/// spacing and casing). Matching is analyzer-aware, so inflected forms
-/// highlight. Returns the wrapped text and whether any word matched.
-fn wrap_matched_words(
+/// Returns the byte spans of the maximal non-whitespace runs (words) of
+/// `text`, in order of appearance. A word includes any trailing punctuation,
+/// so `azure.` is a single word.
+fn word_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        if c.is_whitespace() {
+            if let Some(s) = start {
+                spans.push((s, i));
+                start = None;
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(s) = start {
+        spans.push((s, text.len()));
+    }
+    spans
+}
+
+/// Returns the byte spans of the whitespace-delimited words of `text` whose
+/// analyzed form (under `analyzer`) is in `terms`, in order of appearance.
+/// Matching is analyzer-aware, so inflected forms highlight.
+fn matched_word_spans(
     text: &str,
     terms: &BTreeSet<String>,
     analyzer: Option<&str>,
-    pre_tag: &str,
-    post_tag: &str,
-) -> (String, bool) {
-    let mut out = String::new();
-    let mut matched = false;
-    // `split_inclusive` keeps each word glued to its trailing whitespace so
-    // the original spacing is preserved.
-    for segment in text.split_inclusive(|c: char| c.is_whitespace()) {
-        let split = segment
-            .find(|c: char| c.is_whitespace())
-            .unwrap_or(segment.len());
-        let (word, rest) = segment.split_at(split);
-        if !word.is_empty()
-            && crate::query::analyze_with(word, analyzer)
+) -> Vec<(usize, usize)> {
+    word_spans(text)
+        .into_iter()
+        .filter_map(|(start, end)| {
+            let matched = crate::query::analyze_with(&text[start..end], analyzer)
                 .iter()
-                .any(|token| terms.contains(token))
-        {
-            out.push_str(pre_tag);
-            out.push_str(word);
-            out.push_str(post_tag);
-            matched = true;
-        } else {
-            out.push_str(word);
-        }
-        out.push_str(rest);
+                .any(|token| terms.contains(token));
+            matched.then_some((start, end))
+        })
+        .collect()
+}
+
+/// Wraps each span in `spans` (byte ranges into `text`) with the highlight
+/// tags, preserving all other text (spacing and casing) verbatim.
+fn wrap_spans(text: &str, spans: &[(usize, usize)], pre_tag: &str, post_tag: &str) -> String {
+    let mut out = String::new();
+    let mut last = 0usize;
+    for &(start, end) in spans {
+        out.push_str(&text[last..start]);
+        out.push_str(pre_tag);
+        out.push_str(&text[start..end]);
+        out.push_str(post_tag);
+        last = end;
     }
-    (out, matched)
+    out.push_str(&text[last..]);
+    out
 }
 
 /// Computes the highlighted sentence-window fragments of `text` for the
-/// query terms analyzed with `analyzer`: each sentence containing a match is
-/// one fragment (matched words wrapped in tags), in order of appearance, up
-/// to [`MAX_HIGHLIGHT_FRAGMENTS`]. Returns `None` when no sentence matches.
+/// query terms analyzed with `analyzer`. Each sentence containing a match
+/// contributes a fragment (matched words wrapped in tags), in order of
+/// appearance, up to [`MAX_HIGHLIGHT_FRAGMENTS`]. A sentence longer than
+/// [`MAX_SENTENCE_LENGTH`] instead contributes a [`FRAGMENT_WINDOW`]-character
+/// window around each match (matches already inside an emitted window are
+/// not repeated). Returns `None` when no sentence matches.
 fn highlight_fragments(
     text: &str,
     terms: &BTreeSet<String>,
@@ -155,13 +186,35 @@ fn highlight_fragments(
     }
     let mut fragments = Vec::new();
     for sentence in split_sentences(text) {
-        let (highlighted, matched) =
-            wrap_matched_words(sentence, terms, analyzer, pre_tag, post_tag);
-        if matched {
-            fragments.push(highlighted);
-            if fragments.len() >= MAX_HIGHLIGHT_FRAGMENTS {
-                break;
+        let spans = matched_word_spans(sentence, terms, analyzer);
+        if spans.is_empty() {
+            continue;
+        }
+        if sentence.len() <= MAX_SENTENCE_LENGTH {
+            fragments.push(wrap_spans(sentence, &spans, pre_tag, post_tag));
+        } else {
+            let mut covered: Vec<(usize, usize)> = Vec::new();
+            for &(start, end) in &spans {
+                if covered.iter().any(|&(ws, we)| start >= ws && end <= we) {
+                    continue;
+                }
+                let ws = sentence.floor_char_boundary(start.saturating_sub(FRAGMENT_WINDOW));
+                let we = sentence.ceil_char_boundary((end + FRAGMENT_WINDOW).min(sentence.len()));
+                let window = &sentence[ws..we];
+                let inner: Vec<(usize, usize)> = spans
+                    .iter()
+                    .filter(|&&(s, e)| s >= ws && e <= we)
+                    .map(|&(s, e)| (s - ws, e - ws))
+                    .collect();
+                fragments.push(wrap_spans(window, &inner, pre_tag, post_tag));
+                covered.push((ws, we));
+                if fragments.len() >= MAX_HIGHLIGHT_FRAGMENTS {
+                    break;
+                }
             }
+        }
+        if fragments.len() >= MAX_HIGHLIGHT_FRAGMENTS {
+            break;
         }
     }
     (!fragments.is_empty()).then_some(fragments)
@@ -219,4 +272,156 @@ fn highlight_document(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Analyzes raw terms with the default analyzer, mirroring
+    /// [`highlight_document`], which passes analyzed terms to
+    /// [`highlight_fragments`].
+    fn terms(list: &[&str]) -> BTreeSet<String> {
+        list.iter()
+            .flat_map(|s| crate::query::analyze_with(s, None))
+            .collect()
+    }
+
+    /// Unwraps a [`highlight_fragments`] result, panicking when no fragment was
+    /// produced (the tests always assert a match exists).
+    fn frags(opt: Option<Vec<String>>) -> Vec<String> {
+        match opt {
+            Some(f) => f,
+            None => panic!("expected highlight fragments"),
+        }
+    }
+
+    #[test]
+    fn split_sentences_on_terminators() {
+        let sentences = split_sentences("Azure is great. Nothing here! Find it? Last one");
+        assert_eq!(
+            sentences,
+            vec![
+                "Azure is great.",
+                " Nothing here!",
+                " Find it?",
+                " Last one"
+            ]
+        );
+    }
+
+    #[test]
+    fn split_sentences_without_terminator_is_single() {
+        assert_eq!(split_sentences("one two three"), vec!["one two three"]);
+    }
+
+    #[test]
+    fn short_field_is_single_fragment() {
+        let fragments = frags(highlight_fragments(
+            "Azure Search Rocks",
+            &terms(&["azure"]),
+            None,
+            "<em>",
+            "</em>",
+        ));
+        assert_eq!(fragments, vec!["<em>Azure</em> Search Rocks"]);
+    }
+
+    #[test]
+    fn only_matching_sentences_become_fragments_in_order() {
+        let text = "Azure is great. Nothing relevant here. Search finds azure twice.";
+        let fragments = frags(highlight_fragments(
+            text,
+            &terms(&["azure"]),
+            None,
+            "<em>",
+            "</em>",
+        ));
+        assert_eq!(fragments.len(), 2);
+        assert!(fragments[0].contains("<em>Azure</em>"));
+        assert!(fragments[1].contains("<em>azure</em>"));
+    }
+
+    #[test]
+    fn at_most_three_fragments_per_field() {
+        let text = "a azure. b azure. c azure. d azure. e azure.";
+        let fragments = frags(highlight_fragments(
+            text,
+            &terms(&["azure"]),
+            None,
+            "<em>",
+            "</em>",
+        ));
+        assert_eq!(fragments.len(), MAX_HIGHLIGHT_FRAGMENTS);
+    }
+
+    #[test]
+    fn no_match_yields_none() {
+        assert!(
+            highlight_fragments("hello world", &terms(&["azure"]), None, "<em>", "</em>").is_none()
+        );
+    }
+
+    #[test]
+    fn phrase_terms_in_one_sentence_yield_single_fragment() {
+        // A phrase query analyzes to its constituent terms; all matches in one
+        // sentence produce a single fragment.
+        let fragments = frags(highlight_fragments(
+            "Azure Search Rocks",
+            &terms(&["azure", "search"]),
+            None,
+            "<em>",
+            "</em>",
+        ));
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0], "<em>Azure</em> <em>Search</em> Rocks");
+    }
+
+    #[test]
+    fn long_sentence_yields_window_not_whole_sentence() {
+        let filler = "word ".repeat(50).trim_end().to_owned();
+        let text = format!("{filler} azure {filler}");
+        assert!(text.len() > MAX_SENTENCE_LENGTH);
+        let fragments = frags(highlight_fragments(
+            &text,
+            &terms(&["azure"]),
+            None,
+            "<em>",
+            "</em>",
+        ));
+        assert_eq!(fragments.len(), 1);
+        assert!(fragments[0].contains("<em>azure</em>"));
+        // The fragment is a bounded window (match plus ~100 chars either side,
+        // plus the tags), not the whole over-long sentence.
+        assert!(fragments[0].len() < text.len());
+        assert!(fragments[0].len() <= FRAGMENT_WINDOW * 2 + 50);
+    }
+
+    #[test]
+    fn long_sentence_with_distant_matches_yields_window_per_match() {
+        let filler = "word ".repeat(50).trim_end().to_owned();
+        let text = format!("{filler} azure {filler} azure {filler}");
+        let fragments = frags(highlight_fragments(
+            &text,
+            &terms(&["azure"]),
+            None,
+            "<em>",
+            "</em>",
+        ));
+        assert_eq!(fragments.len(), 2);
+        assert!(fragments[0].contains("<em>azure</em>"));
+        assert!(fragments[1].contains("<em>azure</em>"));
+    }
+
+    #[test]
+    fn tags_wrap_only_matched_words() {
+        let fragments = frags(highlight_fragments(
+            "the azure sky",
+            &terms(&["azure"]),
+            None,
+            "<b>",
+            "</b>",
+        ));
+        assert_eq!(fragments, vec!["the <b>azure</b> sky"]);
+    }
 }

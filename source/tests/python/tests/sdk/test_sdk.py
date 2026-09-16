@@ -1208,6 +1208,48 @@ def test_search_highlights(
     assert exc_info.value.status_code == 400
 
 
+def test_search_highlights_sentence_windows(
+    index_client: SearchIndexClient, search_client: SearchClient, full_index: SearchIndex
+) -> None:
+    index_client.create_index(full_index)
+    search_client.upload_documents(
+        documents=[
+            {
+                "id": "1",
+                "title": "Azure is great. Nothing relevant here. Search finds azure twice.",
+                "price": 1.0,
+            }
+        ]
+    )
+    found = list(search_client.search(search_text="azure", highlight_fields="title"))
+    assert len(found) == 1
+    fragments = found[0]["@search.highlights"]["title"]
+    # Two matching sentences, each its own fragment; the middle sentence is
+    # excluded.
+    assert len(fragments) == 2
+    assert "<em>Azure</em>" in fragments[0]
+    assert "<em>azure</em>" in fragments[1]
+    assert "Nothing relevant here" not in "".join(fragments)
+
+
+def test_search_highlights_long_sentence_window(
+    index_client: SearchIndexClient, search_client: SearchClient, full_index: SearchIndex
+) -> None:
+    index_client.create_index(full_index)
+    filler = " ".join(["word"] * 50)
+    title = f"{filler} azure {filler}"
+    search_client.upload_documents(
+        documents=[{"id": "1", "title": title, "price": 1.0}]
+    )
+    found = list(search_client.search(search_text="azure", highlight_fields="title"))
+    assert len(found) == 1
+    fragments = found[0]["@search.highlights"]["title"]
+    assert len(fragments) == 1
+    assert "<em>azure</em>" in fragments[0]
+    # The fragment is a bounded window, not the whole over-long title.
+    assert len(fragments[0]) < len(title)
+
+
 def test_search_fields_weights_boost_scores(priced_docs: SearchClient) -> None:
     plain = list(priced_docs.search(search_text="red"))
     assert len(plain) == 1
@@ -1507,11 +1549,9 @@ def test_search_non_string_fields(
                     type=SearchFieldDataType.DateTimeOffset,
                     searchable=True,
                 ),
-                SearchField(
-                    name="guid",
-                    type=SearchFieldDataType.Guid,
-                    searchable=True,
-                ),
+                # The pinned SDK has no `SearchFieldDataType.Guid` member; use the
+                # `Edm.Guid` wire type string directly.
+                SearchField(name="guid", type="Edm.Guid", searchable=True),
                 SearchField(
                     name="scores",
                     type=SearchFieldDataType.Collection(SearchFieldDataType.Int32),

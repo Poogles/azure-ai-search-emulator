@@ -1309,6 +1309,67 @@ public class SdkTests : EmulatorTestBase
     }
 
     [Fact]
+    public async Task SearchHighlightsSentenceWindows()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(TestData.FullIndex());
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument
+            {
+                ["id"] = "1",
+                ["title"] = "Azure is great. Nothing relevant here. Search finds azure twice.",
+                ["price"] = 1.0,
+            },
+        });
+
+        var response = await searchClient.SearchAsync<SearchDocument>(
+            "azure", new SearchOptions { HighlightFields = { "title" } });
+        var results = new List<SearchResult<SearchDocument>>();
+        await foreach (var item in response.Value.GetResultsAsync())
+        {
+            results.Add(item);
+        }
+        Assert.Single(results);
+        var fragments = results[0].Highlights["title"];
+        // Two matching sentences, each its own fragment; the middle sentence is
+        // excluded.
+        Assert.Equal(2, fragments.Count);
+        Assert.Contains("<em>Azure</em>", fragments[0]);
+        Assert.Contains("<em>azure</em>", fragments[1]);
+        Assert.DoesNotContain("Nothing relevant here", string.Join("", fragments));
+    }
+
+    [Fact]
+    public async Task SearchHighlightsLongSentenceWindow()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        await indexClient.CreateIndexAsync(TestData.FullIndex());
+        var filler = string.Join(" ", Enumerable.Repeat("word", 50));
+        var title = $"{filler} azure {filler}";
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = title, ["price"] = 1.0 },
+        });
+
+        var response = await searchClient.SearchAsync<SearchDocument>(
+            "azure", new SearchOptions { HighlightFields = { "title" } });
+        var results = new List<SearchResult<SearchDocument>>();
+        await foreach (var item in response.Value.GetResultsAsync())
+        {
+            results.Add(item);
+        }
+        Assert.Single(results);
+        var fragments = results[0].Highlights["title"];
+        Assert.Single(fragments);
+        Assert.Contains("<em>azure</em>", fragments[0]);
+        // The fragment is a bounded window, not the whole over-long title.
+        Assert.True(fragments[0].Length < title.Length, "expected a window, not the whole title");
+    }
+
+    [Fact]
     public async Task SearchFieldsWeightsBoostScores()
     {
         var searchClient = await PricedDocsAsync();
@@ -1658,7 +1719,9 @@ public class SdkTests : EmulatorTestBase
                 new SearchField("price", SearchFieldDataType.Double) { IsSearchable = true, IsFilterable = true },
                 new SearchField("active", SearchFieldDataType.Boolean) { IsSearchable = true, IsFilterable = true },
                 new SearchField("created", SearchFieldDataType.DateTimeOffset) { IsSearchable = true },
-                new SearchField("guid", SearchFieldDataType.Guid) { IsSearchable = true },
+                // The pinned SDK has no `SearchFieldDataType.Guid` member; use the
+                // implicit string conversion for the `Edm.Guid` wire type.
+                new SearchField("guid", "Edm.Guid") { IsSearchable = true },
                 new SearchField("scores", SearchFieldDataType.Collection(SearchFieldDataType.Int32)) { IsSearchable = true },
             },
         });

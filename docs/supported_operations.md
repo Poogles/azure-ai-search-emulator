@@ -202,7 +202,7 @@ Route: `POST /indexes('{name}')/docs/search.post.search?api-version=...`.
 | Facets | `facets=` | Supported (facetable fields only), with `count:N` / `top:N` limits (single-string and array forms) and the special `$count` facet |
 | Field-specific search | `search_fields=` | Supported (searchable fields only, including nested paths such as `Address/City`; `field^N` weights scale the field's BM25 score) |
 | Search modes | `search_mode=` (`all`/`any`) | Supported (`any`/OR is the default when omitted, matching Azure) |
-| Highlighting | `highlight_fields=`, pre/post tags | Supported (searchable fields only; `@search.highlights` with whole-value fragments) |
+| Highlighting | `highlight_fields=`, pre/post tags | Supported (searchable fields only; `@search.highlights` with sentence-window fragments — up to 3 per field, a ±100-char window for sentences over 200 chars, tags wrap only the matched term) |
 | Scoring profiles / parameters / statistics | `scoring_profile=`, ... | Unsupported (explicit) |
 | Semantic queries | `semantic=`, ... | Unsupported (explicit) |
 | Vector queries | `vector_queries=[VectorizedQuery(vector=..., fields=..., k_nearest_neighbors=..., exhaustive=...)]` | Supported (raw-vector kNN; `kind: "text"` vectorizer queries rejected with `400 UnsupportedQuery`) |
