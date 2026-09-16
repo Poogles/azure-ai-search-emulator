@@ -15,6 +15,8 @@ from azure.search.documents.indexes import SearchIndexClient
 # azure-search-documents==12.0.0; they are exercised ahead of the next SDK bump.
 from azure.search.documents.indexes.models import (  # type: ignore[attr-defined]
     AnalyzeTextOptions,
+    HnswAlgorithmConfiguration,
+    HnswParameters,
     KnowledgeBase,
     SearchableField,
     SearchAlias,
@@ -23,8 +25,14 @@ from azure.search.documents.indexes.models import (  # type: ignore[attr-defined
     SearchIndex,
     SearchIndexKnowledgeSource,
     SearchSuggester,
+    SemanticConfiguration,
+    SemanticField,
+    SemanticPrioritizedFields,
+    SemanticSearch,
     SimpleField,
     SynonymMap,
+    VectorSearch,
+    VectorSearchProfile,
 )
 from azure.search.documents.knowledgebases import KnowledgeBaseRetrievalClient
 from azure.search.documents.knowledgebases.models import (
@@ -1837,13 +1845,6 @@ def test_search_debug_option(clean_emulator: str, index_client: SearchIndexClien
 
 
 def _semantic_index() -> SearchIndex:
-    from azure.search.documents.indexes.models import (
-        SemanticConfiguration,
-        SemanticField,
-        SemanticPrioritizedFields,
-        SemanticSearch,
-    )
-
     return SearchIndex(
         name=INDEX_NAME,
         fields=[
@@ -2090,17 +2091,6 @@ def test_semantic_with_vector_queries_rejected(
     The index carries a real vector field so the rejection is the
     semantic/vector conflict (not an unknown vector field).
     """
-    from azure.search.documents.indexes.models import (
-        HnswAlgorithmConfiguration,
-        HnswParameters,
-        SemanticConfiguration,
-        SemanticField,
-        SemanticPrioritizedFields,
-        SemanticSearch,
-        VectorSearch,
-        VectorSearchProfile,
-    )
-
     index_client.create_index(
         SearchIndex(
             name=INDEX_NAME,

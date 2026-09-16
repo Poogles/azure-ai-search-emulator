@@ -2,7 +2,7 @@
 //! reranker score normalization. No model inference — all operations are
 //! deterministic text processing over the full-text result set.
 //!
-//! Wire formats (see `docs/phase_2_3_semantic_search.md`):
+//! Wire formats (see `docs/implementation/phase_2_3_semantic_search.md`):
 //! - Index schema: the SDK `prioritizedFields` format (title, content, and
 //!   keywords fields) and the canonical `priorities` / `sources` format are
 //!   both accepted and normalized to field lists for answers and captions.

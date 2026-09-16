@@ -43,7 +43,6 @@ except RuntimeError as exc:  # submodule not checked out
 KNOWN_ISSUES = {
     # --- Cannot run here: the sample targets a newer/preview SDK than the pinned 12.0.0.
     "sample_knowledge_service_stats_preview.py": ("skip", "SDK 12.0.0 SearchServiceCounters lacks knowledge_base_counter (preview SDK feature)"),
-    "sample_query_semantic.py": ("skip", "SDK 12.0.0 leaks query_language/query_speller into the HTTP transport (TypeError); semantic search is out of scope"),
     "sample_knowledge_base_configuration_preview.py": ("skip", "needs a preview SDK (KnowledgeBaseRetrieveDefaults not in 12.0.0)"),
     "sample_knowledge_base_crud.py": ("skip", "needs a newer SDK (KnowledgeBase rejects the tags kwarg in 12.0.0)"),
     "sample_knowledge_retrieval_response_preview.py": ("skip", "needs a preview SDK (KnowledgeBaseResponseCompletedEvent not in 12.0.0)"),

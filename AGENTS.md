@@ -58,6 +58,7 @@ Infrastructure (`Infrastructure/`):
 ## Conventions and gotchas
 
 - Clippy `pedantic` is on and `unwrap_used`/`expect_used` are **denied** — no `unwrap()`/`expect()`. rustfmt: `max_width = 100`.
+- Python: no function-scoped imports — all imports go at the top of the module.
 - Unsupported operations must fail explicitly with an Azure-structured error (`{"error": {"code", "message"}}`); never silently approximate. Auth is a compatibility mechanism: any non-empty `api-key` is accepted, missing/empty → `401`.
 - Implement the SDK wire format, not the REST docs: document operations go to `/docs/search.index` (upload) and `/docs/search.post.search` (search), not `/docs/index` and `/docs/search`.
 - tantivy is built with `default-features = false` — the C `zstd` dependency fails to link in the Nix environment. Do not re-enable default features.

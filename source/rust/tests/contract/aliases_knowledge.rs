@@ -905,6 +905,91 @@ async fn alias_resolves_for_search_and_document_routes() {
     assert_eq!(body["error"]["code"], "ResourceNotFound");
 }
 
+#[tokio::test]
+async fn alias_resolves_for_suggest_autocomplete_and_analyze() {
+    let app = app();
+    // An index with a suggester over `title`.
+    let definition = json!({
+        "name": "items",
+        "fields": [
+            {"name": "id", "type": "Edm.String", "key": true},
+            {"name": "title", "type": "Edm.String", "searchable": true}
+        ],
+        "suggesters": [{"name": "sg", "searchFields": ["title"]}]
+    });
+    let uri = format!("/indexes?api-version={API_VERSION}");
+    let (status, body) = call(
+        app.clone(),
+        request("POST", &uri, Some(API_KEY), Some(definition)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "index rejected: {body}");
+    let (status, body) = call(
+        app.clone(),
+        upload_request(
+            "items",
+            json!([{"@search.action": "upload", "document": {"id": "1", "title": "Boston Harbor Hotel"}}]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "seed upload failed: {body}");
+    let (status, _) = call(app.clone(), create_alias_request("alias1", "items")).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Suggest via the alias name resolves to the target index.
+    let uri = format!("/indexes('alias1')/docs/search.post.suggest?api-version={API_VERSION}");
+    let (status, body) = call(
+        app.clone(),
+        request(
+            "POST",
+            &uri,
+            Some(API_KEY),
+            Some(json!({"search": "bos", "suggesterName": "sg"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "suggest via alias failed: {body}");
+    assert_eq!(body["value"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["value"][0]["id"], "1");
+
+    // Autocomplete via the alias name.
+    let uri = format!("/indexes('alias1')/docs/search.post.autocomplete?api-version={API_VERSION}");
+    let (status, body) = call(
+        app.clone(),
+        request(
+            "POST",
+            &uri,
+            Some(API_KEY),
+            Some(json!({"search": "bos", "suggesterName": "sg"})),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "autocomplete via alias failed: {body}"
+    );
+    assert_eq!(body["value"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["value"][0]["text"], "Boston");
+
+    // Analyze text via the alias name.
+    let uri = format!("/indexes('alias1')/search.analyze?api-version={API_VERSION}");
+    let (status, body) = call(
+        app,
+        request(
+            "POST",
+            &uri,
+            Some(API_KEY),
+            Some(json!({"text": "hello world"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "analyze via alias failed: {body}");
+    assert!(body["tokens"]
+        .as_array()
+        .is_some_and(|tokens| !tokens.is_empty()));
+}
+
 // ---------------------------------------------------------------------------
 // Alias resolution on index management routes
 // ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 ---
 status: complete
-status_last_reviewed: 2026-09-10
+status_last_reviewed: 2026-09-16
 ---
 
 # Microsoft Reference-Samples Compatibility Probe
@@ -24,13 +24,22 @@ machine-readable one.
 - Each discovered sync sample (`sample_*.py`, excluding `sample_utils.py` and
   `*_async.py`) is run **unmodified** as a subprocess, with the
   `AZURE_SEARCH_*` environment variables pointed at the emulator.
-- Two harness-only adaptations, both documented in
-  `source/tests/python/tests/ms_samples/conftest.py`:
+- Three harness-only adaptations, all documented in
+  `source/tests/python/tests/ms_samples/conftest.py` and
+  `ms_samples/shims/sitecustomize.py`:
   - The samples do not pin an `api-version`, so they send the SDK default
     (`2026-04-01` for the pinned SDK 12.0.0). The probe container accepts
     `2024-07-01,2026-04-01`.
   - Subprocesses re-apply the plain-HTTP shims via
     `ms_samples/shims/sitecustomize.py` on `PYTHONPATH`.
+  - A shim works around an SDK 12.0.0 bug in which `search()` options the SDK
+    does not implement (`query_language`, `query_speller`, used by
+    `sample_query_semantic.py`) are captured by `**kwargs` and forwarded into
+    `requests.Session.request`, which rejects them with a `TypeError`. The
+    shim filters transport-bound kwargs at `RequestsTransport.send` so the
+    request proceeds with exactly what the SDK puts on the wire. **Remove the
+    shim when the pinned SDK implements those options (or rejects unknown
+    search options at the call site).**
 - Samples that assume the portal `hotels-sample-index` get it from
   `ms_samples/setup_hotels.py` (schema subset the emulator supports,
   including an `Address` complex field and `GeoJSON` `Location` values on the
@@ -59,10 +68,10 @@ Each sample is classified in `KNOWN_ISSUES` (`test_ms_samples.py`):
 
 ## Current state
 
-32 sync samples discovered. `make test-ms`: **15 passed, 17 skipped, 0 failed.**
-(All 15 passes are genuine; there are no gap pins remaining.)
+32 sync samples discovered. `make test-ms`: **16 passed, 16 skipped, 0 failed.**
+(All 16 passes are genuine; there are no gap pins remaining.)
 
-### Passes (15)
+### Passes (16)
 
 | Sample                                   | Notes                                                                                                                                                                                                                                                                                                                     |
 |:-----------------------------------------|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -73,6 +82,7 @@ Each sample is classified in `KNOWN_ISSUES` (`test_ms_samples.py`):
 | `sample_query_filter.py`                 | Genuine pass since the complex-type fix (`Address/StateProvince` filter against the `Address` complex field in the seeded hotels index).                                                                                                                                                                                  |
 | `sample_index_analyze_text.py`           | Genuine pass since the `POST /search.analyze` fix: tokenizes text and returns tokens with offsets.                                                                                                                                                                                                                        |
 | `sample_query_session.py`                | Genuine pass since the `sessionId` fix: the option is accepted and silently ignored (deterministic ordering makes session affinity irrelevant).                                                                                                                                                                           |
+| `sample_query_semantic.py`               | Genuine pass since the extractive semantic-search implementation plus the SDK-transport shim (see "How it works"): the sample adds a semantic configuration to the seeded hotels index, runs a speller search and a `queryType=semantic` search (extractive answers/captions — see `known_differences.md`), and removes the configuration. The `query_language`/`query_speller` options are dropped by the SDK's request builder and never reach the wire. |
 | `sample_index_synonym_map_crud.py`       | Genuine pass since the synonym-map CRUD fix: create (incl. from file), list, get, and delete of Solr-format maps all round-trip. Maps are stored but inert (see `known_differences.md`).                                                                                                                                  |
 | `sample_query_autocomplete.py`           | Genuine pass since the autocomplete fix: `POST /docs/search.post.autocomplete` returns prefix-matched completions (`text` + `queryPlusText`). The seeded hotels yield no match for `"bo"`, so the sample passes on the empty `value` array.                                                                               |
 | `sample_query_suggestions.py`            | Genuine pass since the suggest fix: `POST /docs/search.post.suggest` returns matching documents plus `@search.text`. The seeded hotels yield no match for `"coffee"`, so the sample passes on the empty `value` array.                                                                                                    |
@@ -80,13 +90,13 @@ Each sample is classified in `KNOWN_ISSUES` (`test_ms_samples.py`):
 | `sample_index_client_custom_request.py`  | Genuine pass since the SDK 12 bump: `SearchIndexClient.send_request` GETs the seeded hotels index and prints the echoed definition.                                                                                                                                                                                       |
 | `sample_search_client_custom_request.py` | Genuine pass since the SDK 12 bump: `SearchClient.send_request` GETs `/docs/$count` and prints the document count (4).                                                                                                                                                                                                    |
 | `sample_index_alias_crud.py`             | Genuine pass since the alias CRUD fix: create, get, update (re-point to the v2 index, which exercises collection-of-complex), and delete of the `hotels-sample-alias` all round-trip.                                                                                                                                     |
-| `sample_agentic_retrieval.py`            | Genuine pass since the knowledge CRUD + retrieval fix: creates a knowledge source and knowledge base over the seeded hotels index, `POST /knowledgebases('{name}')/retrieve` returns an empty response (no model inference — see `known_differences.md`), and cleanup deletes both. Passes on the empty `response` array. |
+| `sample_agentic_retrieval.py`            | Genuine pass since the knowledge CRUD + retrieval fix: creates a knowledge source and knowledge base over the seeded hotels index, `POST /knowledgebases('{name}')/retrieve` returns the seeded hotel documents from the base's `searchIndex` source (no model inference — see `known_differences.md`), and cleanup deletes both. |
 
 ### Documented emulator gaps (0)
 
 All emulator gaps are closed. Gaps 11–13 landed (see the tracker and plans below); their `KNOWN_ISSUES` pins have been removed.
 
-Historical plans for all gaps are in [Gap implementation plans](#gap-implementation-plans) below. The remaining 17 skips are tracked as Gaps 9–10 (external-service, `☐ not started`) plus preview-SDK / SDK-bug skips.
+Historical plans for all gaps are in [Gap implementation plans](#gap-implementation-plans) below. The remaining 16 skips are tracked as Gaps 9–10 (external-service, `☐ not started`) plus preview-SDK skips.
 
 ### Gap implementation plans
 
@@ -467,8 +477,11 @@ lands.
       mismatch) with `400 InvalidAlias`. Referenced-index existence is not
       checked (aliases are stored opaquely).
 - [x] Extended `azure_guard` to cover `/aliases` and `/aliases(` paths.
-- [x] Alias resolution: aliases are CRUD-only; search/document routes do not
-      resolve an alias name to its index. Documented in `known_differences.md`.
+- [x] Alias resolution: aliases resolve on both the data plane (search,
+  document upload/lookup/count, suggest, autocomplete, analyze-text) and the
+  management plane (`GET`/`PUT`/`DELETE /indexes('name')` operate on the
+  target index); index and alias names share one namespace. Documented in
+  `known_differences.md`.
 - [x] Added contract tests in `source/rust/tests/contract/aliases_knowledge.rs`
       (CRUD, validation, auth, reset) and documented the surface in
       `docs/supported_operations.md` / `docs/known_differences.md`.
@@ -533,10 +546,13 @@ lands.
       Validation: non-empty name, path/body match; sources require a `kind`
       (searchIndex sources require `searchIndexParameters.searchIndexName`);
       bases require a non-empty `knowledgeSources` array.
-- [x] Implemented `POST /knowledgebases('{name}')/retrieve` to return an empty
-      retrieval response (`{"response": [], "activity": [], "references": []}`)
-      when the base exists (`404` otherwise). Model inference is an
-      initial-design non-goal; documented in `known_differences.md`.
+- [x] Implemented `POST /knowledgebases('{name}')/retrieve`: when the base
+  exists (`404` otherwise) it returns the documents from the base's
+  `searchIndex` knowledge sources (each tagged with an `@search.source`
+  field), searched with the request's search text and limited by `top`
+  (default 3, max 1000); `activity` and `references` remain empty. Model
+  inference is an initial-design non-goal; documented in
+  `known_differences.md`.
 - [x] Added contract tests in `source/rust/tests/contract/aliases_knowledge.rs`
       (CRUD, validation, auth, reset, retrieval empty/404) and documented the
       surface in `docs/supported_operations.md` / `docs/known_differences.md`.
@@ -587,16 +603,23 @@ lands.
 - [x] `docs/supported_operations.md`: updated for aliases, collection-of-complex
       field types, knowledge sources/bases, and agentic retrieval (done with
       Gaps 11, 12, 13).
-- [x] `docs/known_differences.md`: documented CRUD-only aliases (no resolution),
-      collection-of-complex filter semantics, and empty retrieval responses
-      (done with Gaps 11, 12, 13).
+- [x] `docs/known_differences.md`: documented alias resolution (data and
+  management planes), collection-of-complex filter semantics, and
+  document-returning retrieval responses (done with Gaps 11, 12, 13).
 - [x] `source/tests/python/tests/ms_samples/test_ms_samples.py`: removed the
-      4 `gap` pins (Gaps 11–13); `sample_index_alias_crud.py` and
-      `sample_agentic_retrieval.py` now pass; `sample_index_crud.py` and
-      `sample_knowledge_source_crud.py` reclassified as preview-SDK `skip`
-      (`ListingSearchType` and `FilterHint`/`QueryHints` absent from 12.0.0).
+  4 `gap` pins (Gaps 11–13); `sample_index_alias_crud.py` and
+  `sample_agentic_retrieval.py` now pass; `sample_index_crud.py` and
+  `sample_knowledge_source_crud.py` reclassified as preview-SDK `skip`
+  (`ListingSearchType` and `FilterHint`/`QueryHints` absent from 12.0.0).
+- [x] SDK-transport shim (done with the extractive semantic-search
+  implementation): `ms_samples/shims/sitecustomize.py` filters transport-bound
+  kwargs at `RequestsTransport.send` so `sample_query_semantic.py`'s
+  `query_language`/`query_speller` (unsupported by SDK 12.0.0's `search()`,
+  leaked via `**kwargs` into `requests.Session.request`) no longer raise
+  `TypeError`; the sample's `KNOWN_ISSUES` skip was removed and it now passes.
+  **Remove the shim when the pinned SDK implements those options.**
 
-### Skipped — needs a newer/preview SDK than the pinned `12.0.0` (13)
+### Skipped — needs a newer/preview SDK than the pinned `12.0.0` (12)
 
 Upstream `main` already targets models that post-date stable `12.0.0` (latest
 on PyPI and the version the emulator is validated against — see
@@ -606,11 +629,6 @@ or SDK internals before emulator behaviour is reached:
 - `sample_knowledge_service_stats_preview.py` — the sample reads
   `stats.counters.knowledge_base_counter.usage`, but 12.0.0's
   `SearchServiceCounters` has no `knowledge_base_counter` (preview feature).
-- `sample_query_semantic.py` — SDK 12.0.0 leaks `query_language` /
-  `query_speller` into the HTTP transport (`TypeError:
-  Session.request() got an unexpected keyword argument 'query_language'`) on
-  the speller call, before any request reaches the emulator. Semantic search
-  itself is out of scope (see `known_differences.md`).
 - `sample_knowledge_base_configuration_preview.py`
   (`KnowledgeBaseRetrieveDefaults`), `sample_knowledge_retrieval_response_preview.py`
   (`KnowledgeBaseResponseCompletedEvent`), `sample_knowledge_source_fabric_data_agent_preview.py`
@@ -690,6 +708,6 @@ Notes:
   own usage of the SDK.
 - Gaps confirmed here that are accepted long-term differences belong in
   `known_differences.md`; gaps that are planned work belong in the
-  `phase_2*.md` / `phase_3*.md` plans. When a gap is closed, remove its
+  `docs/implementation/phase_2*.md` / `phase_3*.md` plans. When a gap is closed, remove its
   `KNOWN_ISSUES` entry (the suite forces this by going red) and update those
   docs.

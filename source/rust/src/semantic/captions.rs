@@ -26,9 +26,7 @@ pub fn truncate(text: &str, max_len: usize) -> String {
     }
     let keep = max_len.saturating_sub(TRUNCATION_SUFFIX.chars().count());
     let prefix: String = text.chars().take(keep).collect();
-    let cut = prefix
-        .rfind(char::is_whitespace)
-        .map_or(prefix.len(), |i| i);
+    let cut = prefix.rfind(char::is_whitespace).unwrap_or(prefix.len());
     let mut out = prefix[..cut].trim_end().to_owned();
     out.push_str(TRUNCATION_SUFFIX);
     out

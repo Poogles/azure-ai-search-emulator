@@ -11,7 +11,7 @@ Add vector field support and vector similarity search to the emulator, enabling 
 
 ## Motivation
 
-Phase 2 explicitly descoped vector/semantic search (`docs/phase_2_production_api.md` §Out of scope). Applications using Azure AI Search for RAG or embedding-based retrieval cannot run against the emulator. This phase closes that gap for the vector subset, leaving semantic search (Azure AI's hosted model inference) out of scope.
+Phase 2 explicitly descoped vector/semantic search (`docs/implementation/phase_2_production_api.md` §Out of scope). Applications using Azure AI Search for RAG or embedding-based retrieval cannot run against the emulator. This phase closes that gap for the vector subset, leaving semantic search (Azure AI's hosted model inference) out of scope.
 
 ## Scope
 
@@ -315,7 +315,7 @@ New error cases (all `400` with Azure structure):
 10. Unit tests: vector module (distance scoring, index lifecycle incl. delete-rebuild, filter modes, exhaustive flag, dotProduct exactness), schema validation, document validation.
 11. Python SDK compatibility tests: vector index creation, document upload with vectors, vector search, hybrid search.
 12. HTTP fixtures: extend `source/tests/python/fixtures/` with vector wire-format captures for Phase 3 C# replay.
-13. Updated `docs/phase_2_production_api.md`: remove vector from "Out of scope" (mark as Phase 2.1).
+13. Updated `docs/implementation/phase_2_production_api.md`: remove vector from "Out of scope" (mark as Phase 2.1).
 
 ## Test plan
 

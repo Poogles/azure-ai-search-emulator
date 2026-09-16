@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use super::distance::Metric;
 
-/// Defaults from the spec (`docs/phase_2_1_vector_indexing.md`): missing
+/// Defaults from the spec (`docs/implementation/phase_2_1_vector_indexing.md`): missing
 /// kind-specific parameters objects fall back to these.
 pub const DEFAULT_M: usize = 4;
 pub const DEFAULT_EF_CONSTRUCTION: usize = 400;

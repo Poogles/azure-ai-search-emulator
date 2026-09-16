@@ -8,15 +8,18 @@ The emulator is a **compatible test double with a persistent search implementati
 
 ## Status
 
-The project has completed **Phases 0–2.1**: a runnable, containerised HTTP service implementing the full Phase 2 API surface plus vector indexing and vector/hybrid search (Phase 2.1), exercised by the official Python SDK through testcontainers and probed against Microsoft's reference samples. **Phase 3** (admin API, C# compatibility, Azure comparison, release packaging) is in progress. See [docs/](docs/) for details.
+The project has completed **Phases 0–2.4**: a runnable, containerised HTTP service implementing the full Phase 2 API surface plus vector indexing and vector/hybrid search (Phase 2.1), compatibility-gap closure (Phase 2.2), semantic search (Phase 2.3), and vectorizer queries (Phase 2.4), exercised by the official Python and C# SDKs through testcontainers and probed against Microsoft's reference samples. **Phase 3** (admin API, C# compatibility, Azure comparison, release packaging) is in progress. See [docs/](docs/) for details.
 
 | Phase | Description                                               | Doc                                                                           |
 |:------|:----------------------------------------------------------|:------------------------------------------------------------------------------|
-| 0     | Repository setup, tooling, scaffolding                    | [phase_0_repository_setup.md](docs/phase_0_repository_setup.md)               |
-| 1     | Runnable HTTP service, Docker image, Python SDK e2e tests | [phase_1_scaffold_and_e2e.md](docs/phase_1_scaffold_and_e2e.md)               |
-| 2     | Full API surface, query engine, storage, contract tests   | [phase_2_production_api.md](docs/phase_2_production_api.md)                   |
-| 2.1   | Vector indexing and vector/hybrid search                  | [phase_2_1_vector_indexing.md](docs/phase_2_1_vector_indexing.md)             |
-| 3     | Admin API, C# compatibility, Azure comparison, release    | [phase_3_admin_api_and_remaining.md](docs/phase_3_admin_api_and_remaining.md) |
+| 0     | Repository setup, tooling, scaffolding                    | [phase_0_repository_setup.md](docs/implementation/phase_0_repository_setup.md)               |
+| 1     | Runnable HTTP service, Docker image, Python SDK e2e tests | [phase_1_scaffold_and_e2e.md](docs/implementation/phase_1_scaffold_and_e2e.md)               |
+| 2     | Full API surface, query engine, storage, contract tests   | [phase_2_production_api.md](docs/implementation/phase_2_production_api.md)                   |
+| 2.1   | Vector indexing and vector/hybrid search                  | [phase_2_1_vector_indexing.md](docs/implementation/phase_2_1_vector_indexing.md)             |
+| 2.2   | Closing compatibility gaps                                | [phase_2_2_compatibility_gaps.md](docs/implementation/phase_2_2_compatibility_gaps.md)       |
+| 2.3   | Semantic search                                           | [phase_2_3_semantic_search.md](docs/implementation/phase_2_3_semantic_search.md)             |
+| 2.4   | Vectorizer queries                                        | [phase_2_4_vectorizer_queries.md](docs/implementation/phase_2_4_vectorizer_queries.md)       |
+| 3     | Admin API, C# compatibility, Azure comparison, release    | [phase_3_admin_api_and_remaining.md](docs/implementation/phase_3_admin_api_and_remaining.md) |
 
 The overall design, goals, non-goals, and architecture are described in [docs/initial_design.md](docs/initial_design.md).
 
@@ -72,6 +75,8 @@ Serves on `http://localhost:8080` by default. Configure via environment variable
 | `EMULATOR_LOG_LEVEL`             | `info`       | Log level                                     |
 | `EMULATOR_ENABLE_ADMIN`          | `true`       | Enable `/admin/reset`                         |
 | `EMULATOR_VECTOR__MAX_DIMENSION` | `3072`       | Max accepted vector field dimension           |
+| `EMULATOR_SEMANTIC__MAX_ANSWERS` | `5`          | Max extractive answers per semantic query     |
+| `EMULATOR_SEMANTIC__MAX_CAPTIONS`| `3`          | Max extractive captions per semantic query    |
 
 ### Docker
 
@@ -105,7 +110,23 @@ poetry install
 poetry run pytest tests/e2e -v
 ```
 
-The E2E suite starts the container via testcontainers and exercises the official `azure-search-documents` SDK: index CRUD, upload, full-text and match-all search, deleted-index error handling, and a RAG-style vector + hybrid search flow.
+The E2E suite starts the container via testcontainers and exercises the official `azure-search-documents` SDK: index CRUD, upload, full-text and match-all search, deleted-index error handling, and RAG-style vector + hybrid, vectorizer, and semantic search flows.
+
+### C# SDK tests
+
+```sh
+make test-csharp
+```
+
+A second, independent harness drives the official `Azure.Search.Documents` .NET SDK against the same containerised emulator, mirroring the Python suites (e2e, full SDK operation coverage, vector search, and replay of the captured Python HTTP fixtures).
+
+### Microsoft reference samples
+
+```sh
+make test-ms
+```
+
+Probes the emulator against Microsoft's own `azure-sdk-for-python` search samples (see [docs/ms_samples_compatibility.md](docs/ms_samples_compatibility.md)).
 
 ## Linting (pre-commit)
 
@@ -160,10 +181,14 @@ poetry run pytest --collect-only
 
 - [docs/getting_started.md](docs/getting_started.md) — run the emulator locally and wire it into test suites with testcontainers (Python and .NET).
 - [docs/initial_design.md](docs/initial_design.md) — problem statement, requirements, architecture, alternatives, design principles.
-- [docs/phase_0_repository_setup.md](docs/phase_0_repository_setup.md) — repository and tooling setup.
-- [docs/phase_1_scaffold_and_e2e.md](docs/phase_1_scaffold_and_e2e.md) — minimal service, containerisation, e2e tests.
-- [docs/phase_2_production_api.md](docs/phase_2_production_api.md) — full API surface and test suite.
-- [docs/phase_3_admin_api_and_remaining.md](docs/phase_3_admin_api_and_remaining.md) — admin API, C# compatibility, release.
+- [docs/implementation/phase_0_repository_setup.md](docs/implementation/phase_0_repository_setup.md) — repository and tooling setup.
+- [docs/implementation/phase_1_scaffold_and_e2e.md](docs/implementation/phase_1_scaffold_and_e2e.md) — minimal service, containerisation, e2e tests.
+- [docs/implementation/phase_2_production_api.md](docs/implementation/phase_2_production_api.md) — full API surface and test suite.
+- [docs/implementation/phase_2_1_vector_indexing.md](docs/implementation/phase_2_1_vector_indexing.md) — vector indexing and vector/hybrid search.
+- [docs/implementation/phase_2_2_compatibility_gaps.md](docs/implementation/phase_2_2_compatibility_gaps.md) — closing compatibility gaps.
+- [docs/implementation/phase_2_3_semantic_search.md](docs/implementation/phase_2_3_semantic_search.md) — semantic search.
+- [docs/implementation/phase_2_4_vectorizer_queries.md](docs/implementation/phase_2_4_vectorizer_queries.md) — vectorizer queries.
+- [docs/implementation/phase_3_admin_api_and_remaining.md](docs/implementation/phase_3_admin_api_and_remaining.md) — admin API, C# compatibility, release.
 - [docs/supported_operations.md](docs/supported_operations.md) — supported-operations matrix: every operation, its SDK method, HTTP request, status codes, and supported/unsupported state.
 - [docs/ms_samples_compatibility.md](docs/ms_samples_compatibility.md) — compatibility probe against Microsoft's reference samples: how it runs, per-sample results, and what is skipped and why.
 - [docs/known_differences.md](docs/known_differences.md) — accepted behavioural differences from real Azure AI Search, with rationale.

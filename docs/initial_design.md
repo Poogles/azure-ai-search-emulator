@@ -974,7 +974,7 @@ A smaller set of tests should continue to exercise the real Azure service.
 
 The implementation is split into independently reviewable phases, each with its own implementation document:
 
-1. **Phase 0 — Repository setup** (`docs/phase_0_repository_setup.md`)
+1. **Phase 0 — Repository setup** (`docs/implementation/phase_0_repository_setup.md`)
 
    * Rust project scaffolding.
    * Tooling (clippy, rustfmt, cargo test).
@@ -982,14 +982,14 @@ The implementation is split into independently reviewable phases, each with its 
    * CI skeleton.
    * `docs/decisions/` with pinned versions and configuration conventions.
 
-2. **Phase 1 — Application scaffold and end-to-end test** (`docs/phase_1_scaffold_and_e2e.md`)
+2. **Phase 1 — Application scaffold and end-to-end test** (`docs/implementation/phase_1_scaffold_and_e2e.md`)
 
    * Minimal runnable HTTP service (Rust).
    * Containerisation (multi-stage Dockerfile → static binary).
    * End-to-end tests using the Python SDK and testcontainers.
    * HTTP fixture capture for later C# replay.
 
-3. **Phase 2 — Full API to production usage standard** (`docs/phase_2_production_api.md`)
+3. **Phase 2 — Full API to production usage standard** (`docs/implementation/phase_2_production_api.md`)
 
    * API surface discovery.
    * Index management.
@@ -1000,14 +1000,14 @@ The implementation is split into independently reviewable phases, each with its 
    * Contract and SDK compatibility tests.
    * `docs/known_differences.md` (created as gaps are discovered).
 
-4. **Phase 2.1 — Vector indexing and vector search** (`docs/phase_2_1_vector_indexing.md`)
+4. **Phase 2.1 — Vector indexing and vector search** (`docs/implementation/phase_2_1_vector_indexing.md`)
 
    * Vector field schema and validation.
    * Vector similarity search (HNSW + exact brute-force) and hybrid (vector + full-text) search.
    * `vectorFilterMode` (pre/post) and per-query `exhaustive`.
    * Vector contract, unit, and SDK compatibility tests.
 
-5. **Phase 3 — Admin API and remaining elements** (`docs/phase_3_admin_api_and_remaining.md`)
+5. **Phase 3 — Admin API and remaining elements** (`docs/implementation/phase_3_admin_api_and_remaining.md`)
 
    * Admin API.
    * C# SDK compatibility (fixture replay + live tests).
@@ -1016,7 +1016,7 @@ The implementation is split into independently reviewable phases, each with its 
 
 ## Open questions
 
-The following are resolved during the Phase 2 API surface discovery (see `docs/phase_2_production_api.md` §Discovery) rather than being assumed by individual components:
+The following are resolved during the Phase 2 API surface discovery (see `docs/implementation/phase_2_production_api.md` §Discovery) rather than being assumed by individual components:
 
 * Which SDK operations are currently used by applications?
 * Which index field types are required?

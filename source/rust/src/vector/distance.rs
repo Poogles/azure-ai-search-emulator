@@ -3,7 +3,7 @@
 //! [`Metric`] is the emulator's copy of the Azure `metric` property on a
 //! vector-search algorithm entry (`cosine`, `dotProduct`, `euclidean`).
 //! Score derivation is emulator-defined (see
-//! `docs/phase_2_1_vector_indexing.md` §Scoring):
+//! `docs/implementation/phase_2_1_vector_indexing.md` §Scoring):
 //! - cosine: `1 - cosine_distance`
 //! - dotProduct: the raw inner product
 //! - euclidean: `1 / (1 + l2_distance)`

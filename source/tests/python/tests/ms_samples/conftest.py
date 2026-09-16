@@ -11,9 +11,11 @@ Two differences from the parent e2e harness:
 * The samples do not pin an ``api-version``, so they use the SDK default
   (``2026-04-01`` for the pinned SDK 12.0.0). The emulator is therefore
   started with both ``2024-07-01`` and the SDK default accepted.
-* The samples are run in a subprocess, so the plain-HTTP shims from the parent
+* The samples are run in a subprocess, so the harness shims from the parent
   ``conftest.py`` are re-applied via ``ms_samples/shims/sitecustomize.py`` on
-  ``PYTHONPATH``.
+  ``PYTHONPATH`` (the plain-HTTP shim, plus a workaround for the SDK 12.0.0
+  ``query_language``/``query_speller`` transport leak — see the shim file and
+  ``docs/ms_samples_compatibility.md``).
 """
 
 import os
