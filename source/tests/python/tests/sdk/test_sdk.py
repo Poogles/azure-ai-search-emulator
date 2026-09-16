@@ -212,6 +212,62 @@ def test_get_document(
         search_client.get_document(key="missing")
 
 
+def test_stored_retrievable_field_visibility(
+    index_client: SearchIndexClient, search_client: SearchClient
+) -> None:
+    # `SearchField` (not the `SearchableField` helper) is used because the
+    # helper does not expose `retrievable`/`stored`.
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchField(name="title", type=SearchFieldDataType.String, searchable=True),
+                SearchField(
+                    name="secret", type=SearchFieldDataType.String, searchable=True, retrievable=False
+                ),
+                SearchField(
+                    name="ephemeral", type=SearchFieldDataType.String, searchable=True, stored=False
+                ),
+                SearchField(
+                    name="ghost",
+                    type=SearchFieldDataType.String,
+                    searchable=True,
+                    stored=False,
+                    retrievable=False,
+                ),
+            ],
+        )
+    )
+    search_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "one", "secret": "s1", "ephemeral": "e1", "ghost": "g1"},
+        ]
+    )
+
+    # Search: the key and retrievable fields are returned; non-retrievable
+    # fields are omitted unless explicitly selected.
+    doc = next(iter(search_client.search(search_text="*")))
+    assert doc["id"] == "1"
+    assert doc["title"] == "one"
+    assert doc["ephemeral"] == "e1"
+    assert "secret" not in doc
+    assert "ghost" not in doc
+
+    # Selecting the stored, non-retrievable field returns it.
+    selected = next(iter(search_client.search(search_text="*", select=["id", "secret"])))
+    assert selected["secret"] == "s1"
+    assert "title" not in selected
+
+    # get_document: only stored fields (the key is always returned).
+    stored = search_client.get_document(key="1")
+    assert stored["id"] == "1"
+    assert stored["title"] == "one"
+    assert stored["secret"] == "s1"
+    assert "ephemeral" not in stored
+    assert "ghost" not in stored
+
+
 def test_search_facet_options(priced_docs: SearchClient) -> None:
     results = priced_docs.search(search_text="*", facets=["tags,count:1"])
     facets = results.get_facets()
@@ -1054,9 +1110,25 @@ def test_knowledge_base_crud(clean_emulator: str, index_client: SearchIndexClien
         index_client.get_knowledge_base("kb1")
 
 
+def _retrieval_client(clean_emulator: str) -> KnowledgeBaseRetrievalClient:
+    return KnowledgeBaseRetrievalClient(
+        endpoint=clean_emulator,
+        knowledge_base_name="kb1",
+        credential=CREDENTIAL,
+        api_version=API_VERSION,
+    )
+
+
 def test_knowledge_base_retrieve_returns_empty(
     clean_emulator: str, index_client: SearchIndexClient
 ) -> None:
+    # An empty source index: the retrieve returns an empty response.
+    index_client.create_index(
+        SearchIndex(
+            name="i1",
+            fields=[SearchField(name="id", type=SearchFieldDataType.String, key=True)],
+        )
+    )
     index_client.create_knowledge_source(
         SearchIndexKnowledgeSource(
             name="src1",
@@ -1068,13 +1140,7 @@ def test_knowledge_base_retrieve_returns_empty(
         KnowledgeBase(name="kb1", knowledge_sources=[{"name": "src1"}])
     )
 
-    client = KnowledgeBaseRetrievalClient(
-        endpoint=clean_emulator,
-        knowledge_base_name="kb1",
-        credential=CREDENTIAL,
-        api_version=API_VERSION,
-    )
-    response = client.retrieve(
+    response = _retrieval_client(clean_emulator).retrieve(
         KnowledgeBaseRetrievalRequest(
             intents=[KnowledgeRetrievalSemanticIntent(type="semantic", search="hotels")]
         )
@@ -1082,6 +1148,79 @@ def test_knowledge_base_retrieve_returns_empty(
     assert response.response == []
     assert response.activity == []
     assert response.references == []
+
+
+def test_knowledge_base_retrieve_returns_source_documents(
+    clean_emulator: str, index_client: SearchIndexClient
+) -> None:
+    index_client.create_index(
+        SearchIndex(
+            name="i1",
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchableField(name="title", type=SearchFieldDataType.String),
+            ],
+        )
+    )
+    search_client = SearchClient(
+        endpoint=clean_emulator,
+        index_name="i1",
+        credential=CREDENTIAL,
+        api_version=API_VERSION,
+    )
+    search_client.upload_documents(
+        [
+            {"id": "1", "title": "azure search"},
+            {"id": "2", "title": "azure emulators"},
+            {"id": "3", "title": "other topic"},
+        ]
+    )
+    index_client.create_knowledge_source(
+        SearchIndexKnowledgeSource(
+            name="src1",
+            kind="searchIndex",
+            search_index_parameters={"searchIndexName": "i1"},
+        )
+    )
+    index_client.create_knowledge_base(
+        KnowledgeBase(name="kb1", knowledge_sources=[{"name": "src1"}])
+    )
+
+    # The intent's `search` is the search text; a match-all returns every
+    # source document (default `top` is 3), each tagged with its source.
+    response = _retrieval_client(clean_emulator).retrieve(
+        KnowledgeBaseRetrievalRequest(
+            intents=[KnowledgeRetrievalSemanticIntent(type="semantic", search="*")]
+        )
+    )
+    assert len(response.response) == 3
+    for message in response.response:
+        assert message["@search.source"] == "src1"
+    assert response.activity == []
+    assert response.references == []
+
+
+def test_knowledge_base_retrieve_missing_source_index_returns_404(
+    clean_emulator: str, index_client: SearchIndexClient
+) -> None:
+    # A source pointing at a missing index: the retrieve call fails.
+    index_client.create_knowledge_source(
+        SearchIndexKnowledgeSource(
+            name="src1",
+            kind="searchIndex",
+            search_index_parameters={"searchIndexName": "no-such-index"},
+        )
+    )
+    index_client.create_knowledge_base(
+        KnowledgeBase(name="kb1", knowledge_sources=[{"name": "src1"}])
+    )
+
+    with pytest.raises(ResourceNotFoundError):
+        _retrieval_client(clean_emulator).retrieve(
+            KnowledgeBaseRetrievalRequest(
+                intents=[KnowledgeRetrievalSemanticIntent(type="semantic", search="*")]
+            )
+        )
 
 
 def test_search_mode_any_matches_union(

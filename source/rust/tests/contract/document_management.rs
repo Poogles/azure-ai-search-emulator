@@ -1,5 +1,5 @@
 use axum::http::StatusCode;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::common::*;
 
@@ -271,6 +271,111 @@ async fn get_document_on_missing_index_returns_404() {
     let (status, body) = call(app, get_document_request("missing", "1")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"]["code"], "ResourceNotFound");
+}
+
+// ---------------------------------------------------------------------------
+// `stored` / `retrievable` field-visibility enforcement
+// ---------------------------------------------------------------------------
+
+/// An index exercising all four `stored`/`retrievable` combinations:
+/// `title` (both true, the default), `secret` (stored, not retrievable),
+/// `ephemeral` (retrievable, not stored), and `ghost` (neither).
+fn stored_retrievable_index(name: &str) -> Value {
+    json!({
+        "name": name,
+        "fields": [
+            {"name": "id", "type": "Edm.String", "key": true},
+            {"name": "title", "type": "Edm.String", "searchable": true},
+            {"name": "secret", "type": "Edm.String", "searchable": true, "retrievable": false},
+            {"name": "ephemeral", "type": "Edm.String", "searchable": true, "stored": false},
+            {"name": "ghost", "type": "Edm.String", "searchable": true, "stored": false, "retrievable": false}
+        ]
+    })
+}
+
+async fn create_stored_retrievable_index(app: &axum::Router, name: &str) -> (StatusCode, Value) {
+    call(
+        app.clone(),
+        request(
+            "POST",
+            &format!("/indexes?api-version={API_VERSION}"),
+            Some(API_KEY),
+            Some(stored_retrievable_index(name)),
+        ),
+    )
+    .await
+}
+
+fn stored_retrievable_doc() -> Value {
+    json!([
+        {"@search.action": "upload", "document": {
+            "id": "1", "title": "one", "secret": "s1", "ephemeral": "e1", "ghost": "g1"
+        }}
+    ])
+}
+
+#[tokio::test]
+async fn search_omits_non_retrievable_and_returns_retrievable() {
+    let app = app();
+    let (status, _) = create_stored_retrievable_index(&app, "sr").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(app.clone(), upload_request("sr", stored_retrievable_doc())).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = call(app, search_request("sr", json!({"search": "*"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    let doc = &body["value"][0];
+    // Key field, the default stored+retrievable field, and the retrievable
+    // (non-stored) field are all returned.
+    assert_eq!(doc["id"], "1");
+    assert_eq!(doc["title"], "one");
+    assert_eq!(doc["ephemeral"], "e1");
+    // `retrievable: false` (stored) is omitted unless explicitly selected.
+    assert!(doc.get("secret").is_none(), "secret present: {doc}");
+    // `stored: false, retrievable: false` is never returned.
+    assert!(doc.get("ghost").is_none(), "ghost present: {doc}");
+}
+
+#[tokio::test]
+async fn search_select_includes_stored_non_retrievable() {
+    let app = app();
+    let (status, _) = create_stored_retrievable_index(&app, "sr").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(app.clone(), upload_request("sr", stored_retrievable_doc())).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = call(
+        app,
+        search_request("sr", json!({"search": "*", "select": "id,secret"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let doc = &body["value"][0];
+    // Selecting the stored, non-retrievable field returns it.
+    assert_eq!(doc["id"], "1");
+    assert_eq!(doc["secret"], "s1");
+    // Unselected fields are projected out.
+    assert!(doc.get("title").is_none(), "title present: {doc}");
+    assert!(doc.get("ephemeral").is_none(), "ephemeral present: {doc}");
+}
+
+#[tokio::test]
+async fn get_document_returns_only_stored_fields() {
+    let app = app();
+    let (status, _) = create_stored_retrievable_index(&app, "sr").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(app.clone(), upload_request("sr", stored_retrievable_doc())).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = call(app, get_document_request("sr", "1")).await;
+    assert_eq!(status, StatusCode::OK);
+    // Key + stored fields, including the stored, non-retrievable one.
+    assert_eq!(body["id"], "1");
+    assert_eq!(body["title"], "one");
+    assert_eq!(body["secret"], "s1");
+    // `stored: false` fields are not persisted for get_document.
+    assert!(body.get("ephemeral").is_none(), "ephemeral present: {body}");
+    assert!(body.get("ghost").is_none(), "ghost present: {body}");
 }
 
 fn document_count_request(name: &str) -> axum::http::Request<axum::body::Body> {

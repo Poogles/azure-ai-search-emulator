@@ -527,6 +527,110 @@ impl SearchService {
         self.named_store(kind).delete(kind, name)
     }
 
+    /// Executes a knowledge-base `retrieve`: returns documents from the base's
+    /// `searchIndex` knowledge sources (no model inference). Each source index
+    /// is searched with the request's search text (the top-level `query`, or
+    /// the first intent's `search` as sent by the SDKs, or a match-all `"*"`),
+    /// limited by `top` (default 3, max 1000); each returned document carries
+    /// an `@search.source` field naming its knowledge source. `activity` and
+    /// `references` are empty (no model inference). A missing source index
+    /// fails the whole call with `404 ResourceNotFound`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] if the knowledge base does not exist, a source
+    /// index is missing, or a source search fails.
+    pub fn retrieve_knowledge_base(&self, name: &str, body: &Value) -> Result<Value, ApiError> {
+        let base = self.get_named_resource(ResourceKind::KnowledgeBase, name)?;
+        let base_raw = base.to_value();
+        // The search text is the top-level `query` (raw-HTTP convenience) or the
+        // first intent's `search` (the SDK wire format); otherwise a match-all.
+        // `top` defaults to 3 and is capped at 1000.
+        let search_text = body
+            .get("query")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                body.get("intents")
+                    .and_then(Value::as_array)
+                    .and_then(|intents| intents.first())
+                    .and_then(|intent| intent.get("search"))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or("*");
+        let top = body
+            .get("top")
+            .and_then(Value::as_u64)
+            .unwrap_or(3)
+            .min(1000);
+
+        // Resolve each `searchIndex` source to its index, failing the whole
+        // call when a source index is missing. A source entry is either inline
+        // (carrying a `kind`) or a reference to a named knowledge source.
+        let knowledge_sources = base_raw
+            .get("knowledgeSources")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut sources: Vec<(String, String)> = Vec::new();
+        for entry in &knowledge_sources {
+            let Some(source_name) = entry.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let source_def: Value = if entry.get("kind").is_some() {
+                entry.clone()
+            } else {
+                match self.get_named_resource(ResourceKind::KnowledgeSource, source_name) {
+                    Ok(resource) => resource.to_value(),
+                    Err(_) => continue,
+                }
+            };
+            if source_def.get("kind").and_then(Value::as_str) != Some("searchIndex") {
+                continue;
+            }
+            let Some(index_name) = source_def
+                .get("searchIndexParameters")
+                .and_then(|p| p.get("searchIndexName"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            if self
+                .storage
+                .get_index(&self.resolve_index_name(index_name))
+                .is_none()
+            {
+                return Err(ApiError::not_found(format!(
+                    "Index {index_name:?} was not found."
+                )));
+            }
+            sources.push((source_name.to_owned(), index_name.to_owned()));
+        }
+
+        // Search each source index and collect the documents, tagging each with
+        // its knowledge source.
+        let mut response: Vec<Value> = Vec::new();
+        for (source_name, index_name) in &sources {
+            let search_body = json!({ "search": search_text, "top": top });
+            let query = self.parse_search(index_name, &search_body)?;
+            let outcome = self.search(index_name, &query)?;
+            for document in &outcome.documents {
+                let mut fields = document.fields.clone();
+                fields.insert(
+                    "@search.source".to_owned(),
+                    Value::String(source_name.clone()),
+                );
+                response.push(Value::Object(fields));
+            }
+        }
+        Ok(json!({
+            "response": response,
+            "activity": [],
+            "references": []
+        }))
+    }
+
     /// Returns a single document by key.
     ///
     /// # Errors
@@ -535,7 +639,22 @@ impl SearchService {
     pub fn get_document(&self, index: &str, key: &str) -> Result<Value, ApiError> {
         let definition = self.require_index(index)?;
         match self.storage.get_document(&definition.name, key)? {
-            Some(document) => Ok(document.to_value()),
+            Some(document) => {
+                // `get_document` returns only `stored` fields (the key field is
+                // always returned so the document stays identifiable).
+                // `retrievable` does not affect `get_document`: a
+                // `stored: true, retrievable: false` field is still returned
+                // here, while a `stored: false, retrievable: true` field is not.
+                let key_name = definition.key_field().map(|f| f.name.as_str());
+                let mut fields = document.fields;
+                fields.retain(|name, _| {
+                    if Some(name.as_str()) == key_name {
+                        return true;
+                    }
+                    definition.field(name).is_none_or(|f| f.stored)
+                });
+                Ok(Value::Object(fields))
+            }
             None => Err(ApiError::not_found(format!(
                 "Document with key {key:?} was not found in index {index:?}."
             ))),
@@ -1202,8 +1321,11 @@ impl SearchService {
     }
 
     /// Projects a page into response documents: per-document scores,
-    /// highlight fragments, and omission of non-retrievable vectors unless
-    /// explicitly selected.
+    /// highlight fragments, and the `stored`/`retrievable` field-visibility
+    /// rules. A field is returned in search results when it is `retrievable`,
+    /// or when it is `stored` and explicitly selected; the key field is always
+    /// returned. (A `retrievable: false` vector is thus searchable but omitted
+    /// unless selected, same as Azure.)
     fn project_page(
         page: Vec<(Document, f32)>,
         query: &SearchQuery,
@@ -1217,22 +1339,24 @@ impl SearchService {
         // Highlight fragments for the returned page, when `highlight`
         // fields were requested.
         let highlights = page_highlights(query, full_text, definition, &page);
-        // Vectors with `retrievable: false` are searchable but omitted from
-        // the response unless explicitly selected (same as Azure).
-        let hidden: BTreeSet<&str> = definition
-            .fields
-            .iter()
-            .filter(|f| f.is_vector_field() && !f.retrievable)
-            .map(|f| f.name.as_str())
-            .collect();
+        let key_name = definition.key_field().map(|f| f.name.as_str());
         let documents: Vec<Document> = page
             .into_iter()
             .map(|(mut doc, _)| {
-                if !hidden.is_empty() {
-                    doc.fields.retain(|name, _| {
-                        !hidden.contains(name.as_str()) || query.select.iter().any(|s| s == name)
-                    });
-                }
+                doc.fields.retain(|name, _| {
+                    if Some(name.as_str()) == key_name {
+                        return true;
+                    }
+                    match definition.field(name) {
+                        Some(field) => {
+                            field.retrievable
+                                || (field.stored && query.select.iter().any(|s| s == name))
+                        }
+                        // Fields absent from the schema are kept (documents are
+                        // schema-validated, so this is defensive).
+                        None => true,
+                    }
+                });
                 doc
             })
             .collect();

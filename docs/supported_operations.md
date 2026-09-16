@@ -52,7 +52,7 @@ Everything else (e.g. `Edm.Vector(...)`, `Edm.Byte`, other quantized types) is r
 
 Document validation (per document): `Edm.Int8` values must be integers in -128–127, `Edm.Int16` in -32768–32767; `Edm.Time`/`Edm.Duration`/`Edm.Binary` values must be well-formed strings of their kind (violations produce a per-document `400` in the batch response).
 
-Field attributes (`searchable`, `filterable`, `sortable`, `facetable`, `retrievable`) are parsed, stored, and echoed. `searchable` controls full-text indexing; `filterable`, `sortable`, and `facetable` gate the corresponding query options (a field used in `filter`/`orderby`/`facets` must carry the matching attribute, else `400 InvalidQuery`). Collection types may be written with or without the `Edm.` prefix (`Collection(Edm.String)` as sent by the SDK, or `Edm.Collection(Edm.String)`); both are accepted and normalized.
+Field attributes (`searchable`, `filterable`, `sortable`, `facetable`, `retrievable`, `stored`) are parsed, stored, and echoed. `searchable` controls full-text indexing; `filterable`, `sortable`, and `facetable` gate the corresponding query options (a field used in `filter`/`orderby`/`facets` must carry the matching attribute, else `400 InvalidQuery`). `retrievable` (default `true`) controls search-result visibility; `stored` (default `true`) controls persistence. A field is returned in search results when it is `retrievable`, or when it is `stored` and explicitly selected (the key field is always returned); `get_document` returns only `stored` fields (the key field is always returned). Collection types may be written with or without the `Edm.` prefix (`Collection(Edm.String)` as sent by the SDK, or `Edm.Collection(Edm.String)`); both are accepted and normalized.
 
 ### Vector fields (Phase 2.1)
 
@@ -75,7 +75,7 @@ Rules (rejected with `400 InvalidIndex`):
 - `dimensions` is required: a positive integer, 1–3072 (cap lowerable via `EMULATOR_VECTOR__MAX_DIMENSION`).
 - `vectorSearchProfile` is required and must reference a profile in the index's `vectorSearch.profiles` array.
 - `searchable` must be `true`; the field must not be `key`, `filterable`, `sortable`, or `facetable`.
-- `retrievable` may be `true` or `false` (default `true`); `retrievable: false` vectors are searchable but omitted from search responses unless explicitly selected (same as Azure). `stored` is accepted but inert.
+- `retrievable` may be `true` or `false` (default `true`); `retrievable: false` vectors are searchable but omitted from search responses unless explicitly selected (same as Azure). `stored` (default `true`) is enforced like any other field: a `stored: false` vector is omitted from `get_document` responses.
 - Up to 16 vector fields per index.
 - The index must include a `vectorSearch` object with at least one algorithm entry and at least one profile entry when vector fields are present. Supported algorithm `kind`s: `hnsw` (HNSW graph; `hnswParameters`: `m`, `efConstruction`, `efSearch`, `metric`) and `exhaustiveKnn` (brute-force scan; `exhaustiveKnnParameters`: `metric`). Supported `metric`s: `cosine`, `dotProduct`, `euclidean`. A missing kind-specific parameters object falls back to defaults (`m: 4`, `efConstruction: 400`, `efSearch: 500`, `metric: cosine`). `dotProduct` always executes as an exact scan regardless of `kind` (raw inner products cannot back an HNSW graph); small cosine/euclidean indexes scan exactly too, with the graph engaging above the `ef` window (see `docs/decisions/0004-vector-index.md`).
 
@@ -115,7 +115,7 @@ Validation (rejected with `400 InvalidAlias`): missing/empty `name`, missing/emp
 
 ## Knowledge sources, knowledge bases, and agentic retrieval
 
-Service-level resources. Knowledge sources and bases are stored and echoed (like aliases); the retrieval endpoint returns an empty response because model inference is out of scope (see `docs/known_differences.md`).
+Service-level resources. Knowledge sources and bases are stored and echoed (like aliases). The retrieval endpoint performs no model inference (out of scope, see `docs/known_differences.md`); instead it returns the documents from the base's `searchIndex` knowledge sources, each tagged with an `@search.source` field naming its source. The request's search text (the top-level `query`, or the first intent's `search` as sent by the SDKs; otherwise a match-all) drives the search and `top` (default 3, max 1000) limits each source index. A missing source index fails the call with `404 ResourceNotFound`.
 
 | Operation | SDK method | HTTP request | Success | Errors | Status |
 |-----------|-----------|--------------|---------|--------|--------|
@@ -129,7 +129,7 @@ Service-level resources. Knowledge sources and bases are stored and echoed (like
 | Get knowledge base | `SearchIndexClient.get_knowledge_base` | `GET /knowledgebases('{name}')?api-version=...` | `200` + the base | `404 ResourceNotFound` | Supported |
 | List knowledge bases | `SearchIndexClient.list_knowledge_bases` | `GET /knowledgebases?api-version=...` | `200 {"value": [...]}` (sorted by name) | — | Supported |
 | Delete knowledge base | `SearchIndexClient.delete_knowledge_base` | `DELETE /knowledgebases('{name}')?api-version=...` | `204` | `404 ResourceNotFound` | Supported |
-| Retrieve | `KnowledgeBaseRetrievalClient.retrieve` | `POST /knowledgebases('{name}')/retrieve?api-version=...` | `200 {"response": [], "activity": [], "references": []}` | `404 ResourceNotFound` (missing base) | Supported (empty response) |
+| Retrieve | `KnowledgeBaseRetrievalClient.retrieve` | `POST /knowledgebases('{name}')/retrieve?api-version=...` | `200 {"response": [source docs + `@search.source`], "activity": [], "references": []}` | `404 ResourceNotFound` (missing base or missing source index) | Supported (source documents, no model inference) |
 
 Request bodies are stored and echoed verbatim with an `@odata.etag` added. Sources require a non-empty `kind` (searchIndex sources additionally require `searchIndexParameters.searchIndexName`); other kinds are accepted opaquely. Bases require a non-empty `knowledgeSources` array (each entry with a non-empty `name`).
 
@@ -218,7 +218,7 @@ Route: `POST /indexes('{name}')/docs/search.post.search?api-version=...`.
 
 The full list of search options rejected with `400 UnsupportedQuery`: `scoringProfile`, `scoringParameters`, `scoringStatistics`, `answers`, `captions`, `semantic`, `semanticConfiguration`, `semanticQuery`, `semanticErrorHandling`, `semanticMaxWaitInMilliseconds`.
 
-Accepted but inert (silently ignored): `sessionId` (the emulator uses deterministic score + key tie-breaking, so session affinity is irrelevant) and the index-schema `stored` property (no separate stored/retrievable enforcement beyond `retrievable`). Per-query `weight` is applied: it scales that vector query's contribution to the hybrid RRF fusion.
+Accepted but inert (silently ignored): `sessionId` (the emulator uses deterministic score + key tie-breaking, so session affinity is irrelevant). Per-query `weight` is applied: it scales that vector query's contribution to the hybrid RRF fusion.
 
 ### Filter
 
@@ -351,7 +351,7 @@ Matching is case-insensitive prefix or infix matching of the search text against
 |------------|----------------|------------|------------|----------------|
 | Index create/get/list/update/delete | `tests/contract/index_management.rs` | `service`, `storage` | `test_emulator.py`, `tests/sdk/` | `E2ETests`, `SdkTests.IndexCrud` |
 | Synonym map create/update/get/list/delete, auth, validation, reset | `tests/contract/synonym_maps.rs` | `service` | `tests/sdk/`, `tests/ms_samples/` (`sample_index_synonym_map_crud.py`) | `SdkTests.SynonymMapCrud` |
-| Document upload/merge/mergeOrUpload/delete, per-document errors, batch shapes, get-document, document count, GeographyPoint values | `tests/contract/document_management.rs` | `service` | `tests/sdk/` | `SdkTests` (upload/merge/delete/count), `E2ETests.UploadAndSearch` |
+| Document upload/merge/mergeOrUpload/delete, per-document errors, batch shapes, get-document, document count, GeographyPoint values, `stored`/`retrievable` field visibility | `tests/contract/document_management.rs` | `service` | `tests/sdk/` (`test_stored_retrievable_field_visibility`) | `SdkTests` (upload/merge/delete/count, `StoredRetrievableFieldVisibility`), `E2ETests.UploadAndSearch` |
 | Search shape, count, match-all, boolean operators, fuzzy terms (incl. default distance 2), searchMode, stemming/stopwords, BM25 scores + ordering (incl. `@search.score`), highlights, empty text, searchFields (incl. weights), `select=*`, facet options (incl. `$count` via raw HTTP, string-form options), analyze text (incl. analyzer/field validation, keyword/whitespace), service stats | `tests/contract/search.rs` | `query`, `service` | `tests/sdk/`, `test_emulator.py` (`$count`) | `SdkTests`, `E2ETests` (incl. `$count` via raw HTTP) |
 | Filters, including `in`, string functions, nested complex-type and collection-of-complex paths and collection `any`/`all` | `tests/contract/filtering.rs` | `filter`, `service` | `tests/sdk/` | `SdkTests.SearchFilter`, `SearchCollectionAnyAll` |
 | Complex-type schema, documents, filters, collection-of-complex (incl. nested complex types at any depth, nested filter/orderby/facet/select paths, deep lambda subfield access) | `tests/contract/complex_fields.rs` | `service` | `tests/sdk/` | `SdkTests.ComplexTypeFilter`, `CollectionOfComplexType`, `NestedComplexTypes` |
@@ -361,7 +361,7 @@ Matching is case-insensitive prefix or infix matching of the search text against
 | Autocomplete, suggest (prefix/infix match, suggester validation, auth) | `tests/contract/suggest_autocomplete.rs` | `service`, `storage` | `tests/sdk/`, `tests/ms_samples/` (`sample_query_autocomplete.py`, `sample_query_suggestions.py`) | `SdkTests.SuggestAndAutocomplete` |
 | Vector search (schema, document validation, vector/hybrid, filter modes, exhaustive, dotProduct/euclidean metrics, non-retrievable, multi-query, vector+orderby) | `tests/contract/vector_search.rs` | `vector`, `service` | `tests/sdk/test_vectors.py`, `test_emulator.py` (RAG flow) | `VectorSearchTests`, `E2ETests.RagStyleVectorAndHybridFlow` |
 | Index aliases (CRUD, validation incl. PUT, auth, reset, data-plane resolution, index/alias namespace conflicts) | `tests/contract/aliases_knowledge.rs` | `service` | `tests/sdk/`, `tests/ms_samples/` (`sample_index_alias_crud.py`) | `SdkTests.AliasCrud` |
-| Knowledge sources/bases + retrieval (CRUD, validation, auth, reset, empty retrieval) | `tests/contract/aliases_knowledge.rs` | `service` | `tests/sdk/`, `tests/ms_samples/` (`sample_agentic_retrieval.py`) | `SdkTests.KnowledgeSourceCrud`, `KnowledgeBaseCrud`, `KnowledgeBaseRetrieveReturnsEmpty` |
+| Knowledge sources/bases + retrieval (CRUD, validation, auth, reset, source-document retrieval: `query`/`intents[].search`/`top`, `@search.source`, missing-index 404, inline sources) | `tests/contract/aliases_knowledge.rs` | `service` | `tests/sdk/` (`test_knowledge_base_retrieve_*`), `tests/ms_samples/` (`sample_agentic_retrieval.py`) | `SdkTests.KnowledgeSourceCrud`, `KnowledgeBaseCrud`, `KnowledgeBaseRetrieveReturnsEmpty`, `KnowledgeBaseRetrieveReturnsSourceDocuments`, `KnowledgeBaseRetrieveMissingSourceIndexReturns404` |
 | Auth, API version (incl. floor acceptance), 404s, error structure | `tests/contract/errors.rs` | `version` | `test_emulator.py` | `E2ETests`, `SdkTests.ErrorBodyIsAzureStructured` |
 | Admin reset, health | `tests/contract/admin.rs` | — | `test_emulator.py` | `E2ETests.HealthEndpoint` (reset runs before each test) |
 | Wire-format compatibility (Python-captured fixtures) | — | — | `fixtures/` (captured) | `FixtureReplayTests` (replays `fixtures/`) |

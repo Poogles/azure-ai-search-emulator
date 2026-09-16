@@ -222,6 +222,10 @@ pub struct FieldDefinition {
     pub sortable: bool,
     pub facetable: bool,
     pub retrievable: bool,
+    /// Whether the field value is persisted (available via `get_document` and
+    /// `select`). `retrievable` controls search-result visibility; `stored`
+    /// controls persistence. Both default to `true`.
+    pub stored: bool,
     /// Declared vector dimensions (`dimensions`, or the SDK alias
     /// `vector_search_dimensions`). `Some` only when the property is present
     /// and a positive integer; the service layer validates range and
@@ -313,6 +317,7 @@ impl FieldDefinition {
             sortable: get_bool(obj, "sortable", false),
             facetable: get_bool(obj, "facetable", false),
             retrievable: get_bool(obj, "retrievable", true),
+            stored: get_bool(obj, "stored", true),
             subfields,
             analyzer,
             synonym_maps,

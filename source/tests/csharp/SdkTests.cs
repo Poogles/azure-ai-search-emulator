@@ -1142,6 +1142,12 @@ public class SdkTests : EmulatorTestBase
     public async Task KnowledgeBaseRetrieveReturnsEmpty()
     {
         var indexClient = IndexClient();
+        // An empty source index: the retrieve returns an empty response (a
+        // missing source index now fails with 404, so the index must exist).
+        await indexClient.CreateIndexAsync(new SearchIndex("i1")
+        {
+            Fields = { new SearchField("id", SearchFieldDataType.String) { IsKey = true } },
+        });
         await indexClient.CreateKnowledgeSourceAsync(new SearchIndexKnowledgeSource(
             "src1", new SearchIndexKnowledgeSourceParameters("i1")));
         await indexClient.CreateKnowledgeBaseAsync(new KnowledgeBase(
@@ -1156,6 +1162,121 @@ public class SdkTests : EmulatorTestBase
         Assert.Empty(response.Response);
         Assert.Empty(response.Activity);
         Assert.Empty(response.References);
+    }
+
+    [Fact]
+    public async Task KnowledgeBaseRetrieveReturnsSourceDocuments()
+    {
+        var indexClient = IndexClient();
+        var searchClient = SearchClient("i1");
+        await indexClient.CreateIndexAsync(new SearchIndex("i1")
+        {
+            Fields =
+            {
+                new SearchField("id", SearchFieldDataType.String) { IsKey = true },
+                new SearchableField("title"),
+            },
+        });
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = "azure search" },
+            new SearchDocument { ["id"] = "2", ["title"] = "azure emulators" },
+            new SearchDocument { ["id"] = "3", ["title"] = "other topic" },
+        });
+        await indexClient.CreateKnowledgeSourceAsync(new SearchIndexKnowledgeSource(
+            "src1", new SearchIndexKnowledgeSourceParameters("i1")));
+        await indexClient.CreateKnowledgeBaseAsync(new KnowledgeBase(
+            "kb1", new[] { new KnowledgeSourceReference("src1") }));
+
+        // The SDK's retrieve response model drops unmodeled document fields, so
+        // the source-document shape (@search.source) is verified over raw HTTP.
+        // The intent's search text drives the per-source search (default top 3).
+        var (status, body) = await RawPostAsync(
+            $"{BaseUrl}/knowledgebases('kb1')/retrieve?api-version={ApiVersion}",
+            """{"intents": [{"type": "semantic", "search": "azure"}]}""");
+        Assert.Equal(200, status);
+        using var doc = System.Text.Json.JsonDocument.Parse(body);
+        var root = doc.RootElement;
+        var response = root.GetProperty("response");
+        Assert.Equal(2, response.GetArrayLength());
+        foreach (var item in response.EnumerateArray())
+        {
+            Assert.Equal("src1", item.GetProperty("@search.source").GetString());
+        }
+        Assert.Equal(0, root.GetProperty("activity").GetArrayLength());
+        Assert.Equal(0, root.GetProperty("references").GetArrayLength());
+    }
+
+    [Fact]
+    public async Task KnowledgeBaseRetrieveMissingSourceIndexReturns404()
+    {
+        var indexClient = IndexClient();
+        // A source pointing at a missing index: the retrieve call fails.
+        await indexClient.CreateKnowledgeSourceAsync(new SearchIndexKnowledgeSource(
+            "src1", new SearchIndexKnowledgeSourceParameters("no-such-index")));
+        await indexClient.CreateKnowledgeBaseAsync(new KnowledgeBase(
+            "kb1", new[] { new KnowledgeSourceReference("src1") }));
+
+        var client = new KnowledgeBaseRetrievalClient(
+            new Uri(SdkBaseUrl), "kb1", new AzureKeyCredential(ApiKey), Options);
+        var ex = await Assert.ThrowsAsync<RequestFailedException>(() => client.RetrieveAsync(
+            new KnowledgeBaseRetrievalRequest
+            {
+                Intents = { new KnowledgeRetrievalSemanticIntent("*") },
+            }));
+        Assert.Equal(404, ex.Status);
+    }
+
+    [Fact]
+    public async Task StoredRetrievableFieldVisibility()
+    {
+        // The .NET SDK does not expose the `retrievable`/`stored` field
+        // attributes, so the index is created over raw HTTP; upload, search,
+        // and get-document still go through the SDK.
+        var indexClient = IndexClient();
+        var searchClient = SearchClient(IndexName);
+        var (createStatus, _) = await RawPostAsync($"{BaseUrl}/indexes?api-version={ApiVersion}", """
+        {
+          "name": "csharp-index",
+          "fields": [
+            { "name": "id", "type": "Edm.String", "key": true },
+            { "name": "title", "type": "Edm.String", "searchable": true },
+            { "name": "secret", "type": "Edm.String", "searchable": true, "retrievable": false },
+            { "name": "ephemeral", "type": "Edm.String", "searchable": true, "stored": false },
+            { "name": "ghost", "type": "Edm.String", "searchable": true, "stored": false, "retrievable": false }
+          ]
+        }
+        """);
+        Assert.Equal(201, createStatus);
+        await searchClient.UploadDocumentsAsync(new[]
+        {
+            new SearchDocument { ["id"] = "1", ["title"] = "one", ["secret"] = "s1", ["ephemeral"] = "e1", ["ghost"] = "g1" },
+        });
+
+        // Search: the key and retrievable fields are returned; non-retrievable
+        // fields are omitted unless explicitly selected.
+        var found = await RunSearch<SearchDocument>(searchClient, new SearchOptions(), "*");
+        Assert.Single(found);
+        Assert.Equal("1", found[0]["id"].ToString());
+        Assert.Equal("one", found[0]["title"].ToString());
+        Assert.Equal("e1", found[0]["ephemeral"].ToString());
+        Assert.False(found[0].ContainsKey("secret"));
+        Assert.False(found[0].ContainsKey("ghost"));
+
+        // Selecting the stored, non-retrievable field returns it.
+        var selected = await RunSearch<SearchDocument>(
+            searchClient, new SearchOptions { Select = { "id", "secret" } }, "*");
+        Assert.Single(selected);
+        Assert.Equal("s1", selected[0]["secret"].ToString());
+        Assert.False(selected[0].ContainsKey("title"));
+
+        // get-document: only stored fields (the key is always returned).
+        var stored = (await searchClient.GetDocumentAsync<SearchDocument>("1")).Value;
+        Assert.Equal("1", stored["id"].ToString());
+        Assert.Equal("one", stored["title"].ToString());
+        Assert.Equal("s1", stored["secret"].ToString());
+        Assert.False(stored.ContainsKey("ephemeral"));
+        Assert.False(stored.ContainsKey("ghost"));
     }
     [Fact]
     public async Task SearchModeAnyMatchesUnion()

@@ -2,7 +2,7 @@
 //! knowledge bases + agentic retrieval (Gap 13).
 
 use axum::http::StatusCode;
-use serde_json::json;
+use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use super::common::*;
@@ -650,6 +650,176 @@ async fn retrieve_knowledge_base_returns_empty_response() {
     assert_eq!(body["response"].as_array().map(Vec::len), Some(0));
     assert_eq!(body["activity"].as_array().map(Vec::len), Some(0));
     assert_eq!(body["references"].as_array().map(Vec::len), Some(0));
+}
+
+/// A source index with three documents, two of which contain "azure".
+async fn create_source_index(app: &axum::Router, name: &str) -> (StatusCode, Value) {
+    call(
+        app.clone(),
+        request(
+            "POST",
+            &format!("/indexes?api-version={API_VERSION}"),
+            Some(API_KEY),
+            Some(json!({
+                "name": name,
+                "fields": [
+                    {"name": "id", "type": "Edm.String", "key": true},
+                    {"name": "title", "type": "Edm.String", "searchable": true}
+                ]
+            })),
+        ),
+    )
+    .await
+}
+
+fn source_index_docs() -> Value {
+    json!([
+        {"@search.action": "upload", "document": {"id": "1", "title": "azure search"}},
+        {"@search.action": "upload", "document": {"id": "2", "title": "azure emulators"}},
+        {"@search.action": "upload", "document": {"id": "3", "title": "other topic"}}
+    ])
+}
+
+fn retrieve_request(name: &str, body: Value) -> axum::http::Request<axum::body::Body> {
+    let uri = format!("/knowledgebases('{name}')/retrieve?api-version={API_VERSION}");
+    request("POST", &uri, Some(API_KEY), Some(body))
+}
+
+/// Seeds a source index, a knowledge source pointing at it, and a knowledge
+/// base referencing that source.
+async fn seed_retrieval(app: &axum::Router) {
+    let (status, _) = create_source_index(app, "srcidx").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(app.clone(), upload_request("srcidx", source_index_docs())).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(app.clone(), create_source_request("src1", "srcidx")).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(app.clone(), create_base_request("base1", "src1")).await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn retrieve_knowledge_base_returns_source_documents() {
+    let app = app();
+    seed_retrieval(&app).await;
+
+    let (status, body) = call(app, retrieve_request("base1", json!({"query": "*"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    let response = body["response"].as_array().cloned().unwrap_or_default();
+    // Default `top` is 3, so all three source documents are returned, each
+    // tagged with the knowledge source it came from.
+    assert_eq!(response.len(), 3);
+    for doc in &response {
+        assert_eq!(doc["@search.source"], "src1");
+    }
+    assert_eq!(body["activity"].as_array().map(Vec::len), Some(0));
+    assert_eq!(body["references"].as_array().map(Vec::len), Some(0));
+}
+
+#[tokio::test]
+async fn retrieve_knowledge_base_uses_query_as_search_text() {
+    let app = app();
+    seed_retrieval(&app).await;
+
+    // `query: "azure"` matches only the two documents containing "azure".
+    let (status, body) = call(app, retrieve_request("base1", json!({"query": "azure"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    let response = body["response"].as_array().cloned().unwrap_or_default();
+    assert_eq!(response.len(), 2);
+    let ids: Vec<String> = response
+        .iter()
+        .map(|d| d["id"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert!(ids.contains(&"1".to_owned()), "ids: {ids:?}");
+    assert!(ids.contains(&"2".to_owned()), "ids: {ids:?}");
+}
+
+#[tokio::test]
+async fn retrieve_knowledge_base_uses_intent_search_as_search_text() {
+    let app = app();
+    seed_retrieval(&app).await;
+
+    // The SDK wire format carries the search text in the first intent's
+    // `search` field rather than a top-level `query`.
+    let (status, body) = call(
+        app,
+        retrieve_request(
+            "base1",
+            json!({"intents": [{"type": "semantic", "search": "azure"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let response = body["response"].as_array().cloned().unwrap_or_default();
+    assert_eq!(response.len(), 2);
+}
+
+#[tokio::test]
+async fn retrieve_knowledge_base_respects_top() {
+    let app = app();
+    seed_retrieval(&app).await;
+
+    let (status, body) = call(
+        app,
+        retrieve_request("base1", json!({"query": "*", "top": 2})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let response = body["response"].as_array().cloned().unwrap_or_default();
+    assert_eq!(response.len(), 2);
+}
+
+#[tokio::test]
+async fn retrieve_knowledge_base_missing_source_index_returns_404() {
+    let app = app();
+    // A source pointing at a missing index: the retrieve call fails.
+    let (status, _) = call(app.clone(), create_source_request("src1", "missing-index")).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(app.clone(), create_base_request("base1", "src1")).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = call(app, retrieve_request("base1", json!({"query": "*"}))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "ResourceNotFound");
+}
+
+#[tokio::test]
+async fn retrieve_knowledge_base_inline_source_returns_documents() {
+    let app = app();
+    let (status, _) = create_source_index(&app, "srcidx").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(app.clone(), upload_request("srcidx", source_index_docs())).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A knowledge base with an inline source (carrying a `kind`) rather than a
+    // reference to a named knowledge source.
+    let uri = format!("/knowledgebases?api-version={API_VERSION}");
+    let (status, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            &uri,
+            Some(API_KEY),
+            Some(json!({
+                "name": "base1",
+                "knowledgeSources": [{
+                    "name": "inline",
+                    "kind": "searchIndex",
+                    "searchIndexParameters": {"searchIndexName": "srcidx"}
+                }]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = call(app, retrieve_request("base1", json!({"query": "*"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    let response = body["response"].as_array().cloned().unwrap_or_default();
+    assert_eq!(response.len(), 3);
+    for doc in &response {
+        assert_eq!(doc["@search.source"], "inline");
+    }
 }
 
 #[tokio::test]

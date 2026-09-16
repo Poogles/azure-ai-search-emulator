@@ -303,7 +303,7 @@ Implemented against the SDK wire format (`fuzzy` boolean from `useFuzzyMatching`
 
 ### 11. `stored` property enforcement
 
-**Current state:** The `stored` property on field definitions is accepted but inert.
+**Current state:** Implemented — `stored` (default `true`) is enforced alongside `retrievable`: search results include a field when it is `retrievable` or when it is `stored` and explicitly selected (the key field is always returned); `get_document` returns only `stored` fields (the key field is always returned).
 
 **Target:** Enforce the `stored`/`retrievable` separation.
 
@@ -312,11 +312,11 @@ Implemented against the SDK wire format (`fuzzy` boolean from `useFuzzyMatching`
 - `stored: true, retrievable: true` (default): full availability (current behaviour).
 - `stored: false, retrievable: false`: the field is indexed (if `searchable`) but its value is never returned.
 - Document upload validation is unchanged (the value must be present and type-correct at upload time regardless of `stored`/`retrievable`).
-- `get_document` returns only fields with `stored: true` (or `retrievable: true`, matching Azure's "stored OR retrievable" rule for get-document).
+- `get_document` returns only fields with `stored: true` (the key field is always returned). A `stored: false` field has no persisted value, so it is excluded from `get_document` even when `retrievable: true` (see the `stored: false, retrievable: true` case above); `retrievable` does not affect `get_document`.
 
 ### 12. Knowledge-base retrieve: return source documents
 
-**Current state:** `POST /knowledgebases('{name}')/retrieve` returns an empty response.
+**Current state:** Implemented — `POST /knowledgebases('{name}')/retrieve` returns the documents from the base's `searchIndex` knowledge sources (each tagged with `@search.source`), searched with the request's search text (top-level `query`, or the first intent's `search` as sent by the SDKs; otherwise a match-all) and limited by `top` (default 3, max 1000); `activity` and `references` remain empty; a missing source index fails with `404 ResourceNotFound`.
 
 **Target:** Return documents from the knowledge base's source index (without model inference).
 
@@ -571,20 +571,20 @@ source/rust/src/
 
 ### `stored`/`retrievable` enforcement
 
-- [ ] All four combinations behave correctly.
-- [ ] `get_document` respects `stored`/`retrievable`.
-- [ ] Search response respects `retrievable`.
-- [ ] `select` can retrieve `stored: true, retrievable: false` fields.
-- [ ] Contract tests: field visibility across operations.
+- [x] All four combinations behave correctly.
+- [x] `get_document` respects `stored`/`retrievable`.
+- [x] Search response respects `retrievable`.
+- [x] `select` can retrieve `stored: true, retrievable: false` fields.
+- [x] Contract tests: field visibility across operations.
 
 ### Knowledge-base retrieve
 
-- [ ] Returns documents from `searchIndex` knowledge sources.
-- [ ] `query` field in request body used as search text.
-- [ ] `top` limits results (default 3, max 1000).
-- [ ] Source index missing → `404 ResourceNotFound`.
-- [ ] `activity` and `references` remain empty.
-- [ ] Contract test: retrieve returns source documents.
+- [x] Returns documents from `searchIndex` knowledge sources.
+- [x] `query` field in request body used as search text.
+- [x] `top` limits results (default 3, max 1000).
+- [x] Source index missing → `404 ResourceNotFound`.
+- [x] `activity` and `references` remain empty.
+- [x] Contract test: retrieve returns source documents.
 
 ### Integration
 

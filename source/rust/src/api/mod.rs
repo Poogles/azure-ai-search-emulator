@@ -253,24 +253,30 @@ async fn document_by_key(
     State(state): State<AppState>,
     method: Method,
     Path((raw_name, raw_key)): Path<(String, String)>,
+    body: axum::body::Bytes,
 ) -> Response {
     if raw_name.starts_with(ResourceKind::KnowledgeBase.path_prefix()) {
-        knowledge_base_retrieve(&state, &method, &raw_name, &raw_key)
+        knowledge_base_retrieve(&state, &method, &raw_name, &raw_key, &body)
     } else {
         get_document_by_key(&state, &method, &raw_name, &raw_key)
     }
 }
 
 /// `POST /knowledgebases('{name}')/retrieve` — agentic retrieval. The
-/// emulator performs no model inference (an initial-design non-goal), so it
-/// returns an empty retrieval response; the knowledge base must exist.
-/// Other methods on the retrieve route are 405; any other second segment
-/// on a knowledge base is not an Azure route (404).
+/// emulator performs no model inference (an initial-design non-goal); it
+/// returns the documents from the base's `searchIndex` knowledge sources,
+/// each tagged with an `@search.source` field. The request body's `query`
+/// (when present) is the search text (otherwise a match-all) and `top`
+/// (default 3, max 1000) limits each source index. A missing source index
+/// fails the call with `404 ResourceNotFound`. Other methods on the retrieve
+/// route are 405; any other second segment on a knowledge base is not an
+/// Azure route (404).
 fn knowledge_base_retrieve(
     state: &AppState,
     method: &Method,
     raw_name: &str,
     raw_key: &str,
+    body: &axum::body::Bytes,
 ) -> Response {
     if raw_key != "retrieve" {
         return StatusCode::NOT_FOUND.into_response();
@@ -288,13 +294,16 @@ fn knowledge_base_retrieve(
         Ok(name) => name,
         Err(error) => return error.into_response(),
     };
-    match state.service.get_named_resource(knowledge_base, &name) {
-        Ok(_) => Json(json!({
-            "response": [],
-            "activity": [],
-            "references": []
-        }))
-        .into_response(),
+    let raw = if body.is_empty() {
+        Value::Null
+    } else {
+        match parse_body(body) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        }
+    };
+    match state.service.retrieve_knowledge_base(&name, &raw) {
+        Ok(value) => Json(value).into_response(),
         Err(error) => error.into_response(),
     }
 }
