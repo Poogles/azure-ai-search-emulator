@@ -873,3 +873,84 @@ async fn profile_referencing_unknown_vectorizer_rejected() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(response["error"]["code"], "InvalidIndex");
 }
+
+/// A `null` value for a vectorizer-backed vector field is treated as omitted
+/// (a vector is generated from the source text), whether the vectorizer is
+/// associated through a field-level `vectorizer` property or the field's
+/// profile (the pinned SDKs' wire format).
+#[tokio::test]
+async fn null_vector_on_vectorizer_field_generates_vector() {
+    // Field-level vectorizer (the default test index).
+    let field_app = app();
+    let (status, _) = create_vectorizer_index(&field_app, "vecs").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let docs = json!([
+        {"@search.action": "upload", "document":
+            {"id": "1", "title": "quantum computing", "content": "applications",
+             "category": "tech", "content_vector": null}}
+    ]);
+    let (status, body) = call(field_app.clone(), upload_request("vecs", docs)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["value"][0]["status"], true,
+        "field-level: {}",
+        body["value"][0]["errorMessage"]
+    );
+    let (status, doc) = call(field_app, get_document_request("vecs", "1")).await;
+    assert_eq!(status, StatusCode::OK);
+    let vector = doc["content_vector"]
+        .as_array()
+        .unwrap_or_else(|| panic!("content_vector present"));
+    assert_eq!(vector.len(), 64);
+    assert!(vector.iter().any(|v| v.as_f64() != Some(0.0)));
+
+    // Profile-level vectorizer (the pinned SDKs' wire format).
+    let profile_body = json!({
+        "name": "vecs",
+        "fields": [
+            {"name": "id", "type": "Edm.String", "key": true, "filterable": true, "sortable": true},
+            {"name": "title", "type": "Edm.String", "searchable": true, "filterable": true},
+            {"name": "content", "type": "Edm.String", "searchable": true},
+            {"name": "content_vector", "type": "Collection(Edm.Single)",
+             "searchable": true, "retrievable": true,
+             "dimensions": 64, "vectorSearchProfile": "with_vz"}
+        ],
+        "vectorizers": vectorizers(),
+        "vectorSearch": {
+            "algorithms": [
+                {"name": "hnsw-1", "kind": "hnsw",
+                 "hnswParameters": {"m": 4, "efConstruction": 40, "efSearch": 20, "metric": "cosine"}}
+            ],
+            "profiles": [
+                {"name": "with_vz", "algorithmConfigurationName": "hnsw-1", "vectorizer": "embedder"}
+            ]
+        }
+    });
+    let profile_app = app();
+    let (status, _) = call(
+        profile_app.clone(),
+        request(
+            "POST",
+            &format!("/indexes?api-version={API_VERSION}"),
+            Some(API_KEY),
+            Some(profile_body),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let docs = json!([
+        {"@search.action": "upload", "document":
+            {"id": "1", "title": "quantum computing", "content": "applications",
+             "content_vector": null}}
+    ]);
+    let (status, upload) = call(profile_app.clone(), upload_request("vecs", docs)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        upload["value"][0]["status"], true,
+        "profile-level: {}",
+        upload["value"][0]["errorMessage"]
+    );
+    let (status, doc) = call(profile_app, get_document_request("vecs", "1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(doc["content_vector"].as_array().is_some());
+}

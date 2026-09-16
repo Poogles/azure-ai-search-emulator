@@ -693,13 +693,24 @@ impl SearchService {
     ) -> Result<Vec<IndexingResultItem>, ApiError> {
         let definition = self.require_index(index)?;
         let key_name = key_field_name(&definition);
+        // The vectorizer configuration is derived from the schema, so parse it
+        // once per batch and share it across every document (no per-document or
+        // per-field re-parsing of `vectorizers` / `vectorSearch`).
+        let vectorizer_context = crate::vector::vectorizer::build_vectorizer_context(&definition);
         // The final state of each key is its *last* action in the batch: a key
         // appears in at most one of the outcome sets, so the search engine,
         // the vector indexes, and storage converge on the same outcome.
         let mut batch = DocumentBatch::new(actions.len());
 
         for action in actions {
-            self.apply_document_action(&definition, index, &key_name, &action, &mut batch)?;
+            self.apply_document_action(
+                &definition,
+                index,
+                &key_name,
+                &action,
+                &mut batch,
+                &vectorizer_context,
+            )?;
         }
 
         if !batch.upserts.is_empty() || !batch.deletes.is_empty() {
@@ -745,6 +756,7 @@ impl SearchService {
         key_name: &str,
         action: &DocumentAction,
         batch: &mut DocumentBatch,
+        vectorizer_context: &crate::vector::vectorizer::VectorizerContext,
     ) -> Result<(), ApiError> {
         let key = action
             .document
@@ -752,32 +764,52 @@ impl SearchService {
             .and_then(key_display)
             .unwrap_or_default();
         match action.kind {
-            ActionKind::Upload => match validate_document(definition, &action.document) {
-                Ok(doc) => {
-                    batch.record_upsert(doc);
-                    batch.results.push(ok_result(key, 201));
+            ActionKind::Upload => {
+                match validate_document(definition, &action.document, vectorizer_context) {
+                    Ok(doc) => {
+                        batch.record_upsert(doc);
+                        batch.results.push(ok_result(key, 201));
+                    }
+                    Err(message) => batch.results.push(fail_result(key, 400, message)),
                 }
-                Err(message) => batch.results.push(fail_result(key, 400, message)),
-            },
+            }
             ActionKind::Merge => {
-                self.merge_or_fallback(definition, key_name, key, action, batch, |key, batch| {
-                    batch.results.push(fail_result(
-                        key.clone(),
-                        404,
-                        format!("Document with key {key:?} was not found in index {index:?}."),
-                    ));
-                });
+                self.merge_or_fallback(
+                    definition,
+                    key_name,
+                    key,
+                    action,
+                    batch,
+                    vectorizer_context,
+                    |key, batch| {
+                        batch.results.push(fail_result(
+                            key.clone(),
+                            404,
+                            format!("Document with key {key:?} was not found in index {index:?}."),
+                        ));
+                    },
+                );
             }
             ActionKind::MergeOrUpload => {
-                self.merge_or_fallback(definition, key_name, key, action, batch, |key, batch| {
-                    match validate_document(definition, &action.document) {
+                self.merge_or_fallback(
+                    definition,
+                    key_name,
+                    key,
+                    action,
+                    batch,
+                    vectorizer_context,
+                    |key, batch| match validate_document(
+                        definition,
+                        &action.document,
+                        vectorizer_context,
+                    ) {
                         Ok(doc) => {
                             batch.record_upsert(doc);
                             batch.results.push(ok_result(key, 201));
                         }
                         Err(message) => batch.results.push(fail_result(key, 400, message)),
-                    }
-                });
+                    },
+                );
             }
             ActionKind::Delete => {
                 // A key upserted earlier in the same batch counts as present,
@@ -882,6 +914,7 @@ impl SearchService {
         key_name: &str,
         document: &Value,
         pending: &BTreeMap<String, Document>,
+        vectorizer_context: &crate::vector::vectorizer::VectorizerContext,
     ) -> MergeOutcome {
         let Some(key) = document.get(key_name).and_then(key_display) else {
             return MergeOutcome::Invalid(format!(
@@ -900,7 +933,7 @@ impl SearchService {
         };
         match existing {
             Some(existing) => match merge_fields(&existing, document) {
-                Some(merged) => match validate_document(definition, &merged) {
+                Some(merged) => match validate_document(definition, &merged, vectorizer_context) {
                     Ok(doc) => MergeOutcome::Applied(doc),
                     Err(message) => MergeOutcome::Invalid(message),
                 },
@@ -914,6 +947,7 @@ impl SearchService {
     /// merge records the merged document (200) and an invalid document fails
     /// (400); a missing document is delegated to `on_missing` (a 404 for
     /// `merge`, an upload attempt for `mergeOrUpload`).
+    #[allow(clippy::too_many_arguments)]
     fn merge_or_fallback<F>(
         &self,
         definition: &IndexDefinition,
@@ -921,11 +955,18 @@ impl SearchService {
         key: String,
         action: &DocumentAction,
         batch: &mut DocumentBatch,
+        vectorizer_context: &crate::vector::vectorizer::VectorizerContext,
         on_missing: F,
     ) where
         F: FnOnce(String, &mut DocumentBatch),
     {
-        match self.merge_one(definition, key_name, &action.document, &batch.upserts) {
+        match self.merge_one(
+            definition,
+            key_name,
+            &action.document,
+            &batch.upserts,
+            vectorizer_context,
+        ) {
             MergeOutcome::Applied(doc) => {
                 batch.record_upsert(doc);
                 batch.results.push(ok_result(key, 200));

@@ -406,6 +406,7 @@ fn validate_subfields_at(subfields: &[FieldDefinition], path: &str) -> Result<()
 pub(crate) fn validate_document(
     definition: &IndexDefinition,
     document: &Value,
+    context: &crate::vector::vectorizer::VectorizerContext,
 ) -> Result<Document, String> {
     let obj = document
         .as_object()
@@ -425,14 +426,17 @@ pub(crate) fn validate_document(
             .field(name)
             .ok_or_else(|| format!("Document contains unknown field {name:?}."))?;
         // A vectorizer-backed vector field with a `null` value is treated as
-        // omitted: a vector is generated from the source text below.
-        if field.is_vector_field() && field.vectorizer.is_some() && value.is_null() {
+        // omitted: a vector is generated from the source text below. The
+        // vectorizer may be associated through the field's profile (the pinned
+        // SDKs' wire format) or a field-level `vectorizer` property, so resolve
+        // it the same way `apply_vectorizer_generation` does.
+        if field.is_vector_field() && context.field_vectorizer(field).is_some() && value.is_null() {
             continue;
         }
         check_field_type(field, value)?;
     }
     let mut fields = obj.clone();
-    apply_vectorizer_generation(definition, &mut fields);
+    apply_vectorizer_generation(definition, context, &mut fields);
     Ok(Document { key, fields })
 }
 
@@ -445,36 +449,36 @@ pub(crate) fn validate_document(
 /// source text yields a zero vector.
 fn apply_vectorizer_generation(
     definition: &IndexDefinition,
+    context: &crate::vector::vectorizer::VectorizerContext,
     fields: &mut serde_json::Map<String, Value>,
 ) {
-    let Ok(configs) = crate::vector::vectorizer::parse_vectorizers(definition.vectorizers.as_ref())
-    else {
-        return; // The schema is validated before documents, so this cannot fail.
-    };
-    if configs.is_empty() {
+    if context.configs.is_empty() {
         return;
     }
-    let fallback = crate::vector::vectorizer::searchable_string_fields(&definition.fields);
     for field in &definition.fields {
         if !field.is_vector_field() {
             continue;
         }
         // Resolve the vectorizer via the field's profile (the pinned SDKs'
         // wire format) or a field-level `vectorizer` property.
-        let Some(vectorizer_name) = crate::vector::vectorizer::field_vectorizer(definition, field)
-        else {
+        let Some(vectorizer_name) = context.field_vectorizer(field) else {
             continue;
         };
         let omitted = matches!(fields.get(&field.name), None | Some(Value::Null));
         if !omitted {
             continue;
         }
-        let Some(config) = crate::vector::vectorizer::find_vectorizer(&configs, &vectorizer_name)
+        let Some(config) =
+            crate::vector::vectorizer::find_vectorizer(&context.configs, &vectorizer_name)
         else {
             continue; // The schema is validated, so the vectorizer must exist.
         };
         let dimensions = field.vector_dimensions.unwrap_or(0);
-        let text = crate::vector::vectorizer::vectorizer_source_text(config, fields, &fallback);
+        let text = crate::vector::vectorizer::vectorizer_source_text(
+            config,
+            fields,
+            &context.fallback_fields,
+        );
         let vector = crate::vector::vectorizer::text_to_vector(&text, dimensions);
         // An empty source text yields a zero vector, which has zero cosine
         // similarity to every query vector. Leave the field absent (no vector

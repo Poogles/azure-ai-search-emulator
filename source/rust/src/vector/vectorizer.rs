@@ -212,15 +212,15 @@ pub fn find_vectorizer<'a>(
     configs.iter().find(|c| c.name == name)
 }
 
-/// Resolves the vectorizer a vector field uses, if any. The pinned SDKs
-/// associate a vectorizer with a field through its profile (the field's
-/// `vectorSearchProfile` → the profile's `vectorizer`); a field-level
-/// `vectorizer` property, when present, takes precedence (emulator leniency).
-/// Returns `None` for raw-vector fields.
+/// Resolves the vectorizer a vector field uses, if any, given an already
+/// parsed [`VectorSearchConfig`]. The pinned SDKs associate a vectorizer with a
+/// field through its profile (the field's `vectorSearchProfile` → the
+/// profile's `vectorizer`); a field-level `vectorizer` property, when present,
+/// takes precedence (emulator leniency). Returns `None` for raw-vector fields.
 #[must_use]
-pub fn field_vectorizer(
-    definition: &crate::storage::IndexDefinition,
+pub fn field_vectorizer_with(
     field: &crate::storage::FieldDefinition,
+    search_config: &super::config::VectorSearchConfig,
 ) -> Option<String> {
     if let Some(name) = &field.vectorizer {
         return Some(name.clone());
@@ -228,10 +228,61 @@ pub fn field_vectorizer(
     let Some(profile) = &field.vector_search_profile else {
         return None;
     };
-    let Ok(config) = super::config::parse_vector_search(definition.vector_search.as_ref()) else {
-        return None;
-    };
-    config.profile_vectorizers.get(profile).cloned()
+    search_config.profile_vectorizers.get(profile).cloned()
+}
+
+/// Resolves the vectorizer a vector field uses, if any, parsing the index's
+/// `vectorSearch` configuration. Prefer [`VectorizerContext::field_vectorizer`]
+/// when the configuration is already parsed (e.g. across a document batch).
+#[must_use]
+pub fn field_vectorizer(
+    definition: &crate::storage::IndexDefinition,
+    field: &crate::storage::FieldDefinition,
+) -> Option<String> {
+    let config =
+        super::config::parse_vector_search(definition.vector_search.as_ref()).unwrap_or_default();
+    field_vectorizer_with(field, &config)
+}
+
+/// The vectorizer configuration for an index, parsed once so it can be reused
+/// across every document in a batch (and across a field's `null`-guard and
+/// vector generation) without re-parsing the `vectorizers` / `vectorSearch`
+/// JSON per document or per field.
+#[derive(Debug, Clone, Default)]
+pub struct VectorizerContext {
+    /// The parsed `vectorizers` array (empty when the index has none).
+    pub configs: Vec<VectorizerConfig>,
+    /// The parsed `vectorSearch` configuration (for profile-level resolution).
+    pub search_config: super::config::VectorSearchConfig,
+    /// The index's searchable string fields, in schema order: the text-source
+    /// fallback for vectorizers configured without a `sourceContext`.
+    pub fallback_fields: Vec<String>,
+}
+
+impl VectorizerContext {
+    /// Resolves the vectorizer a vector field uses, if any, using the
+    /// pre-parsed configuration.
+    #[must_use]
+    pub fn field_vectorizer(&self, field: &crate::storage::FieldDefinition) -> Option<String> {
+        field_vectorizer_with(field, &self.search_config)
+    }
+}
+
+/// Parses an index's `vectorizers` and `vectorSearch` configuration once into a
+/// [`VectorizerContext`]. Malformed configuration yields an empty context
+/// (the schema is validated before documents are indexed, so this cannot fail
+/// in practice).
+#[must_use]
+pub fn build_vectorizer_context(definition: &crate::storage::IndexDefinition) -> VectorizerContext {
+    let configs = parse_vectorizers(definition.vectorizers.as_ref()).unwrap_or_default();
+    let search_config =
+        super::config::parse_vector_search(definition.vector_search.as_ref()).unwrap_or_default();
+    let fallback_fields = searchable_string_fields(&definition.fields);
+    VectorizerContext {
+        configs,
+        search_config,
+        fallback_fields,
+    }
 }
 
 /// Builds the text source for a vectorizer from a document's field map: the
