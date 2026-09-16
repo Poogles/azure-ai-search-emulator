@@ -1,6 +1,6 @@
 ---
-status: draft
-status_last_reviewed: 2026-09-14
+status: complete
+status_last_reviewed: 2026-09-16
 ---
 
 # Phase 2.3 — Semantic Search
@@ -65,15 +65,47 @@ Rules (rejected with `400 InvalidIndex`):
 - An index without a `semantic` property cannot be searched with `semantic` parameters (→ `400 InvalidQuery`: "index does not have a semantic configuration").
 - An index with a `semantic` property can still be searched without semantic parameters (normal full-text/vector path, unchanged).
 
-SDK ↔ wire mapping:
+SDK ↔ wire mapping (pinned SDKs: `azure-search-documents==12.0.0` Python,
+`Azure.Search.Documents==12.0.0` .NET):
 
-| SDK (`azure-search-documents`) | Wire / emulator storage |
+| SDK (Python / .NET 12.0.0) | Wire / emulator storage |
 |:---|:---|
-| `SemanticConfiguration(name, priorities=..., sources=..., reranker=...)` | `semantic.configurations[]` |
-| `SemanticField(priority="answers", field="title")` | `priorities.answers[]` |
-| `SemanticField(priority="captions", field="summary")` | `priorities.captions[]` |
-| `SemanticSource(name, type="text", field="content")` | `sources[]` |
-| `StandardSemanticReranker()` | `reranker: {name: "standard"}` |
+| `SemanticSearch(configurations=[...])` / `SemanticSearch { Configurations = {...} }` | `semantic` |
+| `SemanticConfiguration(name, prioritized_fields, ranking_order)` / `SemanticConfiguration { Name, PrioritizedFields, RankingOrder }` | `semantic.configurations[]` |
+| `SemanticPrioritizedFields(title_field, content_fields, keywords_fields)` | `priorities` + `sources` (see mapping below) |
+| `SemanticField(field_name=...)` / `SemanticField { FieldName }` | a field-name entry |
+
+The pinned 12.0.0 SDKs do not expose `priorities`/`sources` directly; they send
+the `prioritizedFields` wire format:
+
+```json
+{
+  "name": "my-semantic-config",
+  "prioritizedFields": {
+    "titleField": {"fieldName": "title"},
+    "prioritizedContentFields": [{"fieldName": "content"}],
+    "prioritizedKeywordsFields": [{"fieldName": "keywords"}]
+  },
+  "rankingOrder": "BoostedRerankerScore"
+}
+```
+
+The emulator accepts **both** index-schema formats and normalizes the SDK
+format to the canonical form internally:
+
+| SDK `prioritizedFields` | Canonical form |
+|:---|:---|
+| `titleField` | `priorities.answers` + `priorities.captions`, context role |
+| `prioritizedContentFields[]` | `priorities.answers` + `priorities.captions`, plus a `sources[]` entry per field |
+| `prioritizedKeywordsFields[]` | `priorities.answers`, plus a `sources[]` entry per field |
+| `rankingOrder` (any value) | `reranker: {name: "standard"}` |
+
+Validation of SDK-format configurations is lenient: referenced fields must
+exist in the index schema (same existence rule as the canonical form); the
+`searchable`/`retrievable` attribute checks apply to the canonical form only.
+`defaultConfiguration` / `DefaultConfigurationName` (index-level default) is
+accepted but inert: every semantic query must still name its configuration
+explicitly.
 
 ### Query: `semantic` parameter
 
@@ -114,7 +146,7 @@ Field semantics:
   - `count`: number of captions to return (1–3, default 1).
   - `type`: must be `"extractive"`.
   - `answers` (nested): per-caption answers (same shape as top-level `answers`, default count 1).
-- `semanticErrorHandling` (optional): `"throwError"` (default) or `"returnPartialResults"`. When `"returnPartialResults"`, if answer/caption extraction fails for a document, that document is still returned (without the failed component) rather than the entire request failing.
+- `semanticErrorHandling` (optional): `"throwError"` (default) or `"returnPartialResults"`. Parsed and validated but inert (see §`semanticErrorHandling`).
 - `semanticMaxWaitInMilliseconds` (optional): accepted but inert (operations are synchronous and fast; no timeout needed). Documented in `known_differences.md`.
 
 Rejected with `400 InvalidQuery`:
@@ -123,6 +155,63 @@ Rejected with `400 InvalidQuery`:
 - `semanticConfiguration` references an unknown configuration name.
 - `answers.type` or `captions.type` other than `"extractive"`.
 - `answers.count` or `captions.count` outside valid range.
+
+### Query: SDK flat format (pinned SDKs 12.0.0)
+
+The pinned 12.0.0 SDKs do not send the nested `semantic` object; they send
+flat top-level search parameters with `queryType: "semantic"`. The exact body
+the Python SDK emits for `search(query_type="semantic",
+semantic_configuration_name="...", query_answer="extractive",
+query_answer_count=3, query_answer_threshold=0.7,
+query_caption="extractive", query_caption_highlight_enabled=True,
+semantic_error_mode="fail", semantic_max_wait_in_milliseconds=500,
+semantic_query="...")` is:
+
+```json
+{
+  "search": "quantum computing",
+  "queryType": "semantic",
+  "semanticConfiguration": "my-semantic-config",
+  "semanticErrorHandling": "fail",
+  "semanticMaxWaitInMilliseconds": 500,
+  "semanticQuery": "quantum?",
+  "answers": "extractive|count-3,threshold-0.7",
+  "captions": "extractive|highlight-true"
+}
+```
+
+Note the configuration key is `semanticConfiguration` (the SDK's
+`semantic_configuration_name` / `SemanticConfigurationName` property
+serializes to this name), and `answers` / `captions` are **compound strings**
+(`"<type>"`, `"<type>|count-N"`, `"<type>|count-N,threshold-T"`,
+`"<type>|highlight-true|false"`), not objects. The .NET SDK emits the same
+keys.
+
+The emulator accepts **both** query formats. The flat format maps to the
+canonical `semantic` object as follows:
+
+| SDK flat parameter (Python / .NET) | Canonical equivalent |
+|:---|:---|
+| `query_type="semantic"` / `QueryType = Semantic` | selects the semantic pipeline (same as a present `semantic` object) |
+| `semantic_configuration_name` / `SemanticConfigurationName` (wire: `semanticConfiguration`) | `semantic.semanticConfiguration` (required with `queryType: "semantic"`) |
+| `semantic_query` / `SemanticQuery` (a separate query text for the semantic phase) | accepted but inert (answer/caption scoring uses the main `search` text) |
+| `query_answer="extractive"` (wire: `answers: "extractive[|...]"`) | `semantic.answers` present |
+| `query_answer_count=N` (wire: `answers: "extractive\|count-N"`) | `semantic.answers.count` (clamped to 1–5; default 3) |
+| `query_answer_threshold` (wire: `answers: "...,threshold-T"`) | accepted but inert |
+| `query_caption="extractive"` (wire: `captions: "extractive[|...]"`) | `semantic.captions` present (default count 1) |
+| `query_caption_highlight_enabled` (wire: `captions: "extractive\|highlight-..."`) | accepted but inert (caption highlights are always produced) |
+| `semantic_error_mode="fail"` / `"partial"` (wire: `semanticErrorHandling`) | `semanticErrorHandling` — both value sets accepted: `fail`/`partial` (flat) and `throwError`/`returnPartialResults` (nested); inert either way |
+| `semantic_max_wait_in_milliseconds` / `MaxWait` | accepted but inert |
+
+The legacy `queryAnswer` / `queryAnswerCount` / `queryCaption` properties are
+also accepted as a fallback (the `answers` / `captions` compound strings take
+precedence when present).
+
+`queryType: "semantic"` without a `semanticConfiguration` →
+`400 InvalidQuery`. `answers`/`captions` values other than
+`"extractive"`/`"none"` are treated as absent (no answers/captions requested).
+Top-level `semanticQuery`, `semanticErrorHandling`,
+`semanticMaxWaitInMilliseconds` are accepted (the latter two inert).
 
 ### Answer extraction (extractive)
 
@@ -137,27 +226,26 @@ Algorithm:
 5. A sentence is eligible only if its BM25 score against the query is above a threshold (at least one query term must match).
 6. If `queryContext.questions` is present, the question text is appended to the query terms for scoring purposes (biasing toward sentences that address the question).
 
-Response shape (per document in `value[]`):
+Response shape (top-level in the search response — the shape the SDKs
+deserialize into `SearchDocumentsResult.answers` / `SearchResults.Answers`):
 
 ```json
 {
   "@search.answers": [
     {
       "score": 0.85,
+      "key": "2",
       "text": "Quantum computing uses quantum bits to process information.",
-      "highlights": ["<em>quantum</em> computing uses <em>quantum</em> bits"],
-      "source": "content",
-      "sentence": 3
+      "highlights": "<em>Quantum</em> computing uses <em>quantum</em> bits to process information."
     }
   ]
 }
 ```
 
-- `score`: normalized BM25 score for the sentence (0.0–1.0, higher = more relevant). Computed as `sentence_score / max_sentence_score` across all candidates.
+- `score`: normalized BM25 score for the sentence (0.0–1.0, higher = more relevant). Computed as `sentence_score / max_sentence_score` across the selected candidates.
+- `key`: the key of the document the answer was extracted from.
 - `text`: the full sentence text.
-- `highlights`: the sentence with query-term matches wrapped in the request's `highlightPreTag`/`highlightPostTag` (default `<em>`/`</em>`).
-- `source`: the field name the sentence was extracted from.
-- `sentence`: zero-based index of the sentence within the source field.
+- `highlights`: the sentence with query-term matches wrapped in the request's `highlightPreTag`/`highlightPostTag` (default `<em>`/`</em>`), as a single string.
 - `@search.answers` is present only when `answers` was requested and at least one answer was extracted. Omitted (not null) otherwise.
 
 ### Caption extraction (extractive)
@@ -171,22 +259,20 @@ Algorithm:
 3. If the selected text exceeds 200 characters, truncate at the last word boundary before 200 characters and append `...`.
 4. If `captions.answers` is requested, extract answers from the caption text using the same sentence-scoring algorithm as §Answer extraction (but scoped to the caption text only).
 
-Response shape (per document in `value[]`):
+Response shape (per document in `value[]` — the shape the SDKs deserialize
+into `SearchResult.captions` / `SearchResult<T>.Captions`):
 
 ```json
 {
   "@search.captions": [
     {
       "text": "This document describes the fundamentals of quantum computing and its applications.",
-      "highlights": ["This document describes the fundamentals of <em>quantum</em> <em>computing</em>"],
-      "source": "summary",
-      "type": "extractive",
+      "highlights": "This document describes the fundamentals of <em>quantum</em> <em>computing</em> and its applications.",
       "answers": [
         {
           "score": 0.72,
           "text": "Quantum computing uses quantum bits to process information.",
-          "highlights": ["<em>quantum</em> <em>computing</em> uses <em>quantum</em> bits"],
-          "source": "summary"
+          "highlights": "<em>Quantum</em> <em>computing</em> uses <em>quantum</em> bits to process information."
         }
       ]
     }
@@ -195,27 +281,23 @@ Response shape (per document in `value[]`):
 ```
 
 - `text`: the caption text (truncated to ≤200 characters).
-- `highlights`: the caption with query-term matches wrapped in tags.
-- `source`: the field name the caption was extracted from.
-- `type`: always `"extractive"`.
-- `answers`: present only when `captions.answers` was requested.
+- `highlights`: the caption with query-term matches wrapped in tags, as a single string.
+- `answers`: present only when `captions.answers` was requested; each entry carries `score`, `text`, and `highlights`.
 - `@search.captions` is present only when `captions` was requested and at least one caption was extracted. Omitted (not null) otherwise.
 
 ### Reranker score
 
-When the semantic configuration includes a `reranker` (or even when it does not — Azure always returns a reranker score for semantic searches), each result document includes:
+Azure always returns a reranker score for semantic searches. Each result document includes:
 
 ```json
 {
-  "@search.reranker": {
-    "score": 0.78
-  }
+  "@search.rerankerScore": 0.78
 }
 ```
 
-- `score`: a normalized relevance score in [0.0, 1.0]. The emulator computes this as the document's BM25 score (or vector similarity score, for vector/hybrid queries) normalized to the [0, 1] range: `score / (score + 1)` for BM25 (a standard sigmoid-like normalization), or the raw cosine similarity for vector queries (already in [-1, 1], clamped to [0, 1]).
-- The reranker score does not change result ordering (ordering is still by the primary score: BM25 or vector similarity). It is an additive diagnostic property.
-- `@search.reranker` is present on every document in a semantic search response. Omitted for non-semantic searches.
+- `@search.rerankerScore`: a bare-number normalized relevance score in [0.0, 1.0]. The emulator computes this as the document's BM25 score normalized to the [0, 1] range: `score / (score + 1)` (a standard sigmoid-like normalization). It is the property the official SDKs deserialize into their models (Python `SearchResult.reranker_score`, .NET `SearchResult<T>.RerankerScore`).
+- The reranker score does not change result ordering (ordering is still by the primary BM25 score). It is an additive diagnostic property.
+- `@search.rerankerScore` is present on every document in a semantic search response. Omitted for non-semantic searches.
 
 ### Semantic + full-text interaction
 
@@ -235,25 +317,22 @@ When the semantic configuration includes a `reranker` (or even when it does not 
 {
   "@odata.context": "/$metadata#documents",
   "@odata.count": 2,
+  "@search.answers": [
+    {
+      "score": 0.91,
+      "key": "1",
+      "text": "Quantum computing leverages superposition and entanglement.",
+      "highlights": "<em>Quantum</em> <em>computing</em> leverages superposition and entanglement."
+    }
+  ],
   "value": [
     {
       "@search.score": 0.85,
-      "@search.reranker": { "score": 0.78 },
-      "@search.answers": [
-        {
-          "score": 0.91,
-          "text": "Quantum computing leverages superposition and entanglement.",
-          "highlights": ["<em>Quantum</em> <em>computing</em> leverages superposition"],
-          "source": "content",
-          "sentence": 2
-        }
-      ],
+      "@search.rerankerScore": 0.78,
       "@search.captions": [
         {
           "text": "An overview of quantum computing principles and applications.",
-          "highlights": ["An overview of <em>quantum</em> <em>computing</em> principles"],
-          "source": "summary",
-          "type": "extractive"
+          "highlights": "An overview of <em>quantum</em> <em>computing</em> principles and applications."
         }
       ],
       "@search.highlights": {
@@ -269,18 +348,15 @@ When the semantic configuration includes a `reranker` (or even when it does not 
 ```
 
 - `@search.score`: the primary BM25 score (unchanged from non-semantic search).
-- `@search.reranker.score`: the normalized reranker score (additive).
-- `@search.answers`: present only when requested and at least one answer extracted.
-- `@search.captions`: present only when requested and at least one caption extracted.
+- `@search.rerankerScore`: the normalized reranker score (additive), on every document.
+- `@search.answers`: top-level; present only when requested and at least one answer extracted.
+- `@search.captions`: per-document; present only when requested and at least one caption extracted.
 - `@search.highlights`: present when `highlight` was requested (same as non-semantic).
 - All properties are omitted (not null) when not applicable.
 
 ### `semanticErrorHandling`
 
-- `"throwError"` (default): if answer or caption extraction encounters an error (e.g., a prioritized field is missing from a document), the entire search returns `400 InvalidQuery` with a descriptive message.
-- `"returnPartialResults"`: the document is still returned; the failed component (`@search.answers` or `@search.captions`) is simply absent for that document. Other documents are unaffected.
-
-In practice, extraction failures are rare (a missing field simply yields no candidates for that document), so `"throwError"` rarely triggers. The distinction matters for SDK error-handling code paths.
+- `"throwError"` (default) / `"returnPartialResults"` (flat: `fail` / `partial`): parsed and validated (unknown values → `400 InvalidQuery`) but **inert** — the emulator's extractive pipeline does not fail in the ways Azure's model-based pipeline can (a missing prioritized field simply yields no candidates for that document), so both modes behave identically. Documented in `known_differences.md`.
 
 ### What is NOT in scope
 
@@ -325,7 +401,7 @@ Processing pipeline (in `service::search`):
    a. Compute reranker scores for all results.
    b. If `answers` requested: run answer extraction across all results, select top-N globally.
    c. If `captions` requested: run caption extraction per document.
-   d. Attach `@search.reranker`, `@search.answers`, `@search.captions` to result documents.
+    d. Attach `@search.rerankerScore`, `@search.answers`, `@search.captions` to result documents.
 5. Apply `top`/`skip` pagination (after semantic processing, so answers/captions are computed for the full result set before paging — matching Azure, where answers are selected from the full result set).
 6. Build response.
 
@@ -372,14 +448,13 @@ Previously rejected options now accepted (removed from `400 UnsupportedQuery` li
 Remaining rejected options (still `400 UnsupportedQuery`):
 
 - `scoringProfile`, `scoringParameters`, `scoringStatistics` (scoring profiles — separate concern).
-- `debug` (moved to Phase 2.2).
 
 ## Deliverables
 
 1. `source/rust/src/semantic/` module: `SemanticConfig` parser, sentence splitter, BM25 sentence scorer, answer selector, caption extractor, reranker score normalizer.
 2. Index schema validation: `semantic` property parsing and validation (configurations, priorities, sources, reranker, rescorers).
 3. Search path extension: `semantic` parameter parsing, validation against index config, semantic post-processing pipeline.
-4. Response shape: `@search.reranker`, `@search.answers`, `@search.captions` properties.
+4. Response shape: `@search.rerankerScore`, `@search.answers`, `@search.captions` properties.
 5. `semanticErrorHandling` support (`throwError` / `returnPartialResults`).
 6. Updated `docs/supported_operations.md`: semantic search flipped from Unsupported to Supported; `answers`/`captions`/`semantic*` removed from the rejected list.
 7. Updated `docs/known_differences.md`: extractive approximation rationale, no query rewriting, BM25 reranker vs cross-encoder, sentence-splitting differences.
@@ -403,9 +478,9 @@ Remaining rejected options (still `400 UnsupportedQuery`):
 ### Contract tests (`source/rust/tests/contract/semantic_search.rs`)
 
 - Create index with semantic configuration: valid → `201`; missing `semantic` → search with `semantic` → `400`; unknown configuration name → `400`; invalid schema (non-searchable source, duplicate config name, bad reranker) → `400 InvalidIndex`.
-- Semantic search (basic): `search` + `semantic.semanticConfiguration` → `200` with `@search.reranker` on all documents.
-- Semantic search with answers: `semantic.answers.count=3` → `@search.answers` present with ≤3 entries; correct shape (score, text, highlights, source, sentence).
-- Semantic search with captions: `semantic.captions.count=2` → `@search.captions` present with ≤2 entries; correct shape (text, highlights, source, type).
+- Semantic search (basic): `search` + `semantic.semanticConfiguration` → `200` with `@search.rerankerScore` on all documents.
+- Semantic search with answers: `semantic.answers.count=3` → `@search.answers` present with ≤3 entries; correct shape (score, key, text, highlights).
+- Semantic search with captions: `semantic.captions.count=2` → `@search.captions` present with ≤2 entries; correct shape (text, highlights, answers).
 - Semantic search with `captions.answers`: nested answers present in caption objects.
 - `queryContext.questions`: accepted; affects answer selection (answers biased toward question terms).
 - `semanticErrorHandling=returnPartialResults`: document with missing priority field still returned (without answers/captions for that doc).
@@ -413,24 +488,47 @@ Remaining rejected options (still `400 UnsupportedQuery`):
 - `semantic` + `queryType=full` → `400 InvalidQuery`.
 - `answers.type` other than `"extractive"` → `400 InvalidQuery`.
 - `answers.count` out of range (0, 6, non-integer) → `400 InvalidQuery`.
-- Non-semantic search on a semantic index: no `@search.reranker`/`@search.answers`/`@search.captions` in response.
+- Non-semantic search on a semantic index: no `@search.rerankerScore`/`@search.answers`/`@search.captions` in response.
 - Semantic search with `filter`, `orderby`, `select`, `facets`, `highlight`: all work in combination.
 - Semantic search with `top`/`skip`: answers selected from full set before paging.
 - `@search.answers`/`@search.captions` omitted (not null) when not requested or no candidates.
 
-### Python SDK compatibility tests
+### Python SDK compatibility tests (`azure-search-documents==12.0.0`)
 
-- `SearchIndexClient.create_index` with `semantic=Semantic(search_configurations=[SemanticConfiguration(...)])`.
-- `SearchClient.search` with `semantic=SemanticQuery(semantic_configuration="...", answers=SemanticAnswer(count=3), captions=SemanticCaption(count=2))`.
-- `query_context=QueryContext(questions=["..."])`.
-- `semantic_error_handling="returnPartialResults"`.
-- Response parsing: `result.get_answers()`, `result.get_captions()`, `result.reranker_score` (SDK model properties).
+- `SearchIndexClient.create_index` with
+  `semantic_search=SemanticSearch(configurations=[SemanticConfiguration(name=...,
+  prioritized_fields=SemanticPrioritizedFields(title_field=SemanticField(...),
+  content_fields=[SemanticField(...)]))])`.
+- `SearchClient.search` with `query_type="semantic"`,
+  `semantic_configuration_name="..."`, `query_answer="extractive"`,
+  `query_answer_count=3`, `query_caption="extractive"`,
+  `semantic_error_mode="fail"`.
+- Response parsing: `SearchResult.captions` and `SearchResult.reranker_score`
+  (SDK model properties populated from `@search.captions` /
+  `@search.rerankerScore`); per-document `@search.answers` and the
+  `@search.reranker` object asserted over raw HTTP (the pinned SDK has no
+  model property for them — the same raw-HTTP pattern used for the
+  bare-number `$count` facet).
+- Canonical nested-`semantic`-object queries (with `semanticConfiguration`,
+  `answers.count`, `captions.count`, `queryContext.questions`,
+  `semanticErrorHandling`) asserted over raw HTTP.
 - Semantic + filter + orderby + select combination.
 - Semantic index without semantic query: normal results, no semantic properties.
+- Error cases: unknown configuration name, `semantic` + `vectorQueries`,
+  `semantic` + `queryType=full`, bad `answers.type`/`count` → `400 InvalidQuery`.
 
-### C# SDK compatibility tests
+### C# SDK compatibility tests (`Azure.Search.Documents==12.0.0`)
 
-- Mirror the Python additions (same scenarios, .NET SDK API: `SemanticConfiguration`, `SemanticQuery`, `SemanticAnswer`, `SemanticCaption`).
+- Mirror the Python additions via the .NET API: `SemanticSearch {
+  Configurations = { new SemanticConfiguration(name) { PrioritizedFields = new
+  SemanticPrioritizedFields(...) } } }` on the index;
+  `SearchOptions { QueryType = SearchQueryType.Semantic, SemanticSearch = new
+  SemanticSearchOptions { SemanticConfigurationName = "...", QueryAnswer =
+  QueryAnswerType.Extractive, QueryCaption = QueryCaptionType.Extractive } }`
+  on the query.
+- Response parsing: `SearchResult<T>.Highlights` analogues —
+  `SearchResult<T>.SemanticSearch.Captions` / `.RerankerScore` where the SDK
+   populates them; `@search.answers` / `@search.rerankerScore` asserted over raw HTTP.
 
 ### E2E
 
@@ -453,83 +551,82 @@ Remaining rejected options (still `400 UnsupportedQuery`):
 
 ### Schema and validation
 
-- [ ] `semantic.configurations` parsed and validated (name, priorities, sources, reranker, rescorers).
-- [ ] Priority fields must be `retrievable: true`; source fields must be `searchable: true`.
-- [ ] `reranker.name` must be `"standard"`; `rescorers` must be empty.
-- [ ] Duplicate configuration names → `400 InvalidIndex`.
-- [ ] Index without `semantic` + query with `semantic` → `400 InvalidQuery`.
-- [ ] Unknown `semanticConfiguration` name → `400 InvalidQuery`.
+- [x] `semantic.configurations` parsed and validated (name, priorities, sources, reranker, rescorers).
+- [x] Priority fields must be `retrievable: true`; source fields must be `searchable: true`.
+- [x] `reranker.name` must be `"standard"`; `rescorers` must be empty.
+- [x] Duplicate configuration names → `400 InvalidIndex`.
+- [x] Index without `semantic` + query with `semantic` → `400 InvalidQuery`.
+- [x] Unknown `semanticConfiguration` name → `400 InvalidQuery`.
 
 ### Query parsing
 
-- [ ] `semantic` parameter parsed: `semanticConfiguration`, `queryContext`, `answers`, `captions`.
-- [ ] `semanticErrorHandling` parsed (`throwError` / `returnPartialResults`).
-- [ ] `semanticMaxWaitInMilliseconds` accepted (inert).
-- [ ] `answers.count` / `captions.count` validated (range, integer).
-- [ ] `answers.type` / `captions.type` must be `"extractive"`.
-- [ ] `semantic` + `vectorQueries` → `400 InvalidQuery`.
-- [ ] `semantic` + `queryType=full` → `400 InvalidQuery`.
+- [x] `semantic` parameter parsed: `semanticConfiguration`, `queryContext`, `answers`, `captions`.
+- [x] `semanticErrorHandling` parsed (`throwError` / `returnPartialResults`).
+- [x] `semanticMaxWaitInMilliseconds` accepted (inert).
+- [x] `answers.count` / `captions.count` validated (range, integer).
+- [x] `answers.type` / `captions.type` must be `"extractive"`.
+- [x] `semantic` + `vectorQueries` → `400 InvalidQuery`.
+- [x] `semantic` + `queryType=full` → `400 InvalidQuery`.
 
 ### Answer extraction
 
-- [ ] Sentences extracted from `priorities.answers` fields (in priority order).
-- [ ] BM25 sentence scoring against query terms.
-- [ ] Top-N selection across all result documents.
-- [ ] Threshold: at least one query term must match.
-- [ ] `queryContext.questions` appended to query terms for scoring.
-- [ ] Response shape: `score`, `text`, `highlights`, `source`, `sentence`.
-- [ ] `@search.answers` omitted when not requested or no candidates.
+- [x] Sentences extracted from `priorities.answers` fields (in priority order).
+- [x] BM25 sentence scoring against query terms.
+- [x] Top-N selection across all result documents.
+- [x] Threshold: at least one query term must match.
+- [x] `queryContext.questions` appended to query terms for scoring.
+- [x] Response shape: `score`, `key`, `text`, `highlights`.
+- [x] `@search.answers` omitted when not requested or no candidates.
 
 ### Caption extraction
 
-- [ ] First sentence / 200-char truncation from `priorities.captions` fields.
-- [ ] Truncation at word boundary + `...`.
-- [ ] Fallback to next priority field if current is empty.
-- [ ] Nested `captions.answers` extraction.
-- [ ] Response shape: `text`, `highlights`, `source`, `type`, `answers`.
-- [ ] `@search.captions` omitted when not requested or no candidates.
+- [x] First sentence / 200-char truncation from `priorities.captions` fields.
+- [x] Truncation at word boundary + `...`.
+- [x] Fallback to next priority field if current is empty.
+- [x] Nested `captions.answers` extraction.
+- [x] Response shape: `text`, `highlights`, `answers`.
+- [x] `@search.captions` omitted when not requested or no candidates.
 
 ### Reranker
 
-- [ ] `@search.reranker.score` present on all documents in semantic search.
-- [ ] BM25 → [0,1] via `score / (score + 1)`.
-- [ ] Vector cosine → [0,1] clamp.
-- [ ] Does not affect result ordering.
-- [ ] Omitted for non-semantic searches.
+- [x] `@search.rerankerScore` (bare number) present on all documents in semantic search.
+- [x] BM25 → [0,1] via `score / (score + 1)`.
+- [x] Does not affect result ordering.
+- [x] Omitted for non-semantic searches.
 
 ### Integration
 
-- [ ] Semantic + filter + orderby + select + facets + highlight all work.
-- [ ] `top`/`skip` applied after semantic processing (answers from full set).
-- [ ] `count=true` reflects the full-text result set (not affected by semantic).
-- [ ] `semanticErrorHandling=returnPartialResults`: partial results on extraction failure.
-- [ ] Non-semantic search on semantic index: unchanged behaviour.
-- [ ] Concurrent semantic searches do not corrupt state.
+- [x] Semantic + filter + orderby + select + facets + highlight all work.
+- [x] `top`/`skip` applied after semantic processing (answers from full set).
+- [x] `count=true` reflects the full-text result set (not affected by semantic).
+- [x] `semanticErrorHandling=returnPartialResults`: partial results on extraction failure.
+- [x] Non-semantic search on semantic index: unchanged behaviour.
+- [x] Concurrent semantic searches do not corrupt state.
 
 ### Errors
 
-- [ ] All new error cases return correct status code and Azure error structure.
-- [ ] `scoringProfile`/`scoringParameters`/`scoringStatistics` still rejected with `400 UnsupportedQuery`.
-- [ ] Vectorizer queries (`kind: "text"`) still rejected (Phase 2.4).
+- [x] All new error cases return correct status code and Azure error structure.
+- [x] `scoringProfile`/`scoringParameters`/`scoringStatistics` still rejected with `400 UnsupportedQuery`.
+- [x] Vectorizer queries (`kind: "text"`) still rejected (Phase 2.4).
 
 ### Tests
 
-- [ ] Unit tests: sentence splitting, scoring, answer selection, caption extraction, reranker, config validation.
-- [ ] Contract tests: `source/rust/tests/contract/semantic_search.rs` covers all matrix entries.
-- [ ] Python SDK tests: semantic index creation, search with answers/captions/queryContext/errorHandling.
-- [ ] C# SDK tests: mirror Python additions.
-- [ ] Fixtures captured for C# replay.
-- [ ] E2E: full RAG-style semantic flow.
-- [ ] All existing tests still pass (no regression).
+- [x] Unit tests: sentence splitting, scoring, answer selection, caption extraction, reranker, config validation.
+- [x] Contract tests: `source/rust/tests/contract/semantic_search.rs` covers all matrix entries.
+- [x] Python SDK tests: semantic index creation, search with answers/captions/queryContext/errorHandling.
+- [x] C# SDK tests: mirror Python additions.
+- [x] Fixtures captured for C# replay.
+- [x] E2E: full RAG-style semantic flow.
+- [x] All existing tests still pass (no regression).
 
 ### Quality gates
 
-- [ ] `cargo fmt --check` passes.
-- [ ] `cargo clippy --all-targets -- -D warnings` passes.
-- [ ] All test suites green (unit, contract, SDK Python, SDK C#, e2e).
-- [ ] `docs/supported_operations.md` updated (semantic flipped to Supported; `answers`/`captions`/`semantic*` removed from rejected list).
-- [ ] `docs/known_differences.md` updated (extractive approximation, no query rewriting, BM25 reranker).
+- [x] `cargo fmt --check` passes.
+- [x] `cargo clippy --all-targets -- -D warnings` passes.
+- [x] All test suites green (unit, contract, SDK Python, SDK C#, e2e).
+- [x] `docs/supported_operations.md` updated (semantic flipped to Supported; `answers`/`captions`/`semantic*` removed from rejected list).
+- [x] `docs/known_differences.md` updated (extractive approximation, no query rewriting, BM25 reranker).
 
 ## Exit criteria
 
-An application can create an index with a semantic configuration, upload documents, and perform semantic search with extractive answers, captions, query context, and reranker scores through the unmodified Python and C# SDKs, with the correct response shape (`@search.reranker`, `@search.answers`, `@search.captions`) and all semantic options accepted — all covered by contract and SDK tests. The application's response-parsing code (answer rendering, caption display, reranker score logging) exercises the same paths it would against Azure, with content quality differences documented in `known_differences.md`.
+An application can create an index with a semantic configuration, upload documents, and perform semantic search with extractive answers, captions, query context, and reranker scores through the unmodified Python and C# SDKs, with the correct response shape (`@search.rerankerScore`, `@search.answers`, `@search.captions`) and all semantic options accepted — all covered by contract and SDK tests. The application's response-parsing code (answer rendering, caption display, reranker score logging) exercises the same paths it would against Azure, with content quality differences documented in `known_differences.md`.

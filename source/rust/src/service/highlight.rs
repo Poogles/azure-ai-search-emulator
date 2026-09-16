@@ -134,8 +134,9 @@ fn word_spans(text: &str) -> Vec<(usize, usize)> {
 
 /// Returns the byte spans of the whitespace-delimited words of `text` whose
 /// analyzed form (under `analyzer`) is in `terms`, in order of appearance.
-/// Matching is analyzer-aware, so inflected forms highlight.
-fn matched_word_spans(
+/// Matching is analyzer-aware, so inflected forms highlight. Shared with the
+/// semantic answer/caption highlighter (same matching semantics).
+pub(crate) fn matched_word_spans(
     text: &str,
     terms: &BTreeSet<String>,
     analyzer: Option<&str>,
@@ -152,8 +153,14 @@ fn matched_word_spans(
 }
 
 /// Wraps each span in `spans` (byte ranges into `text`) with the highlight
-/// tags, preserving all other text (spacing and casing) verbatim.
-fn wrap_spans(text: &str, spans: &[(usize, usize)], pre_tag: &str, post_tag: &str) -> String {
+/// tags, preserving all other text (spacing and casing) verbatim. Shared
+/// with the semantic answer/caption highlighter.
+pub(crate) fn wrap_spans(
+    text: &str,
+    spans: &[(usize, usize)],
+    pre_tag: &str,
+    post_tag: &str,
+) -> String {
     let mut out = String::new();
     let mut last = 0usize;
     for &(start, end) in spans {

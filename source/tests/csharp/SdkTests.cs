@@ -826,11 +826,12 @@ public class SdkTests : EmulatorTestBase
     [Fact]
     public async Task UnsupportedQueryOptionsRejected()
     {
+        // SemanticSearch is a supported option (Phase 2.3); its error cases
+        // are covered by SemanticSearchTests.
         var searchClient = await PricedDocsAsync();
         var cases = new[]
         {
             new SearchOptions { ScoringProfile = "profile" },
-            new SearchOptions { SemanticSearch = new SemanticSearchOptions { SemanticConfigurationName = "config" } },
         };
         foreach (var options in cases)
         {

@@ -1,0 +1,18 @@
+{
+  "method": "POST",
+  "url": "http://<endpoint>/indexes('fixture-semantic-index')/docs/search.post.search?api-version=2024-07-01",
+  "headers": {
+    "Content-Type": "application/json",
+    "Content-Length": "191",
+    "Accept": "application/json;odata.metadata=none",
+    "User-Agent": "<user-agent>",
+    "api-key": "fixture-key"
+  },
+  "request_body": "{\"search\": \"vector search embeddings\", \"queryType\": \"semantic\", \"answers\": \"extractive|count-3\", \"captions\": \"extractive\", \"semanticConfiguration\": \"default\", \"semanticErrorHandling\": \"fail\"}",
+  "status_code": 200,
+  "response_headers": {
+    "content-type": "application/json",
+    "content-length": "1265"
+  },
+  "response_body": "{\"@odata.context\":\"/$metadata#documents\",\"@search.answers\":[{\"highlights\":\"<em>Vector</em> <em>search</em> uses <em>embeddings.</em>\",\"key\":\"2\",\"score\":1.0,\"text\":\"Vector search uses embeddings.\"},{\"highlights\":\"<em>Vector</em> <em>Search</em> Guide\",\"key\":\"2\",\"score\":0.566538393497467,\"text\":\"Vector Search Guide\"},{\"highlights\":\"It also supports <em>vector</em> <em>search.</em>\",\"key\":\"1\",\"score\":0.5077282786369324,\"text\":\"It also supports vector search.\"}],\"value\":[{\"@search.captions\":[{\"highlights\":\"<em>Vector</em> <em>Search</em> Guide\",\"text\":\"Vector Search Guide\"}],\"@search.rerankerScore\":0.7007978558540344,\"@search.score\":2.342221736907959,\"content\":\"Vector search uses embeddings. Neural networks create the embeddings. The search finds similar documents. This is useful for semantic matching.\",\"id\":\"2\",\"price\":20.0,\"title\":\"Vector Search Guide\"},{\"@search.captions\":[{\"highlights\":\"Azure AI <em>Search</em> Overview\",\"text\":\"Azure AI Search Overview\"}],\"@search.rerankerScore\":0.38753634691238403,\"@search.score\":0.6327499151229858,\"content\":\"Azure AI Search is a cloud service. It provides rich text search capabilities. It also supports vector search. The service is highly available.\",\"id\":\"1\",\"price\":10.0,\"title\":\"Azure AI Search Overview\"}]}"
+}

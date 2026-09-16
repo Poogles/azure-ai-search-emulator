@@ -749,9 +749,9 @@ async fn vector_search_rejects_bad_queries() {
             "UnsupportedQuery",
         ),
         (
-            "semantic option",
+            "semantic option (malformed)",
             json!({"semantic": {"mode": "strict"}}),
-            "UnsupportedQuery",
+            "InvalidQuery",
         ),
         (
             "bad filter mode",

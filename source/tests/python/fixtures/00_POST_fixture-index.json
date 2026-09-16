@@ -4,9 +4,9 @@
   "headers": {
     "Content-Type": "application/json",
     "Content-Length": "149",
-    "api-key": "fixture-key",
     "Accept": "application/json;odata.metadata=minimal",
-    "User-Agent": "<user-agent>"
+    "User-Agent": "<user-agent>",
+    "api-key": "fixture-key"
   },
   "request_body": "{\"name\": \"fixture-index\", \"fields\": [{\"name\": \"id\", \"type\": \"Edm.String\", \"key\": true}, {\"name\": \"title\", \"type\": \"Edm.String\", \"searchable\": true}]}",
   "status_code": 201,

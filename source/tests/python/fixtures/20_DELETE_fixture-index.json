@@ -1,6 +1,6 @@
 {
   "method": "DELETE",
-  "url": "http://<endpoint>/indexes('fixture-index')?api-version=2024-07-01",
+  "url": "http://<endpoint>/indexes('fixture-semantic-index')?api-version=2024-07-01",
   "headers": {
     "Accept": "application/json;odata.metadata=minimal",
     "User-Agent": "<user-agent>",

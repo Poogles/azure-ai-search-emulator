@@ -776,18 +776,8 @@ pub(crate) fn parse_highlight_options(
 
 /// Search request options that are not implemented and must be rejected with
 /// an explicit error.
-pub(crate) const UNSUPPORTED_SEARCH_OPTIONS: &[&str] = &[
-    "scoringProfile",
-    "scoringParameters",
-    "scoringStatistics",
-    "answers",
-    "captions",
-    "semantic",
-    "semanticConfiguration",
-    "semanticQuery",
-    "semanticErrorHandling",
-    "semanticMaxWaitInMilliseconds",
-];
+pub(crate) const UNSUPPORTED_SEARCH_OPTIONS: &[&str] =
+    &["scoringProfile", "scoringParameters", "scoringStatistics"];
 
 /// Parses the `minimumCoverage` option: a float in [0.0, 1.0] (default 0.0).
 ///
@@ -832,4 +822,135 @@ pub(crate) fn parse_debug(obj: &Map<String, Value>) -> Result<bool, ApiError> {
             "debug must be a boolean or a string.",
         )),
     }
+}
+
+/// Parses the semantic search options from a search request body. Supports
+/// two wire formats:
+/// 1. The nested `semantic` object: `{"semantic": {"semanticConfiguration":
+///    "...", "answers": {"count": N, "type": "extractive"}, ...}}`.
+/// 2. The flat SDK format: `{"queryType": "semantic", "semanticConfiguration":
+///    "...", "answers": "extractive|count-N", "captions":
+///    "extractive|highlight-true", "semanticErrorHandling": "fail", ...}`.
+///    (`semanticQuery`, `semanticMaxWaitInMilliseconds`,
+///    `queryAnswerThreshold`, and `queryCaptionHighlightEnabled` are accepted
+///    but inert.)
+///
+/// Returns `None` when neither format is present.
+///
+/// # Errors
+///
+/// Returns an [`ApiError`] (`400 InvalidQuery`) when the options are present
+/// but malformed.
+pub(crate) fn parse_semantic(
+    obj: &Map<String, Value>,
+    limits: &crate::semantic::SemanticLimits,
+) -> Result<Option<crate::semantic::SemanticQuery>, ApiError> {
+    // Format 1: nested `semantic` object.
+    if let Some(raw) = obj.get("semantic") {
+        if !raw.is_null() {
+            return crate::semantic::SemanticQuery::from_json(raw, limits);
+        }
+    }
+    // Format 2: flat SDK properties, triggered by a configuration name (or
+    // `queryType: "semantic"`, whose missing configuration is reported by
+    // validation).
+    let config_name = obj
+        .get("semanticConfiguration")
+        .or_else(|| obj.get("semanticConfigurationName"));
+    let Some(config_name) = config_name.filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let configuration = config_name
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                ErrorCode::InvalidQuery,
+                "The 'semanticConfiguration' property requires a non-empty string.",
+            )
+        })?;
+    let answers = parse_flat_answers(obj, limits);
+    let captions = parse_flat_captions(obj);
+    let error_handling = crate::semantic::SemanticQuery::parse_error_handling(
+        obj.get("semanticErrorHandling")
+            .or_else(|| obj.get("semanticErrorMode")),
+    )?;
+    Ok(Some(crate::semantic::SemanticQuery {
+        configuration: configuration.to_owned(),
+        questions: Vec::new(),
+        answers,
+        captions,
+        error_handling,
+    }))
+}
+
+/// Parses the flat `answers` option: the SDK compound string
+/// (`"extractive"`, `"extractive|count-N"`, `"extractive|count-N,threshold-T"`,
+/// `"none"`), falling back to the `queryAnswer` / `queryAnswerCount`
+/// properties. Unknown types are treated as absent.
+fn parse_flat_answers(
+    obj: &Map<String, Value>,
+    limits: &crate::semantic::SemanticLimits,
+) -> Option<crate::semantic::SemanticQueryAnswers> {
+    if let Some(Value::String(raw)) = obj.get("answers") {
+        let mut parts = raw.split('|');
+        let kind = parts.next().unwrap_or("").trim();
+        if kind != "extractive" {
+            return None;
+        }
+        let mut count = crate::semantic::DEFAULT_ANSWERS_COUNT;
+        for option in parts.flat_map(|part| part.split(',')) {
+            if let Some(value) = option.trim().strip_prefix("count-") {
+                if let Ok(parsed) = value.trim().parse::<usize>() {
+                    count = parsed.clamp(1, limits.max_answers);
+                }
+            }
+        }
+        return Some(crate::semantic::SemanticQueryAnswers { count });
+    }
+    if obj
+        .get("queryAnswer")
+        .and_then(Value::as_str)
+        .is_some_and(|v| v == "extractive")
+    {
+        let count = match obj.get("queryAnswerCount") {
+            Some(Value::Number(n)) => n
+                .as_u64()
+                .and_then(|v| usize::try_from(v).ok())
+                .map_or(crate::semantic::DEFAULT_ANSWERS_COUNT, |v| {
+                    v.clamp(1, limits.max_answers)
+                }),
+            _ => crate::semantic::DEFAULT_ANSWERS_COUNT,
+        };
+        return Some(crate::semantic::SemanticQueryAnswers { count });
+    }
+    None
+}
+
+/// Parses the flat `captions` option: the SDK compound string
+/// (`"extractive"`, `"extractive|highlight-true"`, `"none"`), falling back
+/// to the `queryCaption` property. The SDK has no caption count, so the
+/// default applies. Unknown types are treated as absent.
+fn parse_flat_captions(obj: &Map<String, Value>) -> Option<crate::semantic::SemanticQueryCaptions> {
+    if let Some(Value::String(raw)) = obj.get("captions") {
+        let kind = raw.split('|').next().unwrap_or("").trim();
+        if kind != "extractive" {
+            return None;
+        }
+        return Some(crate::semantic::SemanticQueryCaptions {
+            count: crate::semantic::DEFAULT_CAPTIONS_COUNT,
+            answers: None,
+        });
+    }
+    if obj
+        .get("queryCaption")
+        .and_then(Value::as_str)
+        .is_some_and(|v| v == "extractive")
+    {
+        return Some(crate::semantic::SemanticQueryCaptions {
+            count: crate::semantic::DEFAULT_CAPTIONS_COUNT,
+            answers: None,
+        });
+    }
+    None
 }

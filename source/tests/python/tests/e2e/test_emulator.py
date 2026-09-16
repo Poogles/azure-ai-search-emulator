@@ -360,6 +360,112 @@ def test_rag_style_vector_and_hybrid_flow(
     assert {doc["id"] for doc in found} == {"1", "2", "3"}
 
 
+def test_rag_style_semantic_flow(
+    index_client: SearchIndexClient, search_client: SearchClient, clean_emulator: str
+) -> None:
+    """RAG-style semantic flow: semantic index, extractive answers + captions,
+    query context, and reranker scores through the unmodified SDK.
+
+    The SDK populates ``SearchResult.captions`` and
+    ``SearchResult.reranker_score`` from ``@search.captions`` /
+    ``@search.rerankerScore``; the top-level ``@search.answers`` is asserted
+    over raw HTTP (the paged iterator does not surface it).
+    """
+    from azure.search.documents.indexes.models import (
+        SemanticConfiguration,
+        SemanticField,
+        SemanticPrioritizedFields,
+        SemanticSearch,
+    )
+
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchField(name="title", type=SearchFieldDataType.String, searchable=True),
+                SearchField(name="content", type=SearchFieldDataType.String, searchable=True),
+                SearchField(name="summary", type=SearchFieldDataType.String, searchable=True),
+            ],
+            semantic_search=SemanticSearch(
+                configurations=[
+                    SemanticConfiguration(
+                        name="default",
+                        prioritized_fields=SemanticPrioritizedFields(
+                            title_field=SemanticField(field_name="title"),
+                            content_fields=[SemanticField(field_name="content")],
+                        ),
+                    )
+                ]
+            ),
+        )
+    )
+    docs = [
+        {
+            "id": "1",
+            "title": "Quantum Computing Fundamentals",
+            "content": "Quantum computing leverages superposition and entanglement. It processes information in parallel. The field is advancing rapidly.",
+            "summary": "An overview of quantum computing principles and applications.",
+        },
+        {
+            "id": "2",
+            "title": "Classical Computing",
+            "content": "Classical computing uses bits. It is deterministic. It powers most devices today.",
+            "summary": "An overview of classical computing.",
+        },
+    ]
+    results = search_client.upload_documents(documents=docs)
+    assert all(r.succeeded for r in results)
+
+    # Semantic search through the SDK: captions + reranker score populated.
+    # The SDK returns each result as a dict with ``@search.*`` metadata keys.
+    found = list(
+        search_client.search(
+            search_text="quantum computing",
+            query_type="semantic",
+            semantic_configuration_name="default",
+            query_answer="extractive",
+            query_answer_count=3,
+            query_caption="extractive",
+            semantic_error_mode="fail",
+        )
+    )
+    assert len(found) >= 1
+    top = found[0]
+    assert top["id"] == "1"
+    reranker_score = top["@search.reranker_score"]
+    assert reranker_score is not None
+    assert 0.0 <= reranker_score <= 1.0
+    captions = top["@search.captions"]
+    assert captions is not None
+    assert len(captions) >= 1
+    assert captions[0].text
+    assert captions[0].highlights
+
+    # Top-level @search.answers over raw HTTP (the SDK's paged iterator does
+    # not surface SearchDocumentsResult.answers).
+    url = f"{clean_emulator}/indexes('{INDEX_NAME}')/docs/search.post.search?api-version={API_VERSION}"
+    status, body = _raw_post(
+        url,
+        {
+            "search": "quantum computing",
+            "queryType": "semantic",
+            "semanticConfiguration": "default",
+            "answers": "extractive|count-3",
+            "captions": "extractive",
+            "semanticErrorHandling": "fail",
+        },
+    )
+    assert status == 200
+    answers = body["@search.answers"]
+    assert isinstance(answers, list) and len(answers) >= 1
+    assert answers[0]["key"] == "1"
+    assert answers[0]["text"]
+    assert 0.0 <= answers[0]["score"] <= 1.0
+    for doc in body["value"]:
+        assert 0.0 <= doc["@search.rerankerScore"] <= 1.0
+
+
 def test_batch_last_action_wins(
     clean_emulator: str,
     index_client: SearchIndexClient,

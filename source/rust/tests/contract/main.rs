@@ -13,6 +13,7 @@ mod index_management;
 mod pagination;
 mod query_features;
 mod search;
+mod semantic_search;
 mod suggest_autocomplete;
 mod synonym_maps;
 mod vector_search;

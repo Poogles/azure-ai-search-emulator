@@ -1,0 +1,12 @@
+{
+  "method": "POST",
+  "url": "http://<endpoint>/indexes('fixture-semantic-index')/docs/search.post.search?api-version=2024-07-01",
+  "headers": {
+    "api-key": "fixture-key",
+    "Content-Type": "application/json"
+  },
+  "request_body": "{\"search\": \"vector search\", \"semantic\": {\"semanticConfiguration\": \"default\", \"queryContext\": {\"questions\": [\"What is vector search used for?\"]}, \"answers\": {\"count\": 3, \"type\": \"extractive\"}, \"captions\": {\"count\": 1, \"type\": \"extractive\", \"answers\": {\"count\": 1, \"type\": \"extractive\"}}, \"semanticErrorHandling\": \"returnPartialResults\"}}",
+  "status_code": 200,
+  "response_headers": {},
+  "response_body": "{\"@odata.context\":\"/$metadata#documents\",\"@search.answers\":[{\"highlights\":\"<em>Vector</em> <em>search</em> <em>uses</em> embeddings.\",\"key\":\"2\",\"score\":1.0,\"text\":\"Vector search uses embeddings.\"},{\"highlights\":\"<em>Vector</em> <em>Search</em> Guide\",\"key\":\"2\",\"score\":0.7515126466751099,\"text\":\"Vector Search Guide\"},{\"highlights\":\"It also supports <em>vector</em> <em>search.</em>\",\"key\":\"1\",\"score\":0.6735010147094727,\"text\":\"It also supports vector search.\"}],\"value\":[{\"@search.captions\":[{\"answers\":[{\"highlights\":\"<em>Vector</em> <em>Search</em> Guide\",\"score\":1.0,\"text\":\"Vector Search Guide\"}],\"highlights\":\"<em>Vector</em> <em>Search</em> Guide\",\"text\":\"Vector Search Guide\"}],\"@search.rerankerScore\":0.5784311294555664,\"@search.score\":1.3720914125442505,\"content\":\"Vector search uses embeddings. Neural networks create the embeddings. The search finds similar documents. This is useful for semantic matching.\",\"id\":\"2\",\"price\":20.0,\"title\":\"Vector Search Guide\"},{\"@search.captions\":[{\"answers\":[{\"highlights\":\"Azure AI <em>Search</em> Overview\",\"score\":1.0,\"text\":\"Azure AI Search Overview\"}],\"highlights\":\"Azure AI <em>Search</em> Overview\",\"text\":\"Azure AI Search Overview\"}],\"@search.rerankerScore\":0.38753634691238403,\"@search.score\":0.6327499151229858,\"content\":\"Azure AI Search is a cloud service. It provides rich text search capabilities. It also supports vector search. The service is highly available.\",\"id\":\"1\",\"price\":10.0,\"title\":\"Azure AI Search Overview\"}]}"
+}

@@ -17,7 +17,7 @@ Differences fall into two categories:
 | Azure behaviour                                       | Emulator behaviour                | Rationale                                                                                           |
 |:------------------------------------------------------|:----------------------------------|:----------------------------------------------------------------------------------------------------|
 | Scoring profiles, parameters, statistics              | Rejected                          | Scoring is BM25 (see below); custom scoring profiles are not applied.                               |
-| Semantic queries                                      | Rejected                          | No model inference in the emulator (initial design non-goal).                                       |
+| Semantic queries (model-based)                        | Rejected                          | No model inference in the emulator (initial design non-goal). Extractive semantic search is supported (see below). |
 | Vectorizer (`kind: "text"`) queries                   | Rejected (`400 UnsupportedQuery`) | No vectorizer in the emulator; callers must supply raw vectors.                                     |
 
 ## Silently different (operation succeeds, result may differ from Azure)
@@ -44,6 +44,20 @@ Differences fall into two categories:
 - Algorithm-config leniencies (emulator-only): a missing algorithm `kind` defaults to `"hnsw"`; a top-level `parameters` object is accepted as an alias for the kind-specific parameters object; `m` is validated as 1-256 (Azure restricts it to 4-100).
 - Paging with vectors binds `vectorQueries` + `vectorFilterMode` into the continuation token; changing them mid-paging is `400` (Azure tokens tolerate broader reuse). Fail-fast beats silently shifted pages.
 - At most 5 vector queries per search and at most 16 vector fields per index (both match Azure); max dimension 3072 (or `EMULATOR_VECTOR__MAX_DIMENSION`).
+
+### Semantic search (Phase 2.3)
+
+- Semantic search is **extractive only**: no model inference, no query rewriting, no neural reranking. Answers are selected by BM25 sentence scoring (the global top-N sentences from the configured answer fields that best match the query terms, scored with the same English analyzer as full-text search); captions are the first N sentences from caption-designated fields (in priority order), truncated to 200 characters at a word boundary. Azure uses a neural model for both, so the extracted text will differ from Azure's.
+- Answers are returned as a **top-level** `@search.answers` array (the shape the SDKs deserialize into `SearchDocumentsResult.answers` / `SearchResults.Answers`), each entry carrying `score`, `key`, `text`, and `highlights`. They are selected from the full filtered result set **before** `top`/`skip` paging, so the top answers may come from documents beyond the first page (matching Azure).
+- Captions are returned as a **per-document** `@search.captions` array (the shape the SDKs deserialize into `SearchResult.captions` / `SearchResult<T>.Captions`), each entry carrying `text` and `highlights` (and nested `answers` when `captions.answers` is requested).
+- The reranker score is emitted as a **per-document** `@search.rerankerScore` (bare number, the property the SDKs deserialize into `SearchResult.reranker_score` / `SearchResult<T>.RerankerScore`) on every document in a semantic search. It is a normalized version of the document's BM25 relevance score: `score/(score+1)`. Azure's reranker produces a model-based score in [0,1]; the emulator's is a deterministic transform of the engine score. It does not change result ordering.
+- `queryContext.questions` biases answer selection: the question text is analyzed and appended to the query terms for scoring (no multi-turn state or coreference resolution).
+- `semantic` + `vectorQueries` is rejected with `400 InvalidQuery` (matching Azure). `semantic` + `queryType=full` is also rejected (semantic requires `simple` query type).
+- `semanticErrorHandling` (`throwError`/`returnPartialResults`) and the flat `semanticErrorMode` (`fail`/`partial`) are parsed and validated but inert: the emulator's extractive pipeline does not fail in the ways Azure's model-based pipeline can, so both modes behave identically.
+- `semanticQuery`, `semanticMaxWaitInMilliseconds`, `queryAnswerThreshold`, and `queryCaptionHighlightEnabled` are accepted but inert (operations are synchronous and fast; caption highlights are always produced).
+- `rescorers[]` entries are rejected with `400 InvalidIndex` (Azure's rescorers are preview/limited).
+- Sentence splitting is punctuation-delimited (`.`, `!`, `?`, `;`, newline) with 20–500 character bounds; abbreviations are not special-cased, so boundaries may differ from Azure's internal segmentation on edge cases.
+- **Rationale:** the extractive pipeline provides the wire-format contract (response shape, error codes, option validation) that SDK compatibility tests exercise, without requiring a model endpoint. Test assertions must check structure and presence, not exact answer/caption text or reranker score values.
 
 ### Query matching
 

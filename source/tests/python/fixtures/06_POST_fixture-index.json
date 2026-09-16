@@ -4,11 +4,11 @@
   "headers": {
     "Content-Type": "application/json",
     "Content-Length": "207",
-    "api-key": "fixture-key",
     "Accept": "application/json;odata.metadata=none",
-    "User-Agent": "<user-agent>"
+    "User-Agent": "<user-agent>",
+    "api-key": "fixture-key"
   },
-  "request_body": "{\"value\": [{\"id\": \"1\", \"title\": \"hello world\", \"content_vector\": [1.0, 0.0, 0.0], \"@search.action\": \"upload\"}, {\"id\": \"2\", \"title\": \"foo bar\", \"content_vector\": [0.0, 1.0, 0.0], \"@search.action\": \"upload\"}]}",
+  "request_body": "{\"value\": [{\"@search.action\": \"upload\", \"id\": \"1\", \"title\": \"hello world\", \"content_vector\": [1.0, 0.0, 0.0]}, {\"@search.action\": \"upload\", \"id\": \"2\", \"title\": \"foo bar\", \"content_vector\": [0.0, 1.0, 0.0]}]}",
   "status_code": 200,
   "response_headers": {
     "content-type": "application/json",

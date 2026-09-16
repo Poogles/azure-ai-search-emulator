@@ -204,7 +204,7 @@ Route: `POST /indexes('{name}')/docs/search.post.search?api-version=...`.
 | Search modes | `search_mode=` (`all`/`any`) | Supported (`any`/OR is the default when omitted, matching Azure) |
 | Highlighting | `highlight_fields=`, pre/post tags | Supported (searchable fields only; `@search.highlights` with sentence-window fragments — up to 3 per field, a ±100-char window for sentences over 200 chars, tags wrap only the matched term) |
 | Scoring profiles / parameters / statistics | `scoring_profile=`, ... | Unsupported (explicit) |
-| Semantic queries | `semantic=`, ... | Unsupported (explicit) |
+| Semantic queries | `queryType=semantic` + `semanticConfiguration` (flat SDK format) or a nested `semantic` object (`semanticConfiguration`, `queryContext.questions`, `answers.{count,type}`, `captions.{count,type,answers}`, `semanticErrorHandling`); index `semantic.configurations` accept the SDK `prioritizedFields` format and the canonical `priorities`/`sources` format | Supported (extractive answers via BM25 sentence scoring as top-level `@search.answers`, captions via leading-sentence truncation as per-document `@search.captions`, `@search.rerankerScore` on every document; no model inference; see Known differences) |
 | Vector queries | `vector_queries=[VectorizedQuery(vector=..., fields=..., k_nearest_neighbors=..., exhaustive=...)]` | Supported (raw-vector kNN; `kind: "text"` vectorizer queries rejected with `400 UnsupportedQuery`) |
 | Vector + full-text hybrid | `search_text=` + `vector_queries=` together | Supported (union of both sides fused with Reciprocal Rank Fusion, `k=60`; see Known differences) |
 | Vector filter mode | `vector_filter_mode=` (`preFilter`/`postFilter`) + top-level `filter=` | Supported (`postFilter` default; per-query `exhaustive=` supported; per-query `weight=` scales the query's hybrid RRF contribution) |
@@ -216,9 +216,9 @@ Route: `POST /indexes('{name}')/docs/search.post.search?api-version=...`.
 | Minimum coverage | `minimumCoverage=` (float 0.0–1.0) | Supported (gates inclusion for `searchMode=any` multi-term queries: a document must match at least `ceil(minimumCoverage × total_terms)` terms; no effect for `searchMode=all` or single-term queries; does not affect `@search.score`; values outside [0.0, 1.0] or non-numeric → `400 InvalidQuery`) |
 | Debug | `debug=` (SDK wire format: a `QueryDebugMode` string — `disabled`/`semantic`/`vector`/`queryRewrites`/`innerHits`/`all`, pipe-combinable — or a boolean) | Supported (any mode other than `disabled`, or `true`, adds an additive `@search.debug` object to the response with query diagnostics (parsed query, fields, synonym expansions, execution stats); `disabled`/`false`/absent omits it; does not affect results, ordering, or scoring) |
 
-The full list of search options rejected with `400 UnsupportedQuery`: `scoringProfile`, `scoringParameters`, `scoringStatistics`, `answers`, `captions`, `semantic`, `semanticConfiguration`, `semanticQuery`, `semanticErrorHandling`, `semanticMaxWaitInMilliseconds`.
+The full list of search options rejected with `400 UnsupportedQuery`: `scoringProfile`, `scoringParameters`, `scoringStatistics`.
 
-Accepted but inert (silently ignored): `sessionId` (the emulator uses deterministic score + key tie-breaking, so session affinity is irrelevant). Per-query `weight` is applied: it scales that vector query's contribution to the hybrid RRF fusion.
+Accepted but inert (silently ignored): `sessionId` (the emulator uses deterministic score + key tie-breaking, so session affinity is irrelevant), and the semantic options `semanticQuery`, `semanticMaxWaitInMilliseconds`, `queryAnswerThreshold`, and `queryCaptionHighlightEnabled` (the extractive pipeline is synchronous and always highlights). Per-query `weight` is applied: it scales that vector query's contribution to the hybrid RRF fusion.
 
 ### Filter
 

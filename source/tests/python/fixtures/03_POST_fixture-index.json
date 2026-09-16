@@ -4,15 +4,15 @@
   "headers": {
     "Content-Type": "application/json",
     "Content-Length": "30",
-    "api-key": "fixture-key",
     "Accept": "application/json;odata.metadata=none",
-    "User-Agent": "<user-agent>"
+    "User-Agent": "<user-agent>",
+    "api-key": "fixture-key"
   },
   "request_body": "{\"search\": \"hello\", \"top\": 10}",
   "status_code": 200,
   "response_headers": {
     "content-type": "application/json",
-    "content-length": "126"
+    "content-length": "119"
   },
-  "response_body": "{\"@odata.context\":\"/$metadata#documents\",\"@search.facets\":null,\"value\":[{\"@search.score\":1.0,\"id\":\"1\",\"title\":\"hello world\"}]}"
+  "response_body": "{\"@odata.context\":\"/$metadata#documents\",\"value\":[{\"@search.score\":0.6931471824645996,\"id\":\"1\",\"title\":\"hello world\"}]}"
 }

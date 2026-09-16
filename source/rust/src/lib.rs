@@ -3,6 +3,7 @@ pub mod config;
 pub mod error;
 pub mod filter;
 pub mod query;
+pub mod semantic;
 pub mod service;
 pub mod storage;
 pub mod sync_util;

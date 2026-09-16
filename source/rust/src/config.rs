@@ -9,6 +9,12 @@ pub const DEFAULT_LOG_LEVEL: &str = "info";
 /// Default cap on accepted vector dimensions (matches Azure's limit;
 /// lowerable for memory-constrained CI via `EMULATOR_VECTOR__MAX_DIMENSION`).
 pub const DEFAULT_VECTOR_MAX_DIMENSION: usize = 3072;
+/// Default cap on accepted semantic `answers.count` values (matches Azure's
+/// limit; lowerable via `EMULATOR_SEMANTIC__MAX_ANSWERS`).
+pub const DEFAULT_SEMANTIC_MAX_ANSWERS: usize = 5;
+/// Default cap on accepted semantic `captions.count` values (matches Azure's
+/// limit; lowerable via `EMULATOR_SEMANTIC__MAX_CAPTIONS`).
+pub const DEFAULT_SEMANTIC_MAX_CAPTIONS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageMode {
@@ -34,6 +40,8 @@ pub struct Config {
     pub log_level: String,
     pub enable_admin: bool,
     pub max_vector_dimension: usize,
+    pub max_semantic_answers: usize,
+    pub max_semantic_captions: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -48,6 +56,10 @@ pub enum ConfigError {
     InvalidBool(String),
     #[error("invalid EMULATOR_VECTOR__MAX_DIMENSION value: {0:?}")]
     InvalidMaxVectorDimension(String),
+    #[error("invalid EMULATOR_SEMANTIC__MAX_ANSWERS value: {0:?}")]
+    InvalidMaxSemanticAnswers(String),
+    #[error("invalid EMULATOR_SEMANTIC__MAX_CAPTIONS value: {0:?}")]
+    InvalidMaxSemanticCaptions(String),
 }
 
 /// Parses a non-empty value with `parse`, returning `default` when the value
@@ -146,6 +158,20 @@ impl Config {
             ConfigError::InvalidMaxVectorDimension,
         )?;
 
+        let max_semantic_answers = parse_with(
+            get_nonempty("EMULATOR_SEMANTIC__MAX_ANSWERS"),
+            DEFAULT_SEMANTIC_MAX_ANSWERS,
+            |s| s.parse::<usize>().ok().filter(|n| *n > 0).ok_or(()),
+            ConfigError::InvalidMaxSemanticAnswers,
+        )?;
+
+        let max_semantic_captions = parse_with(
+            get_nonempty("EMULATOR_SEMANTIC__MAX_CAPTIONS"),
+            DEFAULT_SEMANTIC_MAX_CAPTIONS,
+            |s| s.parse::<usize>().ok().filter(|n| *n > 0).ok_or(()),
+            ConfigError::InvalidMaxSemanticCaptions,
+        )?;
+
         Ok(Config {
             port,
             storage_mode,
@@ -153,6 +179,8 @@ impl Config {
             log_level,
             enable_admin,
             max_vector_dimension,
+            max_semantic_answers,
+            max_semantic_captions,
         })
     }
 
@@ -188,6 +216,8 @@ mod tests {
         assert_eq!(config.log_level, DEFAULT_LOG_LEVEL);
         assert!(config.enable_admin);
         assert_eq!(config.max_vector_dimension, DEFAULT_VECTOR_MAX_DIMENSION);
+        assert_eq!(config.max_semantic_answers, DEFAULT_SEMANTIC_MAX_ANSWERS);
+        assert_eq!(config.max_semantic_captions, DEFAULT_SEMANTIC_MAX_CAPTIONS);
         assert!(config.supports_api_version("2024-07-01"));
         assert!(!config.supports_api_version("1900-01-01"));
     }
@@ -232,6 +262,24 @@ mod tests {
         assert!(matches!(
             err(from_pairs(&[("EMULATOR_VECTOR__MAX_DIMENSION", "huge")])),
             ConfigError::InvalidMaxVectorDimension(_)
+        ));
+    }
+
+    #[test]
+    fn semantic_max_counts_override() {
+        let config = ok(from_pairs(&[
+            ("EMULATOR_SEMANTIC__MAX_ANSWERS", "2"),
+            ("EMULATOR_SEMANTIC__MAX_CAPTIONS", "1"),
+        ]));
+        assert_eq!(config.max_semantic_answers, 2);
+        assert_eq!(config.max_semantic_captions, 1);
+        assert!(matches!(
+            err(from_pairs(&[("EMULATOR_SEMANTIC__MAX_ANSWERS", "0")])),
+            ConfigError::InvalidMaxSemanticAnswers(_)
+        ));
+        assert!(matches!(
+            err(from_pairs(&[("EMULATOR_SEMANTIC__MAX_CAPTIONS", "many")])),
+            ConfigError::InvalidMaxSemanticCaptions(_)
         ));
     }
 

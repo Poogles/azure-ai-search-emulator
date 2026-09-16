@@ -301,6 +301,136 @@ def main() -> None:
     index_client.delete_index("fixture-phase22-index")
     index_client.delete_synonym_map("fixture-sm")
 
+    # Phase 2.3 wire formats: semantic index, flat-SDK semantic search, and
+    # the nested `semantic` object — captured for C# replay.
+    from azure.search.documents.indexes.models import (
+        SemanticConfiguration,
+        SemanticField,
+        SemanticPrioritizedFields,
+        SemanticSearch,
+    )
+
+    semantic_client = SearchClient(
+        endpoint=args.endpoint,
+        index_name="fixture-semantic-index",
+        credential=CREDENTIAL,
+        api_version=API_VERSION,
+        transport=transport,
+    )
+    index_client.create_index(
+        SearchIndex(
+            name="fixture-semantic-index",
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchableField(name="title", type=SearchFieldDataType.String),
+                SearchableField(name="content", type=SearchFieldDataType.String),
+                SimpleField(
+                    name="price",
+                    type="Edm.Double",
+                    filterable=True,
+                    sortable=True,
+                ),
+            ],
+            semantic_search=SemanticSearch(
+                configurations=[
+                    SemanticConfiguration(
+                        name="default",
+                        prioritized_fields=SemanticPrioritizedFields(
+                            title_field=SemanticField(field_name="title"),
+                            content_fields=[SemanticField(field_name="content")],
+                        ),
+                    )
+                ]
+            ),
+        )
+    )
+    semantic_client.upload_documents(
+        documents=[
+            {
+                "id": "1",
+                "title": "Azure AI Search Overview",
+                "content": (
+                    "Azure AI Search is a cloud service. It provides rich text "
+                    "search capabilities. It also supports vector search. The "
+                    "service is highly available."
+                ),
+                "price": 10.0,
+            },
+            {
+                "id": "2",
+                "title": "Vector Search Guide",
+                "content": (
+                    "Vector search uses embeddings. Neural networks create the "
+                    "embeddings. The search finds similar documents. This is "
+                    "useful for semantic matching."
+                ),
+                "price": 20.0,
+            },
+        ]
+    )
+    # Flat SDK wire format: queryType=semantic + semanticConfiguration +
+    # compound answers/captions strings.
+    list(
+        semantic_client.search(
+            search_text="vector search embeddings",
+            query_type="semantic",
+            semantic_configuration_name="default",
+            query_answer="extractive",
+            query_answer_count=3,
+            query_caption="extractive",
+            semantic_error_mode="fail",
+        )
+    )
+    # Nested `semantic` object (queryContext, captions.answers,
+    # semanticErrorHandling): the pinned SDK does not send this shape, so it is
+    # captured over raw HTTP and appended to the recording.
+    import urllib.error
+    import urllib.request
+
+    url = (
+        f"{args.endpoint}/indexes('fixture-semantic-index')/docs/search.post.search"
+        f"?api-version={API_VERSION}"
+    )
+    payload = {
+        "search": "vector search",
+        "semantic": {
+            "semanticConfiguration": "default",
+            "queryContext": {"questions": ["What is vector search used for?"]},
+            "answers": {"count": 3, "type": "extractive"},
+            "captions": {
+                "count": 1,
+                "type": "extractive",
+                "answers": {"count": 1, "type": "extractive"},
+            },
+            "semanticErrorHandling": "returnPartialResults",
+        },
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"api-key": API_KEY, "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            status = resp.status
+            body = resp.read().decode()
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        body = exc.read().decode()
+    transport.records.append(
+        {
+            "method": "POST",
+            "url": url,
+            "headers": {"api-key": API_KEY, "Content-Type": "application/json"},
+            "request_body": json.dumps(payload),
+            "status_code": status,
+            "response_headers": {},
+            "response_body": body,
+        }
+    )
+    index_client.delete_index("fixture-semantic-index")
+
     transport.close()
 
     # Write sanitized fixtures
@@ -309,7 +439,7 @@ def main() -> None:
     for i, record in enumerate(transport.records):
         sanitized = sanitize(record)
         path = out_dir / f"{i:02d}_{record['method']}_{INDEX_NAME}.json"
-        path.write_text(json.dumps(sanitized, indent=2))
+        path.write_text(json.dumps(sanitized, indent=2) + "\n")
         print(f"  {path}")  # noqa: T201 - CLI script, stdout is the interface
 
     print(f"\nCaptured {len(transport.records)} exchanges -> {out_dir}/")  # noqa: T201

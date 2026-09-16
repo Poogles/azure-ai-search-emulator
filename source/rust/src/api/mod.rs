@@ -41,12 +41,17 @@ impl AppState {
         let vectors = Arc::new(VectorEngine::new());
         let versions = VersionAdapter::new(config.api_versions.clone());
         let max_vector_dimension = config.max_vector_dimension;
+        let semantic_limits = crate::semantic::SemanticLimits {
+            max_answers: config.max_semantic_answers,
+            max_captions: config.max_semantic_captions,
+        };
         Self {
             service: Arc::new(SearchService::new(
                 storage,
                 engine,
                 vectors,
                 max_vector_dimension,
+                semantic_limits,
             )),
             config,
             versions,
@@ -518,6 +523,25 @@ fn search_response(
     if let Some(debug) = &outcome.debug_info {
         map.insert("@search.debug".to_owned(), debug.clone());
     }
+    // Top-level extractive answers (the shape the SDKs deserialize into
+    // `SearchDocumentsResult.answers`); omitted when none were extracted.
+    if let Some(semantic) = &outcome.semantic_result {
+        if !semantic.answers.is_empty() {
+            let answers: Vec<Value> = semantic
+                .answers
+                .iter()
+                .map(|a| {
+                    json!({
+                        "score": a.score,
+                        "key": a.key,
+                        "text": a.text,
+                        "highlights": a.highlights,
+                    })
+                })
+                .collect();
+            map.insert("@search.answers".to_owned(), Value::Array(answers));
+        }
+    }
     map.insert(
         "value".to_owned(),
         Value::Array(build_page_entries(query, outcome)),
@@ -557,6 +581,46 @@ fn build_page_entries(query: &crate::service::SearchQuery, outcome: &SearchOutco
                     .map(|(field, fragments)| (field.clone(), json!(fragments)))
                     .collect();
                 entry.insert("@search.highlights".to_owned(), Value::Object(highlights));
+            }
+            // Semantic captions and reranker score, when this was a semantic
+            // search. Captions are omitted per-document when none were
+            // extracted; the reranker score is present on every document.
+            if let Some(semantic) = &outcome.semantic_result {
+                if let Some(doc_semantic) = semantic.documents.get(&doc.key) {
+                    if !doc_semantic.captions.is_empty() {
+                        let captions: Vec<Value> = doc_semantic
+                            .captions
+                            .iter()
+                            .map(|c| {
+                                let mut caption = Map::new();
+                                caption.insert("text".to_owned(), json!(c.text));
+                                caption.insert("highlights".to_owned(), json!(c.highlights));
+                                if !c.answers.is_empty() {
+                                    let nested: Vec<Value> = c
+                                        .answers
+                                        .iter()
+                                        .map(|a| {
+                                            json!({
+                                                "score": a.score,
+                                                "text": a.text,
+                                                "highlights": a.highlights,
+                                            })
+                                        })
+                                        .collect();
+                                    caption.insert("answers".to_owned(), Value::Array(nested));
+                                }
+                                Value::Object(caption)
+                            })
+                            .collect();
+                        entry.insert("@search.captions".to_owned(), Value::Array(captions));
+                    }
+                    if doc_semantic.is_semantic {
+                        entry.insert(
+                            "@search.rerankerScore".to_owned(),
+                            json!(doc_semantic.reranker_score),
+                        );
+                    }
+                }
             }
             if query.select.is_empty() {
                 for (key, value) in &doc.fields {

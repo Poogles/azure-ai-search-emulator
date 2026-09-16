@@ -1,0 +1,18 @@
+{
+  "method": "POST",
+  "url": "http://<endpoint>/indexes?api-version=2024-07-01",
+  "headers": {
+    "Content-Type": "application/json",
+    "Content-Length": "738",
+    "Accept": "application/json;odata.metadata=minimal",
+    "User-Agent": "<user-agent>",
+    "api-key": "fixture-key"
+  },
+  "request_body": "{\"name\": \"fixture-semantic-index\", \"fields\": [{\"name\": \"id\", \"type\": \"Edm.String\", \"key\": true}, {\"name\": \"title\", \"type\": \"Edm.String\", \"key\": false, \"searchable\": true, \"filterable\": false, \"facetable\": false, \"sortable\": false, \"retrievable\": true}, {\"name\": \"content\", \"type\": \"Edm.String\", \"key\": false, \"searchable\": true, \"filterable\": false, \"facetable\": false, \"sortable\": false, \"retrievable\": true}, {\"name\": \"price\", \"type\": \"Edm.Double\", \"key\": false, \"searchable\": false, \"filterable\": true, \"facetable\": false, \"sortable\": true, \"retrievable\": true}], \"semantic\": {\"configurations\": [{\"name\": \"default\", \"prioritizedFields\": {\"titleField\": {\"fieldName\": \"title\"}, \"prioritizedContentFields\": [{\"fieldName\": \"content\"}]}}]}}",
+  "status_code": 201,
+  "response_headers": {
+    "content-type": "application/json",
+    "content-length": "671"
+  },
+  "response_body": "{\"fields\":[{\"key\":true,\"name\":\"id\",\"type\":\"Edm.String\"},{\"facetable\":false,\"filterable\":false,\"key\":false,\"name\":\"title\",\"retrievable\":true,\"searchable\":true,\"sortable\":false,\"type\":\"Edm.String\"},{\"facetable\":false,\"filterable\":false,\"key\":false,\"name\":\"content\",\"retrievable\":true,\"searchable\":true,\"sortable\":false,\"type\":\"Edm.String\"},{\"facetable\":false,\"filterable\":true,\"key\":false,\"name\":\"price\",\"retrievable\":true,\"searchable\":false,\"sortable\":true,\"type\":\"Edm.Double\"}],\"name\":\"fixture-semantic-index\",\"semantic\":{\"configurations\":[{\"name\":\"default\",\"prioritizedFields\":{\"prioritizedContentFields\":[{\"fieldName\":\"content\"}],\"titleField\":{\"fieldName\":\"title\"}}}]}}"
+}

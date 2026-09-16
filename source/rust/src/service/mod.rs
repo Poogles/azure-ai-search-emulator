@@ -42,7 +42,8 @@ use self::ordering::{order_scored, rrf_fuse_weighted};
 use self::parsing::{
     parse_debug, parse_facets, parse_filter_option, parse_highlight_options,
     parse_minimum_coverage, parse_orderby, parse_paging_options, parse_search_fields,
-    parse_search_mode, parse_select, parse_vector_options, UNSUPPORTED_SEARCH_OPTIONS,
+    parse_search_mode, parse_select, parse_semantic, parse_vector_options,
+    UNSUPPORTED_SEARCH_OPTIONS,
 };
 use self::resources::{named_resource, ResourceStore};
 use self::synonyms::{parse_synonym_rules, validate_synonym_map, SynonymRule};
@@ -77,6 +78,9 @@ pub struct SearchService {
     /// Cap on accepted vector dimensions (`EMULATOR_VECTOR__MAX_DIMENSION`,
     /// default 3072).
     max_vector_dimension: usize,
+    /// Caps on accepted semantic `count` values
+    /// (`EMULATOR_SEMANTIC__MAX_ANSWERS` / `EMULATOR_SEMANTIC__MAX_CAPTIONS`).
+    semantic_limits: crate::semantic::SemanticLimits,
     /// Service-level synonym maps, keyed by name (sorted).
     synonym_maps: ResourceStore<SynonymMap>,
     /// Service-level named resources (aliases, knowledge sources, knowledge
@@ -91,12 +95,14 @@ impl SearchService {
         engine: Arc<SearchEngine>,
         vectors: Arc<VectorEngine>,
         max_vector_dimension: usize,
+        semantic_limits: crate::semantic::SemanticLimits,
     ) -> Self {
         Self {
             storage,
             engine,
             vectors,
             max_vector_dimension,
+            semantic_limits,
             synonym_maps: ResourceStore::default(),
             named_resources: [
                 ResourceStore::default(),
@@ -939,6 +945,7 @@ impl SearchService {
     /// JSON object, an option is malformed, or a referenced field is missing
     /// or lacks the required attribute (`filterable`, `sortable`, `facetable`,
     /// `searchable`).
+    #[allow(clippy::too_many_lines)]
     pub fn parse_search(&self, index: &str, body: &Value) -> Result<SearchQuery, ApiError> {
         let definition = self.require_index(index)?;
         let obj = match body {
@@ -1023,6 +1030,14 @@ impl SearchService {
 
         let minimum_coverage = parse_minimum_coverage(obj)?;
         let debug = parse_debug(obj)?;
+        let semantic = parse_semantic(obj, &self.semantic_limits)?;
+        Self::validate_semantic(
+            semantic.as_ref(),
+            &vector_queries,
+            query_type,
+            &definition,
+            index,
+        )?;
 
         Ok(SearchQuery {
             search,
@@ -1049,7 +1064,58 @@ impl SearchService {
             vector_filter_mode,
             minimum_coverage,
             debug,
+            semantic,
         })
+    }
+
+    /// Validates the semantic search options against the index and other
+    /// options: rejects semantic + `vectorQueries`, semantic + `queryType=full`,
+    /// `queryType=semantic` without a configuration, and unknown configuration
+    /// names.
+    fn validate_semantic(
+        semantic: Option<&crate::semantic::SemanticQuery>,
+        vector_queries: &[VectorQuery],
+        query_type: QueryType,
+        definition: &IndexDefinition,
+        index: &str,
+    ) -> Result<(), ApiError> {
+        let is_semantic = semantic.is_some() || query_type == QueryType::Semantic;
+        if is_semantic && !vector_queries.is_empty() {
+            return Err(ApiError::bad_request(
+                ErrorCode::InvalidQuery,
+                "Semantic search and vector queries cannot be combined.",
+            ));
+        }
+        if semantic.is_some() && query_type == QueryType::Full {
+            return Err(ApiError::bad_request(
+                ErrorCode::InvalidQuery,
+                "Semantic search requires queryType 'simple'.",
+            ));
+        }
+        if query_type == QueryType::Semantic && semantic.is_none() {
+            return Err(ApiError::bad_request(
+                ErrorCode::InvalidQuery,
+                "queryType 'semantic' requires a semanticConfiguration.",
+            ));
+        }
+        if let Some(sem) = semantic {
+            let Some(config) = &definition.semantic else {
+                return Err(ApiError::bad_request(
+                    ErrorCode::InvalidQuery,
+                    format!("Index '{index}' does not have a semantic configuration."),
+                ));
+            };
+            if config.configuration(&sem.configuration).is_none() {
+                return Err(ApiError::bad_request(
+                    ErrorCode::InvalidQuery,
+                    format!(
+                        "Unknown semantic configuration '{}' in index '{index}'.",
+                        sem.configuration
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Runs a search over an index: full-text match, vector similarity,
@@ -1072,6 +1138,10 @@ impl SearchService {
         let total_candidates = documents.len();
         let (scored, total, facets) =
             Self::execute_plan(&orderby, documents, full_text_scores, &vector_lists, query);
+        // Semantic post-processing runs on the full scored set before paging
+        // (answers are selected globally; captions and reranker scores are
+        // per-document), so the top answers may come from beyond the page.
+        let semantic_result = Self::apply_semantic(&definition, query, &scored);
         let (page, has_more, next_skip) = Self::paginate(scored, skip, query.top, total);
         let page = Self::project_page(page, query, &full_text, &definition);
         let debug_info = if query.debug {
@@ -1093,6 +1163,66 @@ impl SearchService {
             has_more,
             next_skip,
             debug_info,
+            semantic_result,
+        })
+    }
+
+    /// Applies semantic post-processing (answers, captions, reranker) to the
+    /// full scored result set (before paging). Returns `None` when no
+    /// `semantic` option was requested or the index has no semantic
+    /// configuration.
+    fn apply_semantic(
+        definition: &IndexDefinition,
+        query: &SearchQuery,
+        scored: &[(Document, f32)],
+    ) -> Option<crate::semantic::SemanticResult> {
+        let Some(semantic_query) = &query.semantic else {
+            return None;
+        };
+        let Some(config) = &definition.semantic else {
+            return None;
+        };
+        let configuration = config.configuration(&semantic_query.configuration)?;
+        let search_text = query.search.as_deref().unwrap_or("");
+        let terms = crate::semantic::answers::query_terms(search_text, &semantic_query.questions);
+        let pre_tag = query.highlight_pre_tag.as_str();
+        let post_tag = query.highlight_post_tag.as_str();
+
+        let answers = crate::semantic::answers::select_answers(
+            scored,
+            &terms,
+            configuration,
+            semantic_query,
+            pre_tag,
+            post_tag,
+        );
+
+        let mut doc_results = std::collections::BTreeMap::new();
+        for (doc, score) in scored {
+            let captions = crate::semantic::captions::select_captions(
+                doc,
+                configuration,
+                semantic_query,
+                &terms,
+                pre_tag,
+                post_tag,
+            );
+            // Semantic search is full-text only (vector queries are rejected
+            // above), so the reranker normalizes the BM25 score.
+            let reranker_score = crate::semantic::reranker::normalize_bm25(*score);
+            doc_results.insert(
+                doc.key.clone(),
+                crate::semantic::DocumentSemanticResult {
+                    captions,
+                    reranker_score,
+                    is_semantic: true,
+                },
+            );
+        }
+
+        Some(crate::semantic::SemanticResult {
+            answers,
+            documents: doc_results,
         })
     }
 
@@ -2073,9 +2203,11 @@ fn prepare_full_text(
             lucene: Some(text.clone()),
             ..FullTextQuery::default()
         },
-        (Some(text), QueryType::Simple) => parse_search_text(text).map_err(|e| {
-            ApiError::bad_request(ErrorCode::InvalidQuery, format!("Invalid search text: {e}"))
-        })?,
+        (Some(text), QueryType::Simple | QueryType::Semantic) => {
+            parse_search_text(text).map_err(|e| {
+                ApiError::bad_request(ErrorCode::InvalidQuery, format!("Invalid search text: {e}"))
+            })?
+        }
         (None, _) => FullTextQuery::default(),
     };
     full_text.mode = query.search_mode;
@@ -2361,6 +2493,7 @@ mod tests {
             Arc::new(SearchEngine::new()),
             Arc::new(VectorEngine::new()),
             3072,
+            crate::semantic::SemanticLimits::default(),
         )
     }
 
@@ -2404,6 +2537,7 @@ mod tests {
             suggesters: Vec::new(),
             vector_search: None,
             synonym_maps: Vec::new(),
+            semantic: None,
             raw: json!({}),
         }
     }

@@ -43,8 +43,8 @@ impl SearchMode {
 }
 
 /// The `queryType` of a search: `simple` (the default; the emulator's
-/// simple-query parser) or `full` (Lucene syntax, parsed by Tantivy's query
-/// parser).
+/// simple-query parser), `full` (Lucene syntax, parsed by Tantivy's query
+/// parser), or `semantic` (semantic search with extractive answers/captions).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum QueryType {
     /// Simple-query semantics (the default, matching Azure).
@@ -53,6 +53,8 @@ pub enum QueryType {
     /// Lucene query syntax (`AND`/`OR`/`NOT`, `field:term`, `term~N`,
     /// `term*`, ranges, `^N` boosts).
     Full,
+    /// Semantic search (extractive answers, captions, reranker).
+    Semantic,
 }
 
 impl QueryType {
@@ -60,14 +62,15 @@ impl QueryType {
     ///
     /// # Errors
     ///
-    /// Returns an error string for anything other than `simple` / `full`
-    /// (case-insensitive).
+    /// Returns an error string for anything other than `simple` / `full` /
+    /// `semantic` (case-insensitive).
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.to_ascii_lowercase().as_str() {
             "simple" => Ok(QueryType::Simple),
             "full" => Ok(QueryType::Full),
+            "semantic" => Ok(QueryType::Semantic),
             other => Err(format!(
-                "Invalid queryType {other:?}; supported values: 'simple', 'full'."
+                "Invalid queryType {other:?}; supported values: 'simple', 'full', 'semantic'."
             )),
         }
     }

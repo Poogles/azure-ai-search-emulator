@@ -580,9 +580,10 @@ def test_upload_to_missing_index_returns_404(clean_emulator: str) -> None:
 
 
 def test_unsupported_query_options_rejected(priced_docs: SearchClient) -> None:
+    # `semanticConfiguration` is a supported option (Phase 2.3); its error
+    # cases are covered by `test_semantic_error_cases`.
     cases = [
         {"scoring_profile": "profile"},
-        {"semantic_configuration_name": "config"},
     ]
     for options in cases:
         with pytest.raises(HttpResponseError) as exc_info:
@@ -1828,3 +1829,328 @@ def test_search_debug_option(clean_emulator: str, index_client: SearchIndexClien
     status, body = _raw_post(url, {"search": "alpha", "debug": "disabled"})
     assert status == 200
     assert "@search.debug" not in body
+
+
+# ---------------------------------------------------------------------------
+# Semantic search (Phase 2.3)
+# ---------------------------------------------------------------------------
+
+
+def _semantic_index() -> SearchIndex:
+    from azure.search.documents.indexes.models import (
+        SemanticConfiguration,
+        SemanticField,
+        SemanticPrioritizedFields,
+        SemanticSearch,
+    )
+
+    return SearchIndex(
+        name=INDEX_NAME,
+        fields=[
+            SearchField(name="id", type=SearchFieldDataType.String, key=True),
+            SearchableField(name="title", type=SearchFieldDataType.String),
+            SearchableField(name="content", type=SearchFieldDataType.String),
+            SearchableField(name="summary", type=SearchFieldDataType.String),
+            SimpleField(name="price", type=SearchFieldDataType.Double, filterable=True, sortable=True),
+        ],
+        semantic_search=SemanticSearch(
+            configurations=[
+                SemanticConfiguration(
+                    name="default",
+                    prioritized_fields=SemanticPrioritizedFields(
+                        title_field=SemanticField(field_name="title"),
+                        content_fields=[SemanticField(field_name="content")],
+                    ),
+                )
+            ]
+        ),
+    )
+
+
+def _semantic_docs() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": "1",
+            "title": "Azure AI Search Overview",
+            "content": "Azure AI Search is a cloud service. It provides rich text search capabilities. It also supports vector search. The service is highly available.",
+            "summary": "An overview of Azure AI Search capabilities and features.",
+            "price": 10.0,
+        },
+        {
+            "id": "2",
+            "title": "Vector Search Guide",
+            "content": "Vector search uses embeddings. Neural networks create the embeddings. The search finds similar documents. This is useful for semantic matching.",
+            "summary": "A guide to vector search and embeddings.",
+            "price": 20.0,
+        },
+    ]
+
+
+def test_semantic_index_creation(index_client: SearchIndexClient) -> None:
+    """A semantic index is created through the SDK and echoed back."""
+    created = index_client.create_index(_semantic_index())
+    assert created.name == INDEX_NAME
+    fetched = index_client.get_index(INDEX_NAME)
+    assert fetched.semantic_search is not None
+    assert fetched.semantic_search.configurations is not None
+    assert fetched.semantic_search.configurations[0].name == "default"
+
+
+def test_semantic_search_sdk_flat_format(
+    index_client: SearchIndexClient, search_client: SearchClient
+) -> None:
+    """Semantic search through the SDK's flat wire format: captions and
+    reranker score are populated on each result."""
+    index_client.create_index(_semantic_index())
+    search_client.upload_documents(documents=_semantic_docs())
+
+    found = list(
+        search_client.search(
+            search_text="vector search embeddings",
+            query_type="semantic",
+            semantic_configuration_name="default",
+            query_answer="extractive",
+            query_answer_count=3,
+            query_caption="extractive",
+            semantic_error_mode="fail",
+        )
+    )
+    assert len(found) >= 1
+    for doc in found:
+        assert doc["@search.reranker_score"] is not None
+        assert 0.0 <= doc["@search.reranker_score"] <= 1.0
+    top = found[0]
+    assert top["id"] == "2"
+    assert top["@search.captions"] is not None
+    assert len(top["@search.captions"]) >= 1
+    assert top["@search.captions"][0].text
+
+
+def test_semantic_search_nested_format_raw_http(
+    clean_emulator: str, index_client: SearchIndexClient
+) -> None:
+    """The nested `semantic` object (queryContext, captions.answers,
+    semanticErrorHandling) is accepted; top-level @search.answers is returned.
+
+    Exercised over raw HTTP because the pinned SDK does not send the nested
+    `semantic` object (it uses the flat format) and does not surface
+    `SearchDocumentsResult.answers` through the paged iterator.
+    """
+    index_client.create_index(_semantic_index())
+    search_client = SearchClient(
+        endpoint=clean_emulator,
+        index_name=INDEX_NAME,
+        credential=CREDENTIAL,
+        api_version=API_VERSION,
+    )
+    search_client.upload_documents(documents=_semantic_docs())
+    url = (
+        f"{clean_emulator}/indexes('{INDEX_NAME}')/docs/search.post.search"
+        f"?api-version={API_VERSION}"
+    )
+    status, body = _raw_post(
+        url,
+        {
+            "search": "vector search",
+            "semantic": {
+                "semanticConfiguration": "default",
+                "queryContext": {"questions": ["What is vector search used for?"]},
+                "answers": {"count": 3, "type": "extractive"},
+                "captions": {
+                    "count": 1,
+                    "type": "extractive",
+                    "answers": {"count": 1, "type": "extractive"},
+                },
+                "semanticErrorHandling": "returnPartialResults",
+            },
+        },
+    )
+    assert status == 200
+    answers = body["@search.answers"]
+    assert isinstance(answers, list) and len(answers) >= 1
+    for answer in answers:
+        assert answer["key"]
+        assert answer["text"]
+        assert 0.0 <= answer["score"] <= 1.0
+        assert answer["highlights"]
+    doc2 = next(d for d in body["value"] if d["id"] == "2")
+    captions = doc2["@search.captions"]
+    assert isinstance(captions, list) and len(captions) >= 1
+    assert captions[0]["text"]
+    assert captions[0]["highlights"]
+    assert isinstance(captions[0]["answers"], list) and len(captions[0]["answers"]) >= 1
+
+
+def test_semantic_search_with_filter_orderby_select(
+    index_client: SearchIndexClient, search_client: SearchClient
+) -> None:
+    """Semantic search combines with filter, orderby, and select."""
+    index_client.create_index(_semantic_index())
+    search_client.upload_documents(documents=_semantic_docs())
+
+    found = list(
+        search_client.search(
+            search_text="search",
+            query_type="semantic",
+            semantic_configuration_name="default",
+            query_answer="extractive",
+            filter="price gt 5",
+            order_by=["price asc"],
+            select=["id", "title", "price"],
+        )
+    )
+    assert len(found) >= 1
+    assert found[0]["id"] == "1"
+    # select projection: content/summary omitted.
+    assert "content" not in found[0]
+    assert "summary" not in found[0]
+    assert found[0]["@search.reranker_score"] is not None
+
+
+def test_semantic_index_non_semantic_query_has_no_semantic_props(
+    index_client: SearchIndexClient, search_client: SearchClient
+) -> None:
+    """A non-semantic query on a semantic index returns no semantic props."""
+    index_client.create_index(_semantic_index())
+    search_client.upload_documents(documents=_semantic_docs())
+
+    found = list(search_client.search(search_text="vector search"))
+    assert len(found) >= 1
+    for doc in found:
+        assert doc.get("@search.reranker_score") is None
+        assert doc.get("@search.captions") is None
+
+
+def test_semantic_error_cases(
+    clean_emulator: str, index_client: SearchIndexClient
+) -> None:
+    """Semantic error cases return 400 InvalidQuery."""
+    index_client.create_index(_semantic_index())
+    search_client = SearchClient(
+        endpoint=clean_emulator,
+        index_name=INDEX_NAME,
+        credential=CREDENTIAL,
+        api_version=API_VERSION,
+    )
+    search_client.upload_documents(documents=_semantic_docs())
+    url = (
+        f"{clean_emulator}/indexes('{INDEX_NAME}')/docs/search.post.search"
+        f"?api-version={API_VERSION}"
+    )
+
+    # Unknown configuration name.
+    status, body = _raw_post(
+        url,
+        {
+            "search": "search",
+            "queryType": "semantic",
+            "semanticConfiguration": "nonexistent",
+        },
+    )
+    assert status == 400
+    assert body["error"]["code"] == "InvalidQuery"
+
+    # queryType=semantic without a configuration.
+    status, body = _raw_post(url, {"search": "search", "queryType": "semantic"})
+    assert status == 400
+    assert body["error"]["code"] == "InvalidQuery"
+
+    # semantic + queryType=full.
+    status, body = _raw_post(
+        url,
+        {
+            "search": "search",
+            "queryType": "full",
+            "semantic": {"semanticConfiguration": "default"},
+        },
+    )
+    assert status == 400
+    assert body["error"]["code"] == "InvalidQuery"
+
+    # Bad answers.count (above the default max of 5).
+    status, body = _raw_post(
+        url,
+        {
+            "search": "search",
+            "semantic": {
+                "semanticConfiguration": "default",
+                "answers": {"count": 6},
+            },
+        },
+    )
+    assert status == 400
+    assert body["error"]["code"] == "InvalidQuery"
+
+
+def test_semantic_with_vector_queries_rejected(
+    clean_emulator: str, index_client: SearchIndexClient
+) -> None:
+    """semantic + vectorQueries is rejected with 400 InvalidQuery.
+
+    The index carries a real vector field so the rejection is the
+    semantic/vector conflict (not an unknown vector field).
+    """
+    from azure.search.documents.indexes.models import (
+        HnswAlgorithmConfiguration,
+        HnswParameters,
+        SemanticConfiguration,
+        SemanticField,
+        SemanticPrioritizedFields,
+        SemanticSearch,
+        VectorSearch,
+        VectorSearchProfile,
+    )
+
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchableField(name="title", type=SearchFieldDataType.String),
+                SearchField(
+                    name="vec",
+                    type="Collection(Edm.Single)",
+                    searchable=True,
+                    vector_search_dimensions=2,
+                    vector_search_profile_name="cos",
+                ),
+            ],
+            vector_search=VectorSearch(
+                algorithms=[
+                    HnswAlgorithmConfiguration(
+                        name="hnsw-1", parameters=HnswParameters(metric="cosine")
+                    )
+                ],
+                profiles=[
+                    VectorSearchProfile(name="cos", algorithm_configuration_name="hnsw-1")
+                ],
+            ),
+            semantic_search=SemanticSearch(
+                configurations=[
+                    SemanticConfiguration(
+                        name="default",
+                        prioritized_fields=SemanticPrioritizedFields(
+                            title_field=SemanticField(field_name="title")
+                        ),
+                    )
+                ]
+            ),
+        )
+    )
+    url = (
+        f"{clean_emulator}/indexes('{INDEX_NAME}')/docs/search.post.search"
+        f"?api-version={API_VERSION}"
+    )
+    status, body = _raw_post(
+        url,
+        {
+            "search": "search",
+            "queryType": "semantic",
+            "semanticConfiguration": "default",
+            "vectorQueries": [
+                {"kind": "vector", "vector": [1.0, 0.0], "fields": "vec", "k": 1}
+            ],
+        },
+    )
+    assert status == 400
+    assert body["error"]["code"] == "InvalidQuery"

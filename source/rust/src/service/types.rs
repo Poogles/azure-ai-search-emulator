@@ -126,6 +126,8 @@ pub struct SearchQuery {
     /// Whether `debug: true` was requested (adds `@search.debug` to the
     /// response).
     pub debug: bool,
+    /// The parsed `semantic` property, when present.
+    pub semantic: Option<crate::semantic::SemanticQuery>,
 }
 
 /// The raw request state bound into continuation tokens: the raw `filter`,
@@ -218,6 +220,8 @@ pub struct SearchOutcome {
     /// The `@search.debug` object, present only when `debug: true` was
     /// requested.
     pub debug_info: Option<Value>,
+    /// The semantic post-processing result, when `semantic` was requested.
+    pub semantic_result: Option<crate::semantic::SemanticResult>,
 }
 
 /// A single autocomplete completion: the completed term and the query with

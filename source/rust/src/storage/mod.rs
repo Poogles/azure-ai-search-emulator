@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
+use crate::semantic::SemanticConfig;
 use crate::sync_util::{read_unpoisoned, write_unpoisoned};
 
 /// A normalized `Edm.*` field type. Recognized types are named variants;
@@ -472,6 +473,10 @@ pub struct IndexDefinition {
     /// `synonymMaps` array). Only these maps are applied to full-text search
     /// on this index; maps not referenced here are inert for it.
     pub synonym_maps: Vec<String>,
+    /// The `semantic` block, when present. Parsed and validated by the
+    /// service layer; preserved here so the search pipeline can access the
+    /// configuration at query time.
+    pub semantic: Option<SemanticConfig>,
     /// The raw JSON index definition, preserved for echo in responses.
     pub raw: Value,
 }
@@ -534,12 +539,17 @@ impl IndexDefinition {
         }
         synonym_maps.sort();
         synonym_maps.dedup();
+        let semantic = match obj.get("semantic") {
+            None | Some(Value::Null) => None,
+            Some(raw) => crate::semantic::SemanticConfig::from_json(raw, &fields)?,
+        };
         Ok(IndexDefinition {
             name: name.to_owned(),
             fields,
             suggesters,
             vector_search,
             synonym_maps,
+            semantic,
             raw,
         })
     }
