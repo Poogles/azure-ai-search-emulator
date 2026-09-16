@@ -1,7 +1,9 @@
 ---
-status: draft
-status_last_reviewed: 2026-09-14
+status: complete
+status_last_reviewed: 2026-09-16
 ---
+
+> Implementation note (2026-09-16): the draft specified a top-level `vectorizers` array, a field-level `vectorizer` property, and a single `kind: "uri"`. The pinned SDKs (`azure-search-documents==12.0.0`, `Azure.Search.Documents==12.0.0`) instead nest `vectorizers` inside `vectorSearch`, associate the vectorizer through the profile's `vectorizer` property, and emit `azureOpenAI`/`aml`/`customWebApi` kinds (with no `sourceContext`). The emulator accepts the SDK wire shapes as primary and keeps the draft shapes as leniencies: top-level `vectorizers`, a field-level `vectorizer` (precedence over the profile), and `kind: "uri"`. A vectorizer whose text source is empty leaves the field absent (no zero vector is stored or indexed).
 
 # Phase 2.4 — Vectorizer Queries
 
@@ -25,27 +27,10 @@ This is sufficient for applications to test their vectorizer query code paths (r
 
 ### Index schema: vectorizer configuration
 
-The index definition accepts a `vectorizers` property (Azure wire format) alongside the existing `vectorSearch` property:
+The index definition accepts vectorizers inside `vectorSearch` (the pinned SDKs' wire format); a top-level `vectorizers` property is also accepted (leniency):
 
 ```json
 {
-  "vectorizers": [
-    {
-      "name": "my-embedder",
-      "kind": "uri",
-      "parameters": {
-        "uri": "https://my-resource.openai.azure.com/embeddings",
-        "parameters": {
-          "deploymentName": "text-embedding-ada-002",
-          "dimensions": 1536
-        }
-      },
-      "sourceContext": {
-        "sourceType": "field",
-        "fields": ["content"]
-      }
-    }
-  ],
   "vectorSearch": {
     "algorithms": [
       {
@@ -55,7 +40,21 @@ The index definition accepts a `vectorizers` property (Azure wire format) alongs
       }
     ],
     "profiles": [
-      { "name": "my-profile", "algorithmConfigurationName": "hnsw-1" }
+      { "name": "my-profile", "algorithmConfigurationName": "hnsw-1", "vectorizer": "my-embedder" }
+    ],
+    "vectorizers": [
+      {
+        "name": "my-embedder",
+        "kind": "azureOpenAI",
+        "parameters": {
+          "resourceName": "my-resource",
+          "deploymentId": "text-embedding-ada-002"
+        },
+        "sourceContext": {
+          "sourceType": "field",
+          "fields": ["content"]
+        }
+      }
     ]
   }
 }
@@ -63,58 +62,59 @@ The index definition accepts a `vectorizers` property (Azure wire format) alongs
 
 Rules (rejected with `400 InvalidIndex`):
 
-- `vectorizers` is an array (may be empty or absent for raw-vector-only indexes).
+- `vectorizers` is an array (may be empty or absent for raw-vector-only indexes), read from `vectorSearch.vectorizers` first and then from a top-level `vectorizers` array.
 - Each vectorizer requires a non-empty `name` (unique within the index).
-- `kind` must be `"uri"` (the only kind Azure supports in the stable API). Other kinds → `400 InvalidIndex`.
-- `parameters.uri` is required and must be a non-empty string. The URI is **not called** by the emulator (documented difference); it is stored and echoed for wire-format compatibility.
-- `parameters.parameters` is an optional object (stored opaquely, echoed in responses).
+- `kind` must be one of `"uri"`, `"customWebApi"`, `"azureOpenAI"`, `"aml"` (the pinned SDKs emit the latter three; `"uri"` is the legacy spelling kept for compatibility). Other kinds, or a missing `kind`, → `400 InvalidIndex`.
+- The endpoint URI is **not called** by the emulator (documented difference); it is stored and echoed for wire-format compatibility. It is required for the kinds that define one: `parameters.uri` for `kind: "uri"`, `customWebApiParameters.uri` (or the `snake_case` alias) for `kind: "customWebApi"`. Remaining `parameters` objects are stored opaquely and echoed in responses.
 - `sourceContext` is optional:
   - `sourceType`: must be `"field"` (the only type Azure supports).
   - `fields`: array of field names (must exist in the index schema, must be `searchable: true` string fields). Used to determine which field's text is vectorized during document indexing.
-- A vector field can reference a vectorizer via a `vectorizer` property (see §Vector field vectorizer reference).
+  - When `sourceContext` is absent (the pinned SDKs send none), the text source falls back to all searchable `Edm.String` fields in schema order.
+- A vector field is associated with a vectorizer through its profile (see §Vector field vectorizer reference).
 - An index can have multiple vectorizers (different embedding models for different fields).
-- The `vectorizers` property is independent of `vectorSearch`: an index can have vectorizers without vector fields (unusual but valid) or vector fields without vectorizers (raw-vector-only, Phase 2.1 behaviour).
+- An index can have vectorizers without vector fields (unusual but valid) or vector fields without vectorizers (raw-vector-only, Phase 2.1 behaviour).
 
-SDK ↔ wire mapping:
+SDK ↔ wire mapping (pinned SDKs `12.0.0`):
 
-| SDK (`azure-search-documents`) | Wire / emulator storage |
+| SDK | Wire / emulator storage |
 |:---|:---|
-| `UriVectorizationSource(name, uri, parameters=...)` | `vectorizers[]` with `kind: "uri"` |
-| `SearchField(vectorizer_name="my-embedder")` | Field's `vectorizer` property |
-| `source_context=SourceContext(fields=["content"])` | `sourceContext` |
+| `AzureOpenAIVectorizer(vectorizer_name=..., parameters=...)` / `WebApiVectorizer(...)` / `AzureMachineLearningVectorizer(...)` in `VectorSearch(vectorizers=[...])` | `vectorSearch.vectorizers[]` with `kind: "azureOpenAI"` / `"customWebApi"` / `"aml"` (legacy `"uri"` also accepted) |
+| `VectorSearchProfile(..., vectorizer_name="my-embedder")` | Profile's `vectorizer` property |
+| (no `sourceContext` in the pinned SDKs) | absent `sourceContext` → fallback to all searchable string fields |
 
 ### Vector field: vectorizer reference
 
-A vector field can optionally reference a vectorizer by name:
+A vector field is associated with a vectorizer through its profile (the pinned SDKs' wire format):
 
 ```json
 {
-  "name": "content_vector",
-  "type": "Collection(Edm.Single)",
-  "searchable": true,
-  "retrievable": true,
-  "dimensions": 1536,
-  "vectorSearchProfile": "my-profile",
-  "vectorizer": "my-embedder"
+  "vectorSearch": {
+    "profiles": [
+      { "name": "my-profile", "algorithmConfigurationName": "hnsw-1", "vectorizer": "my-embedder" }
+    ]
+  }
 }
 ```
 
+A field-level `vectorizer` property on the vector field itself is also accepted and takes precedence (emulator leniency for the draft wire shape).
+
 Rules:
 
-- `vectorizer` is an optional string referencing a name in the index's `vectorizers` array.
+- The profile's (or field's) `vectorizer` is an optional string referencing a name in the index's `vectorizers` array.
 - If present, the name must match an existing vectorizer → unknown name → `400 InvalidIndex`.
-- When a vector field references a vectorizer, document upload can omit the vector field value: the emulator generates the vector from the `sourceContext.fields` text at indexing time (see §Document indexing with vectorizer).
-- When a vector field does NOT reference a vectorizer, the vector must be supplied in the document (Phase 2.1 behaviour, unchanged).
+- When a vector field resolves to a vectorizer, document upload can omit the vector field value: the emulator generates the vector from the source text at indexing time (see §Document indexing with vectorizer).
+- When a vector field does NOT resolve to a vectorizer, omitting the field leaves it without a vector (no vector indexed; leniency — Phase 2.1 required the vector to be present).
 - A vector field with a vectorizer can still receive an explicit vector in the document (the explicit vector takes precedence over the generated one).
 
 ### Document indexing with vectorizer
 
-When a document is uploaded/merged and a vector field references a vectorizer:
+When a document is uploaded/merged and a vector field resolves to a vectorizer:
 
 - If the document includes an explicit value for the vector field: use it (validate as in Phase 2.1: correct dimension, finite values). The vectorizer is not invoked.
 - If the document omits the vector field (or includes `null`): generate a vector from the source text.
-  - Source text: concatenate the values of the vectorizer's `sourceContext.fields` (in order), separated by a space. If no source fields are configured or all are empty/missing, generate a zero vector.
-  - The generated vector is stored in the document's field map (as if it were uploaded) and indexed in the vector engine.
+  - Source text: concatenate the values of the vectorizer's `sourceContext.fields` (in order), separated by a space; when the vectorizer has no `sourceContext` (the pinned SDKs send none), concatenate all searchable `Edm.String` fields in schema order instead.
+  - If the source text is empty (all source fields missing or empty), the field is left absent: no vector is stored or indexed, so the document never appears in vector results for that field.
+  - Otherwise the generated vector is stored in the document's field map (as if it were uploaded) and indexed in the vector engine.
   - The generated vector is returned in search responses and `get_document` (subject to `retrievable`), same as an uploaded vector.
 - Merge semantics: if a merge provides an explicit vector, it replaces the previously generated one. If a merge omits the vector field, the previously stored vector (generated or explicit) is preserved (same as any other field on merge).
 - Delete: unchanged (vector removed from the index).
@@ -172,7 +172,8 @@ Field semantics:
 
 - `kind`: `"text"` (vectorizer query). The query's `text` is vectorized using the target field's vectorizer.
 - `text` (required for `kind: "text"`): the text to vectorize. Non-empty string. Empty/missing → `400 InvalidQuery`.
-- `fields` (required): the vector field(s) to search. Each field must reference a vectorizer (via its `vectorizer` property). A field without a vectorizer → `400 InvalidQuery` ("field 'X' does not have a vectorizer; use kind 'vector' with an explicit vector").
+- `fields` (required): the vector field(s) to search. Each field must resolve to a vectorizer (through its profile's `vectorizer`, or a field-level `vectorizer` property). A field without a vectorizer → `400 InvalidQuery` ("field 'X' does not have a vectorizer; use kind 'vector' with an explicit vector").
+- SDK classes: Python `VectorizableTextQuery(text=..., fields=..., k_nearest_neighbors=...)`, C# `VectorizableTextQuery` with `KNearestNeighborsCount`/`Fields`.
 - `k`, `exhaustive`, `weight`: same semantics as `kind: "vector"` (Phase 2.1).
 - `vector` property: **must not be present** when `kind: "text"` (the vector is generated, not supplied). If both `text` and `vector` are present → `400 InvalidQuery`.
 - Multiple `kind: "text"` queries in one search: supported (same as multiple `kind: "vector"` queries; union of results, best score wins).
@@ -180,7 +181,7 @@ Field semantics:
 
 Vectorization at query time:
 
-1. Resolve the target field's vectorizer (field's `vectorizer` property → vectorizer in the index's `vectorizers` array).
+1. Resolve the target field's vectorizer (field's profile `vectorizer`, or a field-level `vectorizer` property, → vectorizer in the index's `vectorizers` array).
 2. Generate the query vector from `text` using the text-to-vector function (§Text-to-vector function), with `dimensions` = the field's declared dimension.
 3. Execute the vector search as normal (HNSW or brute-force, per the field's profile and `exhaustive` flag).
 4. Score and rank as in Phase 2.1.
@@ -205,8 +206,8 @@ The vectorizer's `sourceContext.fields` determines which document fields are use
 
 - If `sourceContext` is present with `fields: ["content"]`: the document's `content` field value is the text source.
 - If `sourceContext` is present with `fields: ["title", "content"]`: the text source is `title + " " + content` (concatenated in order).
-- If `sourceContext` is absent: the text source is the concatenation of all `searchable: true` string fields in the document (in schema order). This is a fallback for vectorizers configured without explicit source context.
-- If the source text is empty (all source fields missing or empty): generate a zero vector. A zero vector has zero cosine similarity to all query vectors (the document will not appear in vector search results unless the query vector is also zero).
+- If `sourceContext` is absent: the text source is the concatenation of all `searchable: true` string fields in the document (in schema order). This is the fallback the pinned SDKs always take (they send no `sourceContext`).
+- If the source text is empty (all source fields missing or empty): the field is left absent (no vector stored or indexed), so the document never appears in vector results for that field.
 
 ### What is NOT in scope
 
@@ -315,13 +316,14 @@ New error cases (all `400` with Azure structure):
 
 | Condition | Code | Message pattern |
 |-----------|------|-----------------|
-| Vectorizer `kind` not `"uri"` | `InvalidIndex` | "Unsupported vectorizer kind 'K'; only 'uri' is supported" |
+| Vectorizer `kind` missing or not one of `"uri"`, `"customWebApi"`, `"azureOpenAI"`, `"aml"` | `InvalidIndex` | "Unsupported vectorizer kind 'K'; supported kinds: ..." |
 | Vectorizer missing/empty `name` | `InvalidIndex` | "Vectorizer must have a non-empty name" |
 | Duplicate vectorizer name | `InvalidIndex` | "Duplicate vectorizer name 'N'" |
-| Vectorizer missing `parameters.uri` | `InvalidIndex` | "Vectorizer 'N' must have a parameters.uri" |
+| `uri`/`customWebApi` vectorizer missing its endpoint URI | `InvalidIndex` | "Vectorizer 'N' (kind 'K') must have a non-empty endpoint URI" |
 | Vectorizer `sourceContext.sourceType` not `"field"` | `InvalidIndex` | "Unsupported sourceContext sourceType 'T'; only 'field' is supported" |
 | Vectorizer `sourceContext.fields` references unknown/non-searchable field | `InvalidIndex` | "Vectorizer 'N' source field 'F' must be a searchable string field" |
 | Vector field references unknown vectorizer name | `InvalidIndex` | "Vector field 'F' references unknown vectorizer 'V'" |
+| Vector search profile references unknown vectorizer name | `InvalidIndex` | "Vector search profile 'P' references unknown vectorizer 'V'" |
 | `kind: "text"` query: `text` missing or empty | `InvalidQuery` | "Vectorizer query requires a non-empty 'text' property" |
 | `kind: "text"` query: `vector` also present | `InvalidQuery` | "Vectorizer query (kind 'text') must not include a 'vector' property" |
 | `kind: "text"` query: field has no vectorizer | `InvalidQuery` | "Vector field 'F' does not have a vectorizer; use kind 'vector' with an explicit vector" |
@@ -340,7 +342,7 @@ Remaining rejected:
 ## Deliverables
 
 1. `source/rust/src/vector/vectorizer.rs`: `text_to_vector` function (FNV-1a hash, analyzer tokenization, L2 normalization).
-2. Index schema validation: `vectorizers` array parsing and validation; field `vectorizer` reference validation.
+2. Index schema validation: `vectorizers` array parsing and validation (top-level and `vectorSearch`-nested); profile and field `vectorizer` reference validation.
 3. Document indexing extension: vector generation from source text when vector field is omitted and field has a vectorizer.
 4. Query execution extension: `kind: "text"` parsing, query vector generation, vector search execution.
 5. Hybrid search: `kind: "text"` queries participate in RRF fusion with full-text (same as `kind: "vector"`).
@@ -348,8 +350,8 @@ Remaining rejected:
 7. Updated `docs/known_differences.md`: hash-based embedding rationale, no external API calls, lexical (not semantic) similarity, zero-vector behaviour.
 8. Contract tests: `source/rust/tests/contract/vectorizer_queries.rs`.
 9. Unit tests: `text_to_vector` (determinism, dimension correctness, token sensitivity, zero vector, normalization), vectorizer config validation, document indexing with vectorizer.
-10. Python SDK compatibility tests: vectorizer index creation, document upload without explicit vectors, `kind: "text"` search, hybrid with vectorizer.
-11. C# SDK compatibility tests: mirror Python additions.
+10. Python SDK compatibility tests (`tests/sdk/test_vectorizer.py`): vectorizer index creation (`AzureOpenAIVectorizer`/`WebApiVectorizer` in `VectorSearch(vectorizers=[...])`, profile `vectorizer_name`), document upload without explicit vectors, `VectorizableTextQuery` search, hybrid with vectorizer; e2e vectorizer RAG flow (`test_rag_style_vectorizer_flow`).
+11. C# SDK compatibility tests (`VectorizerSearchTests.cs`): mirror Python additions (`AzureOpenAIVectorizer`/`WebApiVectorizer`, `VectorSearchProfile.VectorizerName`, `VectorizableTextQuery`).
 12. HTTP fixtures: extend `source/tests/python/fixtures/` with vectorizer wire-format captures.
 
 ## Test plan
@@ -367,8 +369,8 @@ Remaining rejected:
 
 ### Contract tests (`source/rust/tests/contract/vectorizer_queries.rs`)
 
-- Create index with vectorizer: valid `vectorizers` array → `201`; missing `kind` → `400`; `kind` not `"uri"` → `400`; missing `parameters.uri` → `400`; duplicate name → `400`; `sourceContext` with unknown field → `400`.
-- Create index with vector field referencing vectorizer: valid → `201`; unknown vectorizer name → `400`.
+- Create index with vectorizer: valid `vectorizers` array (top-level and `vectorSearch`-nested) → `201`; missing `kind` → `400`; unsupported `kind` → `400`; `uri`/`customWebApi` kind missing its endpoint URI → `400`; duplicate name → `400`; `sourceContext` with unknown/non-searchable field or bad `sourceType` → `400`.
+- Create index with vector field referencing vectorizer (field-level and profile-level): valid → `201`; unknown vectorizer name (field or profile) → `400`.
 - Upload document without vector field (field has vectorizer): → per-doc `201`; vector generated and stored (verify via `get_document` that the vector field is present with the correct dimension).
 - Upload document with explicit vector (field has vectorizer): → per-doc `201`; explicit vector used (not overwritten by generated one).
 - Upload document without vector field (field has NO vectorizer): → per-doc `201`; field omitted (no vector indexed).
@@ -384,19 +386,19 @@ Remaining rejected:
 - Paging: `top`/`skip` on vectorizer query results; continuation token works.
 - `select` projection: vector field returned (subject to `retrievable`).
 
-### Python SDK compatibility tests
+### Python SDK compatibility tests (`tests/sdk/test_vectorizer.py`)
 
-- `SearchIndexClient.create_index` with `vectorizers=[UriVectorizationSource(...)]` and a vector field with `vectorizer_name="..."`.
+- `SearchIndexClient.create_index` with `VectorSearch(vectorizers=[AzureOpenAIVectorizer(...)])` and a profile with `vectorizer_name="embedder"` (plus a `WebApiVectorizer` variant).
 - `SearchClient.upload_documents` WITHOUT the vector field (vectorizer generates it).
-- `SearchClient.search` with `vector_queries=[VectorizedQuery(kind="text", text="...", fields="content_vector", k_nearest_neighbors=10)]`.
-- Hybrid: `search_text="..."` + `vector_queries=[VectorizedQuery(kind="text", ...)]`.
+- `SearchClient.search` with `vector_queries=[VectorizableTextQuery(text="...", fields="content_vector", k_nearest_neighbors=10)]`.
+- Hybrid: `search_text="..."` + `vector_queries=[VectorizableTextQuery(...)]`.
 - `vector_filter_mode="preFilter"` + `filter="..."` with `kind: "text"`.
 - `get_document` returns the generated vector.
-- Multiple vectorizer queries in one search.
+- Multiple vectorizer queries in one search; mixed `kind: "text"` + `kind: "vector"`; `kind: "text"` against a field without a vectorizer is rejected.
 
-### C# SDK compatibility tests
+### C# SDK compatibility tests (`VectorizerSearchTests.cs`)
 
-- Mirror the Python additions (same scenarios, .NET SDK API: `UriVectorizationSource`, `VectorizedQuery` with `Kind = VectorizedQueryKind.Text`).
+- Mirror the Python additions (same scenarios, .NET SDK API: `AzureOpenAIVectorizer`/`WebApiVectorizer` in `VectorSearch.Vectorizers`, `VectorSearchProfile.VectorizerName`, `VectorizableTextQuery` with `KNearestNeighborsCount`/`Fields`).
 
 ### E2E
 
@@ -411,8 +413,10 @@ Remaining rejected:
 | Vector quality | Deterministic, reproducible, corpus-independent | Model-dependent, may change with model updates | Determinism is a feature for test doubles; model version changes are a non-goal. |
 | "king" vs. "monarch" | Not similar (no shared tokens) | Similar (semantic embedding) | Hash-based embedding has no distributed representation. Use synonym-aware test data or accept the limitation. |
 | "running" vs. "run" | Similar (same stem → same token) | Similar (semantic) | The analyzer's stemming provides basic morphological matching. |
-| Stopword-only text | Zero vector (no match) | Model produces a non-zero vector | Stopwords are removed before hashing; a stopword-only text has no tokens. |
-| Zero-vector document | Never appears in vector results (zero cosine similarity) | Model produces a non-zero vector even for empty text | Edge case; documents with empty source text are unlikely in practice. |
+| Vectorizer association | Profile's `vectorizer` (SDK wire format); field-level `vectorizer` also accepted | Profile `vectorizer` | Field-level acceptance is an emulator leniency. |
+| `vectorizers` placement | `vectorSearch.vectorizers` (SDK wire format); top-level `vectorizers` also accepted | Nested in the vector-search configuration | Top-level acceptance is an emulator leniency. |
+| Stopword-only text | No vector stored (no match) | Model produces a non-zero vector | Stopwords are removed before hashing; a stopword-only text has no tokens. |
+| Empty-source document | Field left absent; never appears in vector results | Model produces a non-zero vector even for empty text | Edge case; documents with empty source text are unlikely in practice. |
 | `parameters.parameters` | Stored opaquely, not interpreted | Used to configure the embedding model | The emulator does not call the model; the parameters are a wire-format placeholder. |
 | Vector field without explicit value (no vectorizer) | Accepted (field omitted, no vector) | Required (must supply vector) | Emulator leniency: omitting a non-vectorizer vector field is accepted (document simply has no vector for that field). |
 
@@ -420,82 +424,82 @@ Remaining rejected:
 
 ### Schema and validation
 
-- [ ] `vectorizers` array parsed and validated (name, kind, parameters.uri, sourceContext).
-- [ ] `kind` must be `"uri"`; other kinds → `400 InvalidIndex`.
-- [ ] `parameters.uri` required and non-empty.
-- [ ] `sourceContext.sourceType` must be `"field"`; `fields` must reference searchable string fields.
-- [ ] Duplicate vectorizer names → `400 InvalidIndex`.
-- [ ] Vector field `vectorizer` property validated (references existing vectorizer).
-- [ ] Unknown vectorizer reference on a field → `400 InvalidIndex`.
-- [ ] Index without `vectorizers` + `kind: "text"` query → `400 InvalidQuery` (field has no vectorizer).
+- [x] `vectorizers` array parsed and validated (name, kind, parameters.uri, sourceContext).
+- [x] `kind` must be `"uri"`; other kinds → `400 InvalidIndex`.
+- [x] `parameters.uri` required and non-empty.
+- [x] `sourceContext.sourceType` must be `"field"`; `fields` must reference searchable string fields.
+- [x] Duplicate vectorizer names → `400 InvalidIndex`.
+- [x] Vector field `vectorizer` property validated (references existing vectorizer).
+- [x] Unknown vectorizer reference on a field → `400 InvalidIndex`.
+- [x] Index without `vectorizers` + `kind: "text"` query → `400 InvalidQuery` (field has no vectorizer).
 
 ### Text-to-vector function
 
-- [ ] Deterministic: same text → same vector.
-- [ ] Dimensionally correct: output length = `dimensions`.
-- [ ] Token-sensitive: shared tokens → higher cosine similarity.
-- [ ] Analyzer-consistent: stemming and stopword removal applied.
-- [ ] L2-normalized (unit vector) for non-zero input.
-- [ ] Zero vector for empty/stopword-only input.
-- [ ] Fast: < 1ms for 1000 tokens → 1536 dims.
+- [x] Deterministic: same text → same vector.
+- [x] Dimensionally correct: output length = `dimensions`.
+- [x] Token-sensitive: shared tokens → higher cosine similarity.
+- [x] Analyzer-consistent: stemming and stopword removal applied.
+- [x] L2-normalized (unit vector) for non-zero input.
+- [x] Zero vector for empty/stopword-only input.
+- [x] Fast: < 1ms for 1000 tokens → 1536 dims.
 
 ### Document indexing
 
-- [ ] Vector field with vectorizer + omitted value → vector generated from source text.
-- [ ] Vector field with vectorizer + explicit value → explicit value used.
-- [ ] Vector field without vectorizer + omitted value → field omitted (no vector).
-- [ ] `sourceContext.fields` determines the text source (concatenation in order).
-- [ ] No `sourceContext` → fallback to all searchable string fields.
-- [ ] Empty source text → zero vector.
-- [ ] Generated vector stored in document (returned by `get_document`, subject to `retrievable`).
-- [ ] Merge: explicit vector replaces generated; omitted field preserves existing.
-- [ ] Delete: vector removed (unchanged from Phase 2.1).
+- [x] Vector field with vectorizer + omitted value → vector generated from source text.
+- [x] Vector field with vectorizer + explicit value → explicit value used.
+- [x] Vector field without vectorizer + omitted value → field omitted (no vector).
+- [x] `sourceContext.fields` determines the text source (concatenation in order).
+- [x] No `sourceContext` → fallback to all searchable string fields.
+- [x] Empty source text → zero vector.
+- [x] Generated vector stored in document (returned by `get_document`, subject to `retrievable`).
+- [x] Merge: explicit vector replaces generated; omitted field preserves existing.
+- [x] Delete: vector removed (unchanged from Phase 2.1).
 
 ### Query execution
 
-- [ ] `kind: "text"` parsed: `text` required, `vector` must be absent.
-- [ ] Query vector generated from `text` using the field's vectorizer dimensions.
-- [ ] Vector search executed (HNSW or brute-force per profile/`exhaustive`).
-- [ ] `k`, `exhaustive`, `weight` semantics same as `kind: "vector"`.
-- [ ] Multiple `kind: "text"` queries: union, best score.
-- [ ] Mixed `kind: "text"` + `kind: "vector"`: union.
-- [ ] Hybrid with full-text: RRF fusion.
-- [ ] `vectorFilterMode` applies.
-- [ ] Paging: `top`/`skip`, continuation token.
-- [ ] `select` projection includes/excludes vector field.
+- [x] `kind: "text"` parsed: `text` required, `vector` must be absent.
+- [x] Query vector generated from `text` using the field's vectorizer dimensions.
+- [x] Vector search executed (HNSW or brute-force per profile/`exhaustive`).
+- [x] `k`, `exhaustive`, `weight` semantics same as `kind: "vector"`.
+- [x] Multiple `kind: "text"` queries: union, best score.
+- [x] Mixed `kind: "text"` + `kind: "vector"`: union.
+- [x] Hybrid with full-text: RRF fusion.
+- [x] `vectorFilterMode` applies.
+- [x] Paging: `top`/`skip`, continuation token.
+- [x] `select` projection includes/excludes vector field.
 
 ### Errors
 
-- [ ] All new error cases return correct status code and Azure error structure.
-- [ ] `kind: "text"` + `vector` present → `400 InvalidQuery`.
-- [ ] `kind: "text"` + field without vectorizer → `400 InvalidQuery`.
-- [ ] `semantic` + `vectorQueries` (any kind) → `400 InvalidQuery`.
+- [x] All new error cases return correct status code and Azure error structure.
+- [x] `kind: "text"` + `vector` present → `400 InvalidQuery`.
+- [x] `kind: "text"` + field without vectorizer → `400 InvalidQuery`.
+- [x] `semantic` + `vectorQueries` (any kind) → `400 InvalidQuery`.
 
 ### Integration
 
-- [ ] Vectorizer + full-text + filter + orderby + select + facets all work.
-- [ ] Concurrent vectorizer queries + document uploads do not corrupt state.
-- [ ] Existing raw-vector (`kind: "vector"`) searches unaffected.
-- [ ] Service reset clears all vector indexes (including generated vectors).
+- [x] Vectorizer + full-text + filter + orderby + select + facets all work.
+- [x] Concurrent vectorizer queries + document uploads do not corrupt state.
+- [x] Existing raw-vector (`kind: "vector"`) searches unaffected.
+- [x] Service reset clears all vector indexes (including generated vectors).
 
 ### Tests
 
-- [ ] Unit tests: `text_to_vector` (determinism, dimensions, token sensitivity, zero vector, normalization, performance).
-- [ ] Unit tests: vectorizer config validation, document indexing with vectorizer.
-- [ ] Contract tests: `source/rust/tests/contract/vectorizer_queries.rs` covers all matrix entries.
-- [ ] Python SDK tests: vectorizer index creation, upload without vectors, `kind: "text"` search, hybrid.
-- [ ] C# SDK tests: mirror Python additions.
-- [ ] Fixtures captured for C# replay.
-- [ ] E2E: full vectorizer RAG flow.
-- [ ] All existing tests still pass (no regression).
+- [x] Unit tests: `text_to_vector` (determinism, dimensions, token sensitivity, zero vector, normalization, performance).
+- [x] Unit tests: vectorizer config validation, document indexing with vectorizer.
+- [x] Contract tests: `source/rust/tests/contract/vectorizer_queries.rs` covers all matrix entries.
+- [x] Python SDK tests: vectorizer index creation, upload without vectors, `kind: "text"` search, hybrid.
+- [x] C# SDK tests: mirror Python additions.
+- [x] Fixtures captured for C# replay.
+- [x] E2E: full vectorizer RAG flow.
+- [x] All existing tests still pass (no regression).
 
 ### Quality gates
 
-- [ ] `cargo fmt --check` passes.
-- [ ] `cargo clippy --all-targets -- -D warnings` passes.
-- [ ] All test suites green (unit, contract, SDK Python, SDK C#, e2e).
-- [ ] `docs/supported_operations.md` updated (`kind: "text"` flipped to Supported; `vectorizers` documented).
-- [ ] `docs/known_differences.md` updated (hash-based embedding, no external calls, lexical similarity).
+- [x] `cargo fmt --check` passes.
+- [x] `cargo clippy --all-targets -- -D warnings` passes.
+- [x] All test suites green (unit, contract, SDK Python, SDK C#, e2e).
+- [x] `docs/supported_operations.md` updated (`kind: "text"` flipped to Supported; `vectorizers` documented).
+- [x] `docs/known_differences.md` updated (hash-based embedding, no external calls, lexical similarity).
 
 ## Exit criteria
 

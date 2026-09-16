@@ -1,0 +1,18 @@
+{
+  "method": "POST",
+  "url": "http://<endpoint>/indexes('fixture-vectorizer-index')/docs/search.post.search?api-version=2024-07-01",
+  "headers": {
+    "Content-Type": "application/json",
+    "Content-Length": "123",
+    "Accept": "application/json;odata.metadata=none",
+    "User-Agent": "<user-agent>",
+    "api-key": "fixture-key"
+  },
+  "request_body": "{\"search\": \"quantum\", \"vectorQueries\": [{\"text\": \"quantum computing\", \"k\": 2, \"fields\": \"content_vector\", \"kind\": \"text\"}]}",
+  "status_code": 200,
+  "response_headers": {
+    "content-type": "application/json",
+    "content-length": "448"
+  },
+  "response_body": "{\"@odata.context\":\"/$metadata#documents\",\"value\":[{\"@search.score\":0.032786883413791656,\"content\":\"quantum applications\",\"content_vector\":[-0.40824827551841736,0.0,0.8164965510368347,0.40824827551841736,0.0,0.0,0.0,0.0],\"id\":\"1\",\"title\":\"quantum computing\"},{\"@search.score\":0.016129031777381897,\"content\":\"classical mechanics\",\"content_vector\":[0.0,0.0,0.0,0.7071067690849304,0.0,0.7071067690849304,0.0,0.0],\"id\":\"2\",\"title\":\"classical physics\"}]}"
+}

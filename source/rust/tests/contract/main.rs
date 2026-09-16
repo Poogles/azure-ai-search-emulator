@@ -17,3 +17,4 @@ mod semantic_search;
 mod suggest_autocomplete;
 mod synonym_maps;
 mod vector_search;
+mod vectorizer_queries;

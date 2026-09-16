@@ -18,7 +18,6 @@ Differences fall into two categories:
 |:------------------------------------------------------|:----------------------------------|:----------------------------------------------------------------------------------------------------|
 | Scoring profiles, parameters, statistics              | Rejected                          | Scoring is BM25 (see below); custom scoring profiles are not applied.                               |
 | Semantic queries (model-based)                        | Rejected                          | No model inference in the emulator (initial design non-goal). Extractive semantic search is supported (see below). |
-| Vectorizer (`kind: "text"`) queries                   | Rejected (`400 UnsupportedQuery`) | No vectorizer in the emulator; callers must supply raw vectors.                                     |
 
 ## Silently different (operation succeeds, result may differ from Azure)
 
@@ -44,6 +43,14 @@ Differences fall into two categories:
 - Algorithm-config leniencies (emulator-only): a missing algorithm `kind` defaults to `"hnsw"`; a top-level `parameters` object is accepted as an alias for the kind-specific parameters object; `m` is validated as 1-256 (Azure restricts it to 4-100).
 - Paging with vectors binds `vectorQueries` + `vectorFilterMode` into the continuation token; changing them mid-paging is `400` (Azure tokens tolerate broader reuse). Fail-fast beats silently shifted pages.
 - At most 5 vector queries per search and at most 16 vector fields per index (both match Azure); max dimension 3072 (or `EMULATOR_VECTOR__MAX_DIMENSION`).
+
+### Vectorizer embeddings (Phase 2.4)
+
+- `kind: "text"` queries and index-time vector generation use a deterministic signed FNV-1a hash over the full-text analyzer's tokens (lowercasing, punctuation splitting, English stopword removal and stemming), L2-normalized to a unit vector. The same text always yields the same vector; texts sharing analyzed tokens are more similar (lexical token overlap), but there is no semantic representation: "king" and "monarch" are unrelated, while "running" and "run" coincide. Test assertions must use token-overlap expectations (a document sharing both query terms ranks above one sharing one), not semantic-similarity expectations.
+- The configured endpoint (`parameters.uri`, `customWebApiParameters.uri`, or the `azureOpenAI`/`aml` parameters) is stored and echoed but never called: no HTTP requests to embedding services; the emulator is fully self-contained. Accepted `kind`s: `uri`, `customWebApi`, `azureOpenAI`, `aml`.
+- The pinned SDKs associate a vector field with its vectorizer through the profile (the field's `vectorSearchProfile` → the profile's `vectorizer`) and nest `vectorizers` inside `vectorSearch`; the emulator additionally accepts a field-level `vectorizer` property and a top-level `vectorizers` array (leniencies). The pinned SDKs send no `sourceContext`, so SDK-created indexes fall back to all searchable `Edm.String` fields in schema order as the text source.
+- Empty source text yields no vector for that field (the field stays absent): the document never appears in vector results for it. A missing or empty query `text` is rejected with `400 InvalidQuery`.
+- **Rationale:** the hash embedding exercises the full vectorizer query path (request construction, generation, vector search, hybrid fusion, ordering) with zero dependencies and a <20 MB image; semantic quality is explicitly out of scope for a test double.
 
 ### Semantic search (Phase 2.3)
 

@@ -28,6 +28,7 @@
 
 pub mod config;
 pub mod distance;
+pub mod vectorizer;
 
 use std::collections::BTreeMap;
 

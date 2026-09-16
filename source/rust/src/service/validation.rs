@@ -122,6 +122,57 @@ pub(crate) fn validate_schema(
     }
     validate_suggesters(definition)?;
     validate_vector_search_config(definition)?;
+    validate_vectorizers(definition)?;
+    Ok(())
+}
+
+/// Validates the index's `vectorizers` array (Phase 2.4): the structural
+/// rules (name, kind, endpoint URI, `sourceContext`) via
+/// [`parse_vectorizers`], that each `sourceContext.fields` entry names a
+/// searchable string field, and that every vector field's `vectorizer`
+/// reference resolves to a declared vectorizer.
+pub(crate) fn validate_vectorizers(definition: &IndexDefinition) -> Result<(), ApiError> {
+    let configs = crate::vector::vectorizer::parse_vectorizers(definition.vectorizers.as_ref())
+        .map_err(ApiError::invalid_index)?;
+    for config in &configs {
+        if let Some(fields) = &config.source_fields {
+            for field_name in fields {
+                let is_searchable_string = definition
+                    .field(field_name)
+                    .is_some_and(|f| f.searchable && f.field_type == FieldType::String);
+                if !is_searchable_string {
+                    return Err(ApiError::invalid_index(format!(
+                        "Vectorizer {:?} source field {:?} must be a searchable string field.",
+                        config.name, field_name
+                    )));
+                }
+            }
+        }
+    }
+    let has = |name: &str| configs.iter().any(|c| c.name == name);
+    // Field-level `vectorizer` references (emulator leniency) must resolve.
+    for field in &definition.fields {
+        if let Some(vectorizer_name) = &field.vectorizer {
+            if !has(vectorizer_name) {
+                return Err(ApiError::invalid_index(format!(
+                    "Vector field {:?} references unknown vectorizer {:?}.",
+                    field.name, vectorizer_name
+                )));
+            }
+        }
+    }
+    // Profile-level `vectorizer` references (the pinned SDKs' wire format)
+    // must resolve.
+    if let Ok(search_config) = crate::vector::parse_vector_search(definition.vector_search.as_ref())
+    {
+        for (profile, vectorizer_name) in &search_config.profile_vectorizers {
+            if !has(vectorizer_name) {
+                return Err(ApiError::invalid_index(format!(
+                    "Vector search profile {profile:?} references unknown vectorizer {vectorizer_name:?}."
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -373,12 +424,68 @@ pub(crate) fn validate_document(
         let field = definition
             .field(name)
             .ok_or_else(|| format!("Document contains unknown field {name:?}."))?;
+        // A vectorizer-backed vector field with a `null` value is treated as
+        // omitted: a vector is generated from the source text below.
+        if field.is_vector_field() && field.vectorizer.is_some() && value.is_null() {
+            continue;
+        }
         check_field_type(field, value)?;
     }
-    Ok(Document {
-        key,
-        fields: obj.clone(),
-    })
+    let mut fields = obj.clone();
+    apply_vectorizer_generation(definition, &mut fields);
+    Ok(Document { key, fields })
+}
+
+/// Generates vectors for vectorizer-backed vector fields the document omits
+/// (or sets to `null`), inserting them into the document's field map so they
+/// are stored, indexed, and returned like uploaded vectors. Fields with an
+/// explicit (non-null) value keep it; fields without a vectorizer are left
+/// absent. The text source is the vectorizer's `sourceContext.fields` (or all
+/// searchable string fields when no `sourceContext` is configured); empty
+/// source text yields a zero vector.
+fn apply_vectorizer_generation(
+    definition: &IndexDefinition,
+    fields: &mut serde_json::Map<String, Value>,
+) {
+    let Ok(configs) = crate::vector::vectorizer::parse_vectorizers(definition.vectorizers.as_ref())
+    else {
+        return; // The schema is validated before documents, so this cannot fail.
+    };
+    if configs.is_empty() {
+        return;
+    }
+    let fallback = crate::vector::vectorizer::searchable_string_fields(&definition.fields);
+    for field in &definition.fields {
+        if !field.is_vector_field() {
+            continue;
+        }
+        // Resolve the vectorizer via the field's profile (the pinned SDKs'
+        // wire format) or a field-level `vectorizer` property.
+        let Some(vectorizer_name) = crate::vector::vectorizer::field_vectorizer(definition, field)
+        else {
+            continue;
+        };
+        let omitted = matches!(fields.get(&field.name), None | Some(Value::Null));
+        if !omitted {
+            continue;
+        }
+        let Some(config) = crate::vector::vectorizer::find_vectorizer(&configs, &vectorizer_name)
+        else {
+            continue; // The schema is validated, so the vectorizer must exist.
+        };
+        let dimensions = field.vector_dimensions.unwrap_or(0);
+        let text = crate::vector::vectorizer::vectorizer_source_text(config, fields, &fallback);
+        let vector = crate::vector::vectorizer::text_to_vector(&text, dimensions);
+        // An empty source text yields a zero vector, which has zero cosine
+        // similarity to every query vector. Leave the field absent (no vector
+        // stored or indexed) so the document never appears in vector results
+        // for that field, matching the spec's zero-vector behaviour.
+        if vector.iter().all(|x| *x == 0.0) {
+            continue;
+        }
+        let json_vector = Value::Array(vector.into_iter().map(Value::from).collect());
+        fields.insert(field.name.clone(), json_vector);
+    }
 }
 
 pub(crate) fn check_field_type(field: &FieldDefinition, value: &Value) -> Result<(), String> {

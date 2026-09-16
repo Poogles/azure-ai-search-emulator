@@ -1,0 +1,13 @@
+{
+  "method": "DELETE",
+  "url": "http://<endpoint>/indexes('fixture-vectorizer-index')?api-version=2024-07-01",
+  "headers": {
+    "Accept": "application/json;odata.metadata=minimal",
+    "User-Agent": "<user-agent>",
+    "api-key": "fixture-key"
+  },
+  "request_body": null,
+  "status_code": 204,
+  "response_headers": {},
+  "response_body": ""
+}

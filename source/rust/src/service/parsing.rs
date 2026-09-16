@@ -416,10 +416,17 @@ pub(crate) fn parse_vector_queries(
     Ok((queries, Some(raw.clone())))
 }
 
-/// Parses one `vectorQueries[]` entry: `kind`, `vector`, `fields` (string or
-/// array), `k` (`k_nearest_neighbors` SDK alias accepted), `exhaustive`.
-/// `weight` is accepted but inert. A missing `kind` defaults to `"vector"`
-/// (emulator-only leniency, documented in `known_differences.md`).
+/// Parses one `vectorQueries[]` entry: `kind`, `vector` (or `text` for
+/// `kind: "text"` vectorizer queries), `fields` (string or array), `k`
+/// (`k_nearest_neighbors` SDK alias accepted), `exhaustive`. `weight` is
+/// accepted but inert. A missing `kind` defaults to `"vector"` (emulator-only
+/// leniency, documented in `known_differences.md`).
+///
+/// For `kind: "text"` the query's `text` is vectorized with the target
+/// field's vectorizer (a deterministic hash-based embedding, Phase 2.4); the
+/// generated vector is stored on the [`VectorQuery`] and executed like a raw
+/// vector. `text` must be present and non-empty, `vector` must be absent, and
+/// every target field must reference a vectorizer.
 pub(crate) fn parse_vector_query(
     entry: &Value,
     definition: &IndexDefinition,
@@ -427,22 +434,21 @@ pub(crate) fn parse_vector_query(
     let obj = entry.as_object().ok_or_else(|| {
         ApiError::invalid_query("Each vectorQueries entry must be a JSON object.")
     })?;
+    let is_text = matches!(obj.get("kind").and_then(Value::as_str), Some("text"));
     match obj.get("kind").and_then(Value::as_str) {
-        None | Some("vector") => {}
-        Some("text") => {
-            return Err(ApiError::unsupported(
-                ErrorCode::UnsupportedQuery,
-                "Vectorizer queries (kind 'text') are not supported; supply raw vectors with kind 'vector'.",
-            ));
-        }
+        None | Some("vector" | "text") => {}
         Some(other) => {
             return Err(ApiError::invalid_query(format!(
-                "Invalid vector query kind {other:?}; supported kinds: 'vector'."
+                "Invalid vector query kind {other:?}; supported kinds: 'vector', 'text'."
             )));
         }
     }
-    let fields = VectorFieldSet::parse(obj, definition)?;
-    let vector = fields.parse_vector(obj)?;
+    let fields = VectorFieldSet::parse(obj, definition, is_text)?;
+    let vector = if is_text {
+        parse_vectorizer_query_vector(obj, &fields)?
+    } else {
+        fields.parse_vector(obj)?
+    };
     let k = parse_vector_k(obj)?;
     let exhaustive = obj
         .get("exhaustive")
@@ -458,6 +464,28 @@ pub(crate) fn parse_vector_query(
         exhaustive,
         weight,
     })
+}
+
+/// Parses a `kind: "text"` vectorizer query's vector: rejects a present
+/// `vector` property, requires a non-empty `text`, and vectorizes it with the
+/// target fields' shared dimension.
+fn parse_vectorizer_query_vector(
+    obj: &Map<String, Value>,
+    fields: &VectorFieldSet,
+) -> Result<Vec<f32>, ApiError> {
+    if obj.contains_key("vector") {
+        return Err(ApiError::invalid_query(
+            "Vectorizer query (kind 'text') must not include a 'vector' property.",
+        ));
+    }
+    let text = obj
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ApiError::invalid_query("Vectorizer query requires a non-empty 'text' property.")
+        })?;
+    Ok(crate::vector::vectorizer::text_to_vector(text, fields.dim))
 }
 
 /// Parses a vector query's `k` (`k_nearest_neighbors` / `kNearestNeighbors`
@@ -513,8 +541,13 @@ struct VectorFieldSet {
 
 impl VectorFieldSet {
     /// Parses a vector query's `fields`: every entry must be a vector field
-    /// in the schema.
-    fn parse(obj: &Map<String, Value>, definition: &IndexDefinition) -> Result<Self, ApiError> {
+    /// in the schema. When `require_vectorizer` is set (a `kind: "text"`
+    /// query), each field must also reference a vectorizer.
+    fn parse(
+        obj: &Map<String, Value>,
+        definition: &IndexDefinition,
+        require_vectorizer: bool,
+    ) -> Result<Self, ApiError> {
         let fields_value = obj
             .get("fields")
             .ok_or_else(|| ApiError::invalid_query("Each vector query must define \"fields\"."))?;
@@ -533,6 +566,14 @@ impl VectorFieldSet {
                         definition.name
                     ))
                 })?;
+            if require_vectorizer
+                && crate::vector::vectorizer::field_vectorizer(definition, field_def).is_none()
+            {
+                return Err(ApiError::invalid_query(format!(
+                    "Vector field {name:?} does not have a vectorizer; \
+                     use kind 'vector' with an explicit vector.",
+                )));
+            }
             let dimensions = field_def.vector_dimensions.unwrap_or(0);
             match dim {
                 None => dim = Some(dimensions),

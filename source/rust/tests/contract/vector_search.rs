@@ -742,11 +742,11 @@ async fn vector_search_rejects_bad_queries() {
             "InvalidQuery",
         ),
         (
-            "vectorizer kind",
+            "vectorizer kind on a field without a vectorizer",
             json!({"vectorQueries": [
                 {"kind": "text", "text": "hello", "fields": "content_vector", "k": 1}
             ]}),
-            "UnsupportedQuery",
+            "InvalidQuery",
         ),
         (
             "semantic option (malformed)",

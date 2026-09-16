@@ -431,6 +431,92 @@ def main() -> None:
     )
     index_client.delete_index("fixture-semantic-index")
 
+    # Phase 2.4 wire formats: a vectorizer index (vectorizers nested in
+    # `vectorSearch`, the field associated through the profile's vectorizer),
+    # document upload WITHOUT explicit vectors, and `kind: "text"` queries —
+    # captured for C# replay.
+    from azure.search.documents.indexes.models import (
+        AzureOpenAIVectorizer,
+        AzureOpenAIVectorizerParameters,
+    )
+    from azure.search.documents.models import VectorizableTextQuery
+
+    vectorizer_client = SearchClient(
+        endpoint=args.endpoint,
+        index_name="fixture-vectorizer-index",
+        credential=CREDENTIAL,
+        api_version=API_VERSION,
+        transport=transport,
+    )
+    index_client.create_index(
+        SearchIndex(
+            name="fixture-vectorizer-index",
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchField(name="title", type=SearchFieldDataType.String, searchable=True),
+                SearchField(name="content", type=SearchFieldDataType.String, searchable=True),
+                SearchField(
+                    name="content_vector",
+                    type="Collection(Edm.Single)",
+                    searchable=True,
+                    vector_search_dimensions=8,
+                    vector_search_profile_name="cos",
+                ),
+            ],
+            vector_search=VectorSearch(
+                algorithms=[
+                    HnswAlgorithmConfiguration(
+                        name="hnsw-1",
+                        parameters=HnswParameters(m=4, metric="cosine"),
+                    ),
+                ],
+                profiles=[
+                    VectorSearchProfile(
+                        name="cos",
+                        algorithm_configuration_name="hnsw-1",
+                        vectorizer_name="embedder",
+                    ),
+                ],
+                vectorizers=[
+                    AzureOpenAIVectorizer(
+                        vectorizer_name="embedder",
+                        parameters=AzureOpenAIVectorizerParameters(
+                            resource_url="https://example-resource.openai.azure.com",
+                            deployment_name="text-embedding-ada-002",
+                        ),
+                    ),
+                ],
+            ),
+        )
+    )
+    # No explicit vectors: the vectorizer generates them from the text fields.
+    vectorizer_client.upload_documents(
+        documents=[
+            {"id": "1", "title": "quantum computing", "content": "quantum applications"},
+            {"id": "2", "title": "classical physics", "content": "classical mechanics"},
+        ]
+    )
+    list(
+        vectorizer_client.search(
+            vector_queries=[
+                VectorizableTextQuery(
+                    text="quantum computing", k_nearest_neighbors=2, fields="content_vector"
+                )
+            ]
+        )
+    )
+    list(
+        vectorizer_client.search(
+            search_text="quantum",
+            vector_queries=[
+                VectorizableTextQuery(
+                    text="quantum computing", k_nearest_neighbors=2, fields="content_vector"
+                )
+            ],
+        )
+    )
+    index_client.delete_index("fixture-vectorizer-index")
+
     transport.close()
 
     # Write sanitized fixtures

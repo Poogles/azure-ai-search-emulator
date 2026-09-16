@@ -2536,6 +2536,7 @@ mod tests {
             fields,
             suggesters: Vec::new(),
             vector_search: None,
+            vectorizers: None,
             synonym_maps: Vec::new(),
             semantic: None,
             raw: json!({}),

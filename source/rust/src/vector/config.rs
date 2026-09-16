@@ -104,11 +104,16 @@ pub struct VectorAlgorithm {
 }
 
 /// Parsed `vectorSearch`: algorithm name → config, profile name →
-/// algorithm name.
+/// algorithm name, and profile name → vectorizer name (Phase 2.4). The
+/// vectorizer is associated with a vector field through its profile in the
+/// pinned SDKs' wire format (the field's `vectorSearchProfile` → the
+/// profile's `vectorizer`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VectorSearchConfig {
     pub algorithms: BTreeMap<String, VectorAlgorithm>,
     pub profiles: BTreeMap<String, String>,
+    /// Profile name → the `vectorizer` name the profile references, when set.
+    pub profile_vectorizers: BTreeMap<String, String>,
 }
 
 /// Parses the index-level `vectorSearch` object (or its absence) into a
@@ -184,6 +189,17 @@ pub fn parse_vector_search(raw: Option<&Value>) -> Result<VectorSearchConfig, St
                 .is_some()
             {
                 return Err(format!("Duplicate vector search profile name {name:?}."));
+            }
+            // The profile's optional `vectorizer` reference (Phase 2.4): the
+            // vectorizer is associated with a vector field through its profile.
+            if let Some(vectorizer) = obj
+                .get("vectorizer")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                config
+                    .profile_vectorizers
+                    .insert(name.to_owned(), vectorizer.to_owned());
             }
         }
     }

@@ -236,6 +236,10 @@ pub struct FieldDefinition {
     /// The `vectorSearchProfile` name (`vector_search_profile_name` SDK
     /// alias accepted).
     pub vector_search_profile: Option<String>,
+    /// The `vectorizer` name this vector field references (Phase 2.4); `None`
+    /// for raw-vector fields. The referenced vectorizer must exist in the
+    /// index's `vectorizers` array (validated by the service layer).
+    pub vectorizer: Option<String>,
     /// Subfields of an `Edm.ComplexType` field; empty for all other types.
     pub subfields: Vec<FieldDefinition>,
     /// The field's declared analyzer name (`analyzer` property); `None` means
@@ -293,6 +297,12 @@ impl FieldDefinition {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
+        let vectorizer = obj
+            .get("vectorizer")
+            .or_else(|| obj.get("vectorizer_name"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
         let analyzer = get_opt_string(obj, "analyzer");
         let synonym_maps = obj
             .get("synonymMaps")
@@ -312,6 +322,7 @@ impl FieldDefinition {
             field_type: FieldType::from_normalized(&normalize_field_type(field_type)),
             vector_dimensions,
             vector_search_profile,
+            vectorizer,
             is_key: get_bool(obj, "key", false),
             searchable: get_bool(obj, "searchable", false),
             filterable: get_bool(obj, "filterable", false),
@@ -469,6 +480,11 @@ pub struct IndexDefinition {
     /// `vector` module); preserved here so the vector engine can build its
     /// per-field indexes from the stored definition.
     pub vector_search: Option<Value>,
+    /// The raw `vectorizers` array (Phase 2.4), when present. Parsed and
+    /// validated by the service layer (via the `vector::vectorizer` module);
+    /// preserved here so document indexing and `kind: "text"` queries can
+    /// resolve a field's vectorizer and its text source.
+    pub vectorizers: Option<Value>,
     /// The names of the synonym maps associated with the index (the
     /// `synonymMaps` array). Only these maps are applied to full-text search
     /// on this index; maps not referenced here are inert for it.
@@ -518,6 +534,17 @@ impl IndexDefinition {
             .get("vectorSearch")
             .or_else(|| obj.get("vector_search"))
             .cloned();
+        // The pinned SDKs nest `vectorizers` inside `vectorSearch`; a
+        // top-level `vectorizers` (the documented REST shape) is also accepted.
+        let vectorizers = obj
+            .get("vectorizers")
+            .or_else(|| {
+                obj.get("vectorSearch")
+                    .or_else(|| obj.get("vector_search"))
+                    .and_then(Value::as_object)
+                    .and_then(|vs| vs.get("vectorizers"))
+            })
+            .cloned();
         let mut synonym_maps: Vec<String> = obj
             .get("synonymMaps")
             .and_then(Value::as_array)
@@ -548,6 +575,7 @@ impl IndexDefinition {
             fields,
             suggesters,
             vector_search,
+            vectorizers,
             synonym_maps,
             semantic,
             raw,

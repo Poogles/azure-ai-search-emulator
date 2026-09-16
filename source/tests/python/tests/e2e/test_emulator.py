@@ -360,6 +360,101 @@ def test_rag_style_vector_and_hybrid_flow(
     assert {doc["id"] for doc in found} == {"1", "2", "3"}
 
 
+def test_rag_style_vectorizer_flow(
+    index_client: SearchIndexClient, search_client: SearchClient
+) -> None:
+    """Vectorizer RAG flow (Phase 2.4): the index declares a vectorizer,
+    documents are uploaded WITHOUT explicit vectors (the emulator generates
+    them from the text), and ``kind: "text"`` queries retrieve by token
+    overlap. Hybrid fuses the full-text and vectorizer sides."""
+    from azure.search.documents.indexes.models import (
+        AzureOpenAIVectorizer,
+        AzureOpenAIVectorizerParameters,
+        HnswAlgorithmConfiguration,
+        HnswParameters,
+        VectorSearch,
+        VectorSearchProfile,
+    )
+    from azure.search.documents.models import VectorizableTextQuery
+
+    index_client.create_index(
+        SearchIndex(
+            name=INDEX_NAME,
+            fields=[
+                SearchField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchField(name="title", type=SearchFieldDataType.String, searchable=True),
+                SearchField(
+                    name="content_vector",
+                    type="Collection(Edm.Single)",
+                    searchable=True,
+                    vector_search_dimensions=64,
+                    vector_search_profile_name="cos",
+                ),
+            ],
+            vector_search=VectorSearch(
+                algorithms=[
+                    HnswAlgorithmConfiguration(
+                        name="hnsw-1",
+                        parameters=HnswParameters(metric="cosine"),
+                    ),
+                ],
+                profiles=[
+                    VectorSearchProfile(
+                        name="cos", algorithm_configuration_name="hnsw-1", vectorizer_name="embedder"
+                    ),
+                ],
+                vectorizers=[
+                    AzureOpenAIVectorizer(
+                        vectorizer_name="embedder",
+                        parameters=AzureOpenAIVectorizerParameters(
+                            resource_url="https://example-resource.openai.azure.com",
+                            deployment_name="text-embedding-ada-002",
+                        ),
+                    ),
+                ],
+            ),
+        )
+    )
+    # No explicit vectors: the vectorizer generates them from `title`.
+    docs = [
+        {"id": "1", "title": "quantum computing"},
+        {"id": "2", "title": "classical physics"},
+        {"id": "3", "title": "quantum mechanics"},
+    ]
+    results = search_client.upload_documents(documents=docs)
+    assert all(r.succeeded for r in results)
+    # The generated vector is stored and returned.
+    doc = search_client.get_document(key="1")
+    assert len(doc["content_vector"]) == 64
+
+    # kind:text retrieval: doc 1 shares both query tokens, doc 3 shares one.
+    found = list(
+        search_client.search(
+            vector_queries=[
+                VectorizableTextQuery(
+                    text="quantum computing", k_nearest_neighbors=3, fields="content_vector"
+                )
+            ]
+        )
+    )
+    ids = [doc["id"] for doc in found]
+    assert ids[0] == "1"
+    assert ids.index("3") < ids.index("2")
+
+    # Hybrid: full-text "quantum" (1, 3) fused with the vectorizer side.
+    found = list(
+        search_client.search(
+            search_text="quantum",
+            vector_queries=[
+                VectorizableTextQuery(
+                    text="quantum computing", k_nearest_neighbors=3, fields="content_vector"
+                )
+            ],
+        )
+    )
+    assert next(doc["id"] for doc in found) == "1"
+
+
 def test_rag_style_semantic_flow(
     index_client: SearchIndexClient, search_client: SearchClient, clean_emulator: str
 ) -> None:
